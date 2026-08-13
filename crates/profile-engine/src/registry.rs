@@ -49,16 +49,41 @@ impl ProfileRegistry {
     }
 
     /// 注册单个 Profile；先校验，再查重（§37、§38）。
+    ///
+    /// 注册结果通过结构化日志记录（`component`、`profile_id`、`error_code`）。
     pub fn register(&mut self, profile: DeviceProfile) -> Result<(), RegistryError> {
-        validate_profile(&profile).map_err(|e| RegistryError::Invalid {
-            profile_id: profile.id.clone(),
-            reason: e.to_string(),
-        })?;
-        if self.profiles.contains_key(&profile.id) {
-            return Err(RegistryError::DuplicateId {
-                profile_id: profile.id,
-            });
+        if let Err(e) = validate_profile(&profile) {
+            let err = RegistryError::Invalid {
+                profile_id: profile.id.clone(),
+                reason: e.to_string(),
+            };
+            tracing::warn!(
+                component = "profile-engine",
+                profile_id = %profile.id,
+                error_code = "profile_invalid",
+                error = %err,
+                "Profile 注册失败：校验未通过"
+            );
+            return Err(err);
         }
+        if self.profiles.contains_key(&profile.id) {
+            let err = RegistryError::DuplicateId {
+                profile_id: profile.id.clone(),
+            };
+            tracing::warn!(
+                component = "profile-engine",
+                profile_id = %profile.id,
+                error_code = "profile_duplicate",
+                error = %err,
+                "Profile 注册失败：ID 已存在"
+            );
+            return Err(err);
+        }
+        tracing::info!(
+            component = "profile-engine",
+            profile_id = %profile.id,
+            "Profile 注册成功"
+        );
         self.profiles.insert(profile.id.clone(), Arc::new(profile));
         Ok(())
     }
@@ -125,6 +150,7 @@ mod tests {
     use crate::models::{
         AcquisitionConstraints, ProfileCapabilities, ProfileProperty, WriteRounding,
     };
+    use crate::test_util::init_global_subscriber;
 
     fn sample(id: &str) -> DeviceProfile {
         DeviceProfile {
@@ -161,6 +187,7 @@ mod tests {
 
     #[test]
     fn register_and_get() {
+        init_global_subscriber();
         let mut registry = ProfileRegistry::new();
         registry
             .register(sample("inovance-md500"))
@@ -173,6 +200,7 @@ mod tests {
 
     #[test]
     fn duplicate_id_rejected() {
+        init_global_subscriber();
         let mut registry = ProfileRegistry::new();
         registry
             .register(sample("inovance-md500"))
@@ -191,6 +219,7 @@ mod tests {
 
     #[test]
     fn invalid_profile_rejected() {
+        init_global_subscriber();
         let mut registry = ProfileRegistry::new();
         let mut profile = sample("bad-profile");
         profile.properties[0].scale = 0.0;
@@ -201,12 +230,14 @@ mod tests {
 
     #[test]
     fn missing_profile_returns_none() {
+        init_global_subscriber();
         let registry = ProfileRegistry::new();
         assert!(registry.get("none").is_none());
     }
 
     #[test]
     fn load_dir_rolls_back_on_duplicate() {
+        init_global_subscriber();
         // P2：目录加载期间发生 ID 冲突时，本次已注册项必须全部回滚。
         let dir = std::env::temp_dir().join(format!(
             "profile-engine-reg-rollback-{}",
@@ -245,6 +276,7 @@ mod tests {
 
     #[test]
     fn load_dir_registers_all() {
+        init_global_subscriber();
         let dir = std::env::temp_dir().join(format!("profile-engine-reg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("创建目录失败");

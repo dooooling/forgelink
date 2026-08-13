@@ -68,10 +68,54 @@ impl std::error::Error for LoaderError {
     }
 }
 
+impl LoaderError {
+    /// 稳定、机器可读的错误码（结构化日志 `error_code` 字段，§6）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            LoaderError::Io { .. } => "profile_loader_io",
+            LoaderError::Json { .. } => "profile_loader_json",
+            LoaderError::Validation { .. } => "profile_loader_validation",
+            LoaderError::Duplicate { .. } => "profile_loader_duplicate",
+        }
+    }
+
+    /// 失败文件路径（日志 `file` 字段用）。
+    pub fn file_path(&self) -> &std::path::Path {
+        match self {
+            LoaderError::Io { path, .. }
+            | LoaderError::Json { path, .. }
+            | LoaderError::Validation { path, .. }
+            | LoaderError::Duplicate { path, .. } => path,
+        }
+    }
+}
+
 /// 从目录递归加载全部 `*.json` Profile（§38）。
 pub fn load_profiles_dir(dir: &Path) -> Result<Vec<DeviceProfile>, LoaderError> {
+    tracing::info!(
+        component = "profile-engine",
+        dir = %dir.display(),
+        "开始加载 Profile 目录"
+    );
+    let start = std::time::Instant::now();
     let mut profiles = Vec::new();
-    collect_dir(dir, &mut profiles)?;
+    if let Err(e) = collect_dir(dir, &mut profiles) {
+        tracing::warn!(
+            component = "profile-engine",
+            dir = %dir.display(),
+            file = %e.file_path().display(),
+            error_code = e.code(),
+            error = %e,
+            "Profile 加载失败"
+        );
+        return Err(e);
+    }
+    tracing::info!(
+        component = "profile-engine",
+        count = profiles.len(),
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "Profile 目录加载完成"
+    );
     Ok(profiles)
 }
 
@@ -123,6 +167,7 @@ mod tests {
     use observation_model::DomainKind;
 
     use super::*;
+    use crate::test_util::init_global_subscriber;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -172,6 +217,7 @@ mod tests {
 
     #[test]
     fn load_nested_directory() {
+        init_global_subscriber();
         let root = temp_dir("nested");
         let vendor_dir = root.join("inovance").join("md500");
         fs::create_dir_all(&vendor_dir).expect("创建厂商子目录失败");
@@ -186,6 +232,7 @@ mod tests {
 
     #[test]
     fn ignores_non_json_files() {
+        init_global_subscriber();
         let root = temp_dir("ignore");
         fs::write(root.join("notes.txt"), "not json").expect("写入失败");
         let profiles = load_profiles_dir(&root).expect("应忽略非 JSON 文件");
@@ -194,6 +241,7 @@ mod tests {
 
     #[test]
     fn missing_directory_is_io_error() {
+        init_global_subscriber();
         let missing = std::env::temp_dir().join("profile-engine-no-such-dir-42");
         let e = load_profiles_dir(&missing).expect_err("目录不存在应报错");
         assert!(matches!(e, LoaderError::Io { .. }));
@@ -201,6 +249,7 @@ mod tests {
 
     #[test]
     fn invalid_json_reported_with_path() {
+        init_global_subscriber();
         let root = temp_dir("badjson");
         fs::write(root.join("bad.json"), "{ not json").expect("写入失败");
         let e = load_profiles_dir(&root).expect_err("非法 JSON 应报错");
@@ -214,6 +263,7 @@ mod tests {
 
     #[test]
     fn invalid_profile_rejected() {
+        init_global_subscriber();
         let root = temp_dir("scale0");
         fs::write(
             root.join("bad.json"),
@@ -232,10 +282,71 @@ mod tests {
 
     #[test]
     fn single_file_load() {
+        init_global_subscriber();
         let root = temp_dir("single");
         let path = root.join("md500.json");
         fs::write(&path, sample_json()).expect("写入失败");
         let profile = load_single(&path).expect("应成功加载");
         assert_eq!(profile.id, "inovance-md500");
+    }
+
+    #[test]
+    fn load_failure_emits_structured_event() {
+        init_global_subscriber();
+        use std::io::{self, Write};
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::EnvFilter;
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::{Layer, SubscriberExt};
+        use tracing_subscriber::registry::Registry;
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl<'a> MakeWriter<'a> for Capture {
+            type Writer = Capture;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        impl Write for Capture {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().expect("测试锁").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // 非法 JSON 文件 → 加载失败事件（json 格式）应包含结构化字段。
+        let root = temp_dir("logevent");
+        fs::write(root.join("bad.json"), "{ not json").expect("写入失败");
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_writer(Capture(buf.clone()))
+                .with_filter(EnvFilter::new("warn")),
+        );
+        let result = tracing::subscriber::with_default(subscriber, || load_profiles_dir(&root));
+        assert!(result.is_err());
+
+        let out = String::from_utf8(buf.lock().expect("测试锁").clone()).unwrap();
+        assert!(
+            out.contains("\"component\":\"profile-engine\""),
+            "输出: {out}"
+        );
+        assert!(
+            out.contains("\"error_code\":\"profile_loader_json\""),
+            "输出: {out}"
+        );
+        assert!(out.contains("\"level\":\"WARN\""), "输出: {out}");
+        assert!(out.contains("bad.json"), "输出: {out}");
     }
 }
