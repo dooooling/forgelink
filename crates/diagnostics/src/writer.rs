@@ -9,9 +9,9 @@
 //! 置关闭标志，刷写线程排空已入队事件后退出（见 `init::shutdown_logging`）。
 
 use std::io::{self, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
