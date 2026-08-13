@@ -1,0 +1,451 @@
+//! 统一日志初始化：配置解析、subscriber 组装与全局安装（幂等）。
+
+use std::fmt;
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
+
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt as ts_fmt;
+use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::registry::Registry;
+
+use crate::writer::NonBlockingWriter;
+
+/// 日志输出格式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogFormat {
+    /// 人类可读文本（默认）。
+    Text,
+    /// 结构化 JSON，每行一个事件。
+    Json,
+}
+
+/// 日志初始化配置。
+#[derive(Debug, Clone)]
+pub struct LoggingConfig {
+    /// 默认级别：`RUST_LOG` 未设置时生效。默认 `info`；`trace` 仅用于
+    /// 低层诊断，默认关闭。
+    pub default_level: LevelFilter,
+    /// 输出格式；可被环境变量 `FORGELINK_LOG_FORMAT`（`text`/`json`）覆盖。
+    pub format: LogFormat,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            default_level: LevelFilter::INFO,
+            format: LogFormat::Text,
+        }
+    }
+}
+
+/// 日志初始化结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitOutcome {
+    /// 本次调用完成初始化。
+    Initialized,
+    /// 日志已由先前调用初始化（配置以首次调用为准）。
+    AlreadyInitialized,
+}
+
+/// 日志初始化失败。
+#[derive(Debug)]
+pub enum LoggingError {
+    /// `RUST_LOG` 过滤表达式非法。
+    InvalidFilter {
+        expression: String,
+        source: tracing_subscriber::filter::ParseError,
+    },
+    /// `FORGELINK_LOG_FORMAT` 取值非法（仅允许 `text`/`json`）。
+    InvalidFormat { value: String },
+    /// 非阻塞 writer 线程启动失败。
+    Writer(std::io::Error),
+    /// 全局默认 subscriber 已被其他代码安装。
+    SubscriberAlreadySet,
+}
+
+impl fmt::Display for LoggingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoggingError::InvalidFilter { expression, source } => {
+                write!(f, "RUST_LOG 过滤表达式 `{expression}` 非法: {source}")
+            }
+            LoggingError::InvalidFormat { value } => write!(
+                f,
+                "FORGELINK_LOG_FORMAT 取值 `{value}` 非法（仅允许 text/json）"
+            ),
+            LoggingError::Writer(e) => write!(f, "日志 writer 线程启动失败: {e}"),
+            LoggingError::SubscriberAlreadySet => {
+                write!(f, "全局日志 subscriber 已被其他代码安装")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoggingError {}
+
+/// 初始化全局结构化日志（幂等，见 crate 文档）。
+///
+/// 完整初始化流程由互斥锁串行化：并发首次调用时恰好一个线程完成
+/// 安装，其余线程返回 [`InitOutcome::AlreadyInitialized`]，不会误报
+/// 冲突（见 P2）。
+///
+/// # Errors
+///
+/// `RUST_LOG` 非法、`FORGELINK_LOG_FORMAT` 非法、writer 线程启动失败、
+/// 全局 subscriber 已被其他代码安装（[`LoggingError::SubscriberAlreadySet`]）
+/// 时返回 [`LoggingError`]；失败后允许重试（本次调用不会安装任何状态）。
+pub fn init_logging(config: LoggingConfig) -> Result<InitOutcome, LoggingError> {
+    static STATE: OnceLock<InitOutcome> = OnceLock::new();
+    // 串行化完整初始化：避免并发首次调用时，一个线程已安装全局
+    // subscriber、尚未写入 STATE，另一个线程误报 SubscriberAlreadySet。
+    static INIT_MUTEX: Mutex<()> = Mutex::new(());
+
+    // 快速路径：已初始化则直接幂等返回，不触碰锁。
+    if STATE.get().is_some() {
+        return Ok(InitOutcome::AlreadyInitialized);
+    }
+    let _guard = INIT_MUTEX.lock().expect("初始化互斥锁");
+    if STATE.get().is_some() {
+        return Ok(InitOutcome::AlreadyInitialized);
+    }
+    match install(config) {
+        Ok(()) => {
+            let _ = STATE.set(InitOutcome::Initialized);
+            Ok(InitOutcome::Initialized)
+        }
+        // 锁内失败只可能是外部代码已安装 subscriber。
+        Err(e) => Err(e),
+    }
+}
+
+/// 全局安装的刷写线程句柄（退出刷新用）。
+static SHUTDOWN: OnceLock<LoggingShutdown> = OnceLock::new();
+
+/// 日志退出刷新状态：writer（关闭发送端）+ 刷写线程句柄。
+struct LoggingShutdown {
+    writer: NonBlockingWriter,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// 优雅关闭日志（进程退出前调用）。
+///
+/// 关闭 writer 发送端并等待刷写线程将已入队事件全部刷到 stdout 后退出，
+/// 避免进程正常退出时未刷出的日志丢失。未初始化时为空操作；可重复
+/// 调用（首次之后仅关闭已关闭的发送端）。
+pub fn shutdown_logging() {
+    let Some(shutdown) = SHUTDOWN.get() else {
+        return;
+    };
+    shutdown.writer.shutdown();
+    let join = shutdown.join.lock().expect("join 锁").take();
+    if let Some(join) = join {
+        let _ = join.join();
+    }
+}
+
+/// 解析级别过滤：优先 `RUST_LOG`，未设置时回退默认级别。
+fn filter_from_env_or(default: LevelFilter) -> Result<EnvFilter, LoggingError> {
+    match std::env::var("RUST_LOG") {
+        Ok(expr) if !expr.trim().is_empty() => {
+            EnvFilter::try_new(expr.clone()).map_err(|source| LoggingError::InvalidFilter {
+                expression: expr,
+                source,
+            })
+        }
+        _ => Ok(EnvFilter::new(default.to_string())),
+    }
+}
+
+/// 解析输出格式：环境变量 `FORGELINK_LOG_FORMAT` 优先，非法取值报错。
+fn format_from_env_or(requested: LogFormat) -> Result<LogFormat, LoggingError> {
+    match std::env::var("FORGELINK_LOG_FORMAT") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "text" => Ok(LogFormat::Text),
+            "json" => Ok(LogFormat::Json),
+            _ => Err(LoggingError::InvalidFormat { value }),
+        },
+        Err(_) => Ok(requested),
+    }
+}
+
+/// 组装并安装全局 subscriber（Registry + EnvFilter 过滤 + text/json fmt
+/// Layer）；事件先入有界通道，由专用线程刷 stdout。
+///
+/// 全局安装成功后才保存退出句柄；失败路径会关闭发送端并等待刷写线程
+/// 退出，不留下游离线程。
+fn install(config: LoggingConfig) -> Result<(), LoggingError> {
+    let filter = filter_from_env_or(config.default_level)?;
+    let format = format_from_env_or(config.format)?;
+    let (writer, join) = NonBlockingWriter::spawn().map_err(LoggingError::Writer)?;
+    let subscriber = build_subscriber(filter, format, writer.clone());
+    match tracing::subscriber::set_global_default(subscriber) {
+        Ok(()) => {
+            let _ = SHUTDOWN.set(LoggingShutdown {
+                writer,
+                join: Mutex::new(Some(join)),
+            });
+            Ok(())
+        }
+        Err(_) => {
+            writer.shutdown();
+            let _ = join.join();
+            Err(LoggingError::SubscriberAlreadySet)
+        }
+    }
+}
+
+/// 构建 subscriber（供全局安装与测试捕获共用）。
+///
+/// 过滤使用 [`EnvFilter`]（`RUST_LOG` 语义）；fmt Layer 关闭 ANSI 颜色，
+/// 保证输出（含测试捕获）为纯文本/纯 JSON。
+pub(crate) fn build_subscriber<W>(
+    filter: EnvFilter,
+    format: LogFormat,
+    writer: W,
+) -> Box<dyn tracing::Subscriber + Send + Sync>
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let layer: Box<dyn tracing_subscriber::layer::Layer<Registry> + Send + Sync> = match format {
+        LogFormat::Text => Box::new(
+            ts_fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_filter(filter),
+        ),
+        LogFormat::Json => Box::new(
+            ts_fmt::layer()
+                .json()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_filter(filter),
+        ),
+    };
+    Box::new(Registry::default().with(layer))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{self, Write};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    use super::*;
+    use crate::writer::NonBlockingWriter;
+
+    /// 测试捕获 writer：事件写入内存缓冲，断言用。
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("测试锁").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 修改环境变量的测试串行执行，避免并行测试间的环境竞争。
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn capture() -> (CaptureWriter, Arc<Mutex<Vec<u8>>>) {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        (CaptureWriter(buf.clone()), buf)
+    }
+
+    fn capture_text(
+        filter: EnvFilter,
+    ) -> (
+        Box<dyn tracing::Subscriber + Send + Sync>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let (writer, buf) = capture();
+        (build_subscriber(filter, LogFormat::Text, writer), buf)
+    }
+
+    fn capture_json(
+        filter: EnvFilter,
+    ) -> (
+        Box<dyn tracing::Subscriber + Send + Sync>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let (writer, buf) = capture();
+        (build_subscriber(filter, LogFormat::Json, writer), buf)
+    }
+
+    #[test]
+    fn default_level_filters_debug() {
+        // 默认级别过滤：未设置 RUST_LOG 时按 default_level（info），
+        // debug 事件不产生输出。
+        let (subscriber, buf) = capture_text(EnvFilter::new("info"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("不应出现");
+            tracing::info!("应出现");
+        });
+        let out = String::from_utf8(buf.lock().expect("测试锁").clone()).unwrap();
+        assert!(out.contains("应出现"));
+        assert!(!out.contains("不应出现"));
+    }
+
+    #[test]
+    fn rust_log_env_overrides_default_level() {
+        // RUST_LOG=debug 覆盖默认 info。
+        let _guard = ENV_MUTEX.lock().expect("测试锁");
+        unsafe { std::env::set_var("RUST_LOG", "debug") };
+        let filter = filter_from_env_or(LevelFilter::INFO).expect("合法表达式应解析");
+        unsafe { std::env::remove_var("RUST_LOG") };
+        drop(_guard);
+
+        let (subscriber, buf) = capture_text(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!("debug 应出现");
+        });
+        let out = String::from_utf8(buf.lock().expect("测试锁").clone()).unwrap();
+        assert!(out.contains("debug 应出现"));
+    }
+
+    #[test]
+    fn invalid_filter_expression_rejected() {
+        let _guard = ENV_MUTEX.lock().expect("测试锁");
+        unsafe { std::env::set_var("RUST_LOG", "trace=banana") };
+        let e = filter_from_env_or(LevelFilter::INFO).expect_err("非法表达式应报错");
+        unsafe { std::env::remove_var("RUST_LOG") };
+        drop(_guard);
+        assert!(matches!(e, LoggingError::InvalidFilter { .. }));
+    }
+
+    #[test]
+    fn invalid_format_env_rejected() {
+        let _guard = ENV_MUTEX.lock().expect("测试锁");
+        unsafe { std::env::set_var("FORGELINK_LOG_FORMAT", "yaml") };
+        let e = format_from_env_or(LogFormat::Text).expect_err("非法格式应报错");
+        unsafe { std::env::remove_var("FORGELINK_LOG_FORMAT") };
+        drop(_guard);
+        assert!(matches!(e, LoggingError::InvalidFormat { value } if value == "yaml"));
+    }
+
+    #[test]
+    fn format_env_switches_to_json() {
+        let _guard = ENV_MUTEX.lock().expect("测试锁");
+        unsafe { std::env::set_var("FORGELINK_LOG_FORMAT", "json") };
+        let format = format_from_env_or(LogFormat::Text).expect("json 应合法");
+        unsafe { std::env::remove_var("FORGELINK_LOG_FORMAT") };
+        drop(_guard);
+        assert_eq!(format, LogFormat::Json);
+    }
+
+    #[test]
+    fn text_format_output() {
+        let (subscriber, buf) = capture_text(EnvFilter::new("info"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(component = "diagnostics-test", "text 格式事件");
+        });
+        let out = String::from_utf8(buf.lock().expect("测试锁").clone()).unwrap();
+        assert!(out.contains("text 格式事件"), "输出: {out}");
+        assert!(
+            out.contains("component=\"diagnostics-test\""),
+            "输出: {out}"
+        );
+    }
+
+    #[test]
+    fn json_format_output() {
+        let (subscriber, buf) = capture_json(EnvFilter::new("info"));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(component = "diagnostics-test", "json 格式事件");
+        });
+        let out = String::from_utf8(buf.lock().expect("测试锁").clone()).unwrap();
+        let line = out.lines().next().expect("应有输出行");
+        let value: serde_json::Value = serde_json::from_str(line).expect("应为合法 JSON");
+        assert_eq!(value["level"], "INFO");
+        assert_eq!(value["fields"]["component"], "diagnostics-test");
+        assert_eq!(value["fields"]["message"], "json 格式事件");
+    }
+
+    #[test]
+    fn repeated_init_is_idempotent() {
+        // 保证环境干净，避免与其他环境测试相互影响。
+        let _guard = ENV_MUTEX.lock().expect("测试锁");
+        unsafe { std::env::remove_var("RUST_LOG") };
+        unsafe { std::env::remove_var("FORGELINK_LOG_FORMAT") };
+        let first = init_logging(LoggingConfig::default()).expect("首次初始化应成功");
+        assert_eq!(first, InitOutcome::Initialized);
+        let second = init_logging(LoggingConfig::default()).expect("重复初始化应成功返回");
+        assert_eq!(second, InitOutcome::AlreadyInitialized);
+        // 不同配置同样以首次为准。
+        let third = init_logging(LoggingConfig {
+            default_level: LevelFilter::DEBUG,
+            format: LogFormat::Json,
+        })
+        .expect("重复初始化应成功返回");
+        assert_eq!(third, InitOutcome::AlreadyInitialized);
+        // 清理真实刷写线程，避免测试进程退出时残留。
+        shutdown_logging();
+    }
+
+    #[test]
+    fn shutdown_logging_is_idempotent_and_noop_when_uninitialized() {
+        shutdown_logging();
+        shutdown_logging();
+    }
+
+    #[test]
+    fn non_blocking_writer_enqueues_line() {
+        let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
+        let mut writer = NonBlockingWriter::from_channel(tx);
+        writer.write_all(b"hello\n").expect("写入不应失败");
+        let line = rx.recv().expect("应收到事件行");
+        assert_eq!(&*line, b"hello\n");
+    }
+
+    #[test]
+    fn non_blocking_writer_drops_when_full_without_blocking() {
+        let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
+        let mut writer = NonBlockingWriter::from_channel(tx);
+        writer.write_all(b"first\n").expect("写入不应失败");
+        writer
+            .write_all(b"second\n")
+            .expect("通道满时写入不应失败/阻塞");
+        // 通道已满：second 被丢弃，first 仍可取出。
+        let line = rx.recv().expect("应收到首行");
+        assert_eq!(&*line, b"first\n");
+    }
+
+    #[test]
+    fn writes_after_shutdown_are_dropped() {
+        let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
+        let writer = NonBlockingWriter::from_channel(tx);
+        writer.shutdown();
+        let mut w = writer.clone();
+        w.write_all(b"x\n").expect("shutdown 后写入不应失败");
+        assert!(rx.try_recv().is_err(), "shutdown 后不应再入队");
+    }
+
+    #[test]
+    fn shutdown_flushes_and_stops_writer_thread() {
+        // 真实刷写线程：写入事件后 shutdown，线程应排空已入队事件并退出。
+        let (writer, join) = NonBlockingWriter::spawn().expect("线程启动失败");
+        let mut w = writer.clone();
+        w.write_all(b"flush-before-exit\n").expect("写入不应失败");
+        writer.shutdown();
+        join.join().expect("刷写线程应正常退出");
+    }
+}

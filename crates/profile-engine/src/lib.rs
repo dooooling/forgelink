@@ -18,6 +18,9 @@ mod models;
 mod registry;
 mod validate;
 
+#[cfg(test)]
+mod test_util;
+
 pub use convert::{ConversionError, DecodedRead, decode_read, encode_write};
 pub use loader::{LoaderError, load_profiles_dir, load_single};
 pub use models::{
