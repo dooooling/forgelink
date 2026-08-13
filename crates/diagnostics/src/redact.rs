@@ -8,10 +8,11 @@ use regex::Regex;
 ///
 /// 覆盖：
 /// - 键值凭据：`password=...`、`passwd=...`、`pwd=...`、`token=...`、
+///   `access_token=...`、`refresh_token=...`、`id_token=...`、
 ///   `secret=...`、`client_secret=...`、`api_key=...`、`private_key=...`
 ///   （键名大小写不敏感，允许两端引号与空白）；
 /// - URL 内嵌凭据：`scheme://user:pass@host`；
-/// - HTTP Basic 头：`Basic <base64>`；
+/// - HTTP 认证头：`Basic <base64>`、`Bearer <token>`；
 /// - PEM 私钥块：`-----BEGIN * PRIVATE KEY----- ... -----END ...`。
 ///
 /// # 注意
@@ -22,7 +23,7 @@ use regex::Regex;
 pub fn redact(text: &str) -> String {
     let out = credentials().replace_all(text, "$1$2***");
     let out = url_credentials().replace_all(&out, "://***@");
-    let out = basic_auth().replace_all(&out, "Basic ***");
+    let out = auth_scheme().replace_all(&out, "$1 ***");
     pem_block().replace_all(&out, "[REDACTED]").into_owned()
 }
 
@@ -31,7 +32,7 @@ fn credentials() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)(['"]?\b(?:password|passwd|pwd|token|secret|client[_-]?secret|api[_-]?key|private[_-]?key)\b['"]?)(\s*[:=]\s*)(['"]?[^\s,;'"}&]+)"#,
+            r#"(?i)(['"]?\b(?:password|passwd|pwd|secret|client[_-]?secret|api[_-]?key|private[_-]?key|(?:access|refresh|id)[_-]?token|token)\b['"]?)(\s*[:=]\s*)(['"]?[^\s,;'"}&]+)"#,
         )
         .expect("静态正则应合法")
     })
@@ -43,10 +44,12 @@ fn url_credentials() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r#"(?i)://[^@/\s]+@"#).expect("静态正则应合法"))
 }
 
-/// HTTP Basic 头：`Basic <base64>`。
-fn basic_auth() -> &'static Regex {
+/// HTTP 认证头方案：`Basic <base64>`、`Bearer <token>`（含 JWT）。
+fn auth_scheme() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\bBasic\s+[A-Za-z0-9+/=]+").expect("静态正则应合法"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)\b(Basic|Bearer)\s+[A-Za-z0-9._~+/=-]+").expect("静态正则应合法")
+    })
 }
 
 /// PEM 私钥块。
@@ -99,6 +102,27 @@ mod tests {
             redact("Authorization: Basic dXNlcjpwYXNz"),
             "Authorization: Basic ***"
         );
+    }
+
+    #[test]
+    fn bearer_token_masked() {
+        assert_eq!(
+            redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.abcdefgh"),
+            "Authorization: Bearer ***"
+        );
+        assert_eq!(
+            redact("Authorization: bearer abcdef"),
+            "Authorization: bearer ***"
+        );
+    }
+
+    #[test]
+    fn underscored_token_keys_masked() {
+        assert_eq!(
+            redact("access_token=abc&refresh_token=def"),
+            "access_token=***&refresh_token=***"
+        );
+        assert_eq!(redact("?id_token=xyz"), "?id_token=***");
     }
 
     #[test]

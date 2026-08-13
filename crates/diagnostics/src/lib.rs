@@ -13,9 +13,14 @@
 //!   变量 `FORGELINK_LOG_FORMAT`（`text`/`json`）覆盖；非法取值返回
 //!   [`LoggingError::InvalidFormat`]。
 //! - **幂等**：重复调用返回 [`InitOutcome::AlreadyInitialized`]，不 panic，
-//!   配置以首次调用为准；初始化失败后可重试。
+//!   配置以首次调用为准；初始化失败后可重试。若全局 subscriber 已由
+//!   其他代码安装（如第三方库自行初始化日志），返回
+//!   [`LoggingError::SubscriberAlreadySet`]——进程应终止或改用外部配置，
+//!   不得静默接受。
 //! - **非阻塞**：事件写入有界通道（8192 行），由专用线程刷到 stdout；
 //!   通道满时丢弃新行——日志丢帧优先于阻塞采集路径（§5 异步与并发）。
+//!   进程入口在优雅退出前必须调用 [`shutdown_logging`] 关闭发送端并
+//!   等待刷写线程排空，否则退出时未刷出的日志会丢失。
 //! - **脱敏**：错误链可能包含凭据（带密码的连接串等）时，记录前必须经
 //!   [`redact`] 掩盖；脱敏不能替代"不记录敏感字段"的纪律。
 //!
@@ -25,6 +30,8 @@ mod init;
 mod redact;
 mod writer;
 
-pub use init::{InitOutcome, LogFormat, LoggingConfig, LoggingError, init_logging};
+pub use init::{
+    InitOutcome, LogFormat, LoggingConfig, LoggingError, init_logging, shutdown_logging,
+};
 pub use redact::redact;
 pub use tracing;

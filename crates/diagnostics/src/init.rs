@@ -1,7 +1,8 @@
 //! 统一日志初始化：配置解析、subscriber 组装与全局安装（幂等）。
 
 use std::fmt;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::EnvFilter;
@@ -89,21 +90,51 @@ impl std::error::Error for LoggingError {}
 ///
 /// # Errors
 ///
-/// `RUST_LOG` 非法、`FORGELINK_LOG_FORMAT` 非法、writer 线程启动失败
+/// `RUST_LOG` 非法、`FORGELINK_LOG_FORMAT` 非法、writer 线程启动失败、
+/// 全局 subscriber 已被其他代码安装（[`LoggingError::SubscriberAlreadySet`]）
 /// 时返回 [`LoggingError`]；失败后允许重试（本次调用不会安装任何状态）。
 pub fn init_logging(config: LoggingConfig) -> Result<InitOutcome, LoggingError> {
     static STATE: OnceLock<InitOutcome> = OnceLock::new();
     if STATE.get().is_some() {
         return Ok(InitOutcome::AlreadyInitialized);
     }
-    let outcome = match install(config) {
-        Ok(()) => InitOutcome::Initialized,
-        // 并发竞态：另一线程已先完成全局安装，按幂等返回。
-        Err(LoggingError::SubscriberAlreadySet) => InitOutcome::AlreadyInitialized,
-        Err(e) => return Err(e),
+    match install(config) {
+        Ok(()) => {
+            let _ = STATE.set(InitOutcome::Initialized);
+            Ok(InitOutcome::Initialized)
+        }
+        // 并发竞态：另一线程已先完成全局安装，按幂等返回；
+        // 否则（外部代码已安装 subscriber）按错误返回，不静默接受。
+        Err(LoggingError::SubscriberAlreadySet) if STATE.get().is_some() => {
+            Ok(InitOutcome::AlreadyInitialized)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 全局安装的刷写线程句柄（退出刷新用）。
+static SHUTDOWN: OnceLock<LoggingShutdown> = OnceLock::new();
+
+/// 日志退出刷新状态：writer（关闭发送端）+ 刷写线程句柄。
+struct LoggingShutdown {
+    writer: NonBlockingWriter,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// 优雅关闭日志（进程退出前调用）。
+///
+/// 关闭 writer 发送端并等待刷写线程将已入队事件全部刷到 stdout 后退出，
+/// 避免进程正常退出时未刷出的日志丢失。未初始化时为空操作；可重复
+/// 调用（首次之后仅关闭已关闭的发送端）。
+pub fn shutdown_logging() {
+    let Some(shutdown) = SHUTDOWN.get() else {
+        return;
     };
-    let _ = STATE.set(outcome);
-    Ok(outcome)
+    shutdown.writer.shutdown();
+    let join = shutdown.join.lock().expect("join 锁").take();
+    if let Some(join) = join {
+        let _ = join.join();
+    }
 }
 
 /// 解析级别过滤：优先 `RUST_LOG`，未设置时回退默认级别。
@@ -133,13 +164,28 @@ fn format_from_env_or(requested: LogFormat) -> Result<LogFormat, LoggingError> {
 
 /// 组装并安装全局 subscriber（Registry + EnvFilter 过滤 + text/json fmt
 /// Layer）；事件先入有界通道，由专用线程刷 stdout。
+///
+/// 全局安装成功后才保存退出句柄；失败路径会关闭发送端并等待刷写线程
+/// 退出，不留下游离线程。
 fn install(config: LoggingConfig) -> Result<(), LoggingError> {
     let filter = filter_from_env_or(config.default_level)?;
     let format = format_from_env_or(config.format)?;
-    let writer = NonBlockingWriter::spawn().map_err(LoggingError::Writer)?;
-    let subscriber = build_subscriber(filter, format, writer);
-    tracing::subscriber::set_global_default(subscriber)
-        .map_err(|_| LoggingError::SubscriberAlreadySet)
+    let (writer, join) = NonBlockingWriter::spawn().map_err(LoggingError::Writer)?;
+    let subscriber = build_subscriber(filter, format, writer.clone());
+    match tracing::subscriber::set_global_default(subscriber) {
+        Ok(()) => {
+            let _ = SHUTDOWN.set(LoggingShutdown {
+                writer,
+                join: Mutex::new(Some(join)),
+            });
+            Ok(())
+        }
+        Err(_) => {
+            writer.shutdown();
+            let _ = join.join();
+            Err(LoggingError::SubscriberAlreadySet)
+        }
+    }
 }
 
 /// 构建 subscriber（供全局安装与测试捕获共用）。
@@ -342,12 +388,20 @@ mod tests {
         })
         .expect("重复初始化应成功返回");
         assert_eq!(third, InitOutcome::AlreadyInitialized);
+        // 清理真实刷写线程，避免测试进程退出时残留。
+        shutdown_logging();
+    }
+
+    #[test]
+    fn shutdown_logging_is_idempotent_and_noop_when_uninitialized() {
+        shutdown_logging();
+        shutdown_logging();
     }
 
     #[test]
     fn non_blocking_writer_enqueues_line() {
         let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
-        let mut writer = NonBlockingWriter::from_channel(Arc::new(tx));
+        let mut writer = NonBlockingWriter::from_channel(tx);
         writer.write_all(b"hello\n").expect("写入不应失败");
         let line = rx.recv().expect("应收到事件行");
         assert_eq!(&*line, b"hello\n");
@@ -356,7 +410,7 @@ mod tests {
     #[test]
     fn non_blocking_writer_drops_when_full_without_blocking() {
         let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
-        let mut writer = NonBlockingWriter::from_channel(Arc::new(tx));
+        let mut writer = NonBlockingWriter::from_channel(tx);
         writer.write_all(b"first\n").expect("写入不应失败");
         writer
             .write_all(b"second\n")
@@ -364,5 +418,25 @@ mod tests {
         // 通道已满：second 被丢弃，first 仍可取出。
         let line = rx.recv().expect("应收到首行");
         assert_eq!(&*line, b"first\n");
+    }
+
+    #[test]
+    fn writes_after_shutdown_are_dropped() {
+        let (tx, rx) = mpsc::sync_channel::<Box<[u8]>>(1);
+        let writer = NonBlockingWriter::from_channel(tx);
+        writer.shutdown();
+        let mut w = writer.clone();
+        w.write_all(b"x\n").expect("shutdown 后写入不应失败");
+        assert!(rx.try_recv().is_err(), "shutdown 后不应再入队");
+    }
+
+    #[test]
+    fn shutdown_flushes_and_stops_writer_thread() {
+        // 真实刷写线程：写入事件后 shutdown，线程应排空已入队事件并退出。
+        let (writer, join) = NonBlockingWriter::spawn().expect("线程启动失败");
+        let mut w = writer.clone();
+        w.write_all(b"flush-before-exit\n").expect("写入不应失败");
+        writer.shutdown();
+        join.join().expect("刷写线程应正常退出");
     }
 }

@@ -24,4 +24,6 @@ fn main() {
     // TODO: 组装 edge-core 组件，加载配置并启动采集
 
     info!(component = "collector", "collector 退出");
+    // 优雅退出：关闭发送端并等待刷写线程排空，避免日志丢失（§6）。
+    diagnostics::shutdown_logging();
 }
