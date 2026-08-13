@@ -1,0 +1,33 @@
+[package]
+name = "collector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["collector"]
+
+# 纯采集：编译期不含控制链路（§98、§106）
+collector = [
+    "driver-read",
+    "mqtt",
+    "local-cache",
+]
+
+# 启用控制链路（driver-write、control-engine）
+control = [
+    "driver-write",
+    "control-engine",
+]
+
+# 占位：依赖落地后改为 `dep:xxx` 或 `xxx/feature` 形式（§98）。
+# 接入控制链路后必须验证只读构建（--no-default-features --features collector）
+# 不包含控制代码（无 control-engine / driver-write）。
+driver-read = []
+mqtt = []
+local-cache = []
+driver-write = []
+control-engine = []
+
+[dependencies]
