@@ -88,6 +88,10 @@ impl std::error::Error for LoggingError {}
 
 /// 初始化全局结构化日志（幂等，见 crate 文档）。
 ///
+/// 完整初始化流程由互斥锁串行化：并发首次调用时恰好一个线程完成
+/// 安装，其余线程返回 [`InitOutcome::AlreadyInitialized`]，不会误报
+/// 冲突（见 P2）。
+///
 /// # Errors
 ///
 /// `RUST_LOG` 非法、`FORGELINK_LOG_FORMAT` 非法、writer 线程启动失败、
@@ -95,6 +99,15 @@ impl std::error::Error for LoggingError {}
 /// 时返回 [`LoggingError`]；失败后允许重试（本次调用不会安装任何状态）。
 pub fn init_logging(config: LoggingConfig) -> Result<InitOutcome, LoggingError> {
     static STATE: OnceLock<InitOutcome> = OnceLock::new();
+    // 串行化完整初始化：避免并发首次调用时，一个线程已安装全局
+    // subscriber、尚未写入 STATE，另一个线程误报 SubscriberAlreadySet。
+    static INIT_MUTEX: Mutex<()> = Mutex::new(());
+
+    // 快速路径：已初始化则直接幂等返回，不触碰锁。
+    if STATE.get().is_some() {
+        return Ok(InitOutcome::AlreadyInitialized);
+    }
+    let _guard = INIT_MUTEX.lock().expect("初始化互斥锁");
     if STATE.get().is_some() {
         return Ok(InitOutcome::AlreadyInitialized);
     }
@@ -103,11 +116,7 @@ pub fn init_logging(config: LoggingConfig) -> Result<InitOutcome, LoggingError> 
             let _ = STATE.set(InitOutcome::Initialized);
             Ok(InitOutcome::Initialized)
         }
-        // 并发竞态：另一线程已先完成全局安装，按幂等返回；
-        // 否则（外部代码已安装 subscriber）按错误返回，不静默接受。
-        Err(LoggingError::SubscriberAlreadySet) if STATE.get().is_some() => {
-            Ok(InitOutcome::AlreadyInitialized)
-        }
+        // 锁内失败只可能是外部代码已安装 subscriber。
         Err(e) => Err(e),
     }
 }
