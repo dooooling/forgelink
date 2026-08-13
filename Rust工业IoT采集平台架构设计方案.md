@@ -1880,6 +1880,10 @@ observation_id    - 数据点级去重
 request_id        - 控制请求级幂等/关联
 ```
 
+`observation_id` 生成时必须嵌入 `collector_session_id`（Collector 启动时
+生成），保证 Collector 重启、sequence 重新递增后相同
+`device_id + path + sequence` 不会产生重复 ID，消费者不会误判为重复而丢弃。
+
 顺序只保证：
 
 ```text

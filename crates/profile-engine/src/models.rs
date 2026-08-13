@@ -113,3 +113,10 @@ pub struct DeviceProfile {
     pub commands: Vec<ProfileCommand>,
     pub capabilities: ProfileCapabilities,
 }
+
+impl DeviceProfile {
+    /// 按语义路径查询属性映射。
+    pub fn property(&self, path: &str) -> Option<&ProfileProperty> {
+        self.properties.iter().find(|p| p.path == path)
+    }
+}

@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// # 序列化
 ///
-/// `observation_id` 是数据点级去重键（§31.3）；`sequence` 在同一
+/// `observation_id` 是数据点级去重键（§31.3），生成时嵌入
+/// `collector_session_id`（见 `domain-model::build_observation`），
+/// 保证 Collector 重启后仍跨会话唯一；`sequence` 在同一
 /// device_id + 单一 Collector session 内单调递增。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {

@@ -36,6 +36,11 @@ version = "0.1.0"
 [[package]]
 name = "domain-model"
 version = "0.1.0"
+dependencies = [
+ "observation-model",
+ "profile-engine",
+ "serde_json",
+]
 
 [[package]]
 name = "driver-loader"
