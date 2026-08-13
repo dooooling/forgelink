@@ -1,18 +1,31 @@
 //! profile-engine：Device Profile 引擎（§37、§38 Normative）。
 //!
-//! 本阶段只包含 Profile 数据模型（`DeviceProfile` / `ProfileProperty` /
-//! `ProfileCommand` / `ProfileCapabilities`）；读取转换与写入逆变换等
-//! 运行逻辑（§37.1）在后续迭代实现。
-//!
 //! Profile 负责：地址映射、缩放、单位、枚举、语义名称、默认采样周期、
 //! 型号能力等"具体品牌型号"层语义；不实现任何协议编解码。
+//!
+//! 本 crate 提供：
+//!
+//! - 数据模型（`models`）：`DeviceProfile` / `ProfileProperty` 等；
+//! - 完整校验（`validate`）：字段、路径、缩放、类型族、范围（§37）；
+//! - 动态加载（`loader`）：`profiles/` 目录 JSON 递归加载（§38）；
+//! - 注册表（`registry`）：按 `profile_id` 索引的只读查询；
+//! - 转换（`convert`）：读取解码 `RawReadResult → Value + Quality`（§37.1），
+//!   写入逆变换 `Value → RawValue`（缩放、取整、范围与溢出检查）。
 
+mod convert;
+mod loader;
 mod models;
+mod registry;
+mod validate;
 
+pub use convert::{ConversionError, DecodedRead, decode_read, encode_write};
+pub use loader::{LoaderError, load_profiles_dir, load_single};
 pub use models::{
     AcquisitionConstraints, DeviceProfile, ProfileCapabilities, ProfileCommand, ProfileProperty,
     WriteRounding,
 };
+pub use registry::{ProfileRegistry, RegistryError};
+pub use validate::{ValidationError, validate_profile, validate_property};
 
 #[cfg(test)]
 mod tests {
