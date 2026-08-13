@@ -2,7 +2,7 @@
 
 ## 仓库状态
 
-- 当前已完成核心规范模型：`crates/observation-model`（§96 共享模型）、`crates/driver-sdk`（Driver 契约、ABI v1 Tag/Envelope 契约 §17）、`crates/profile-engine`（Device Profile 模型 §37）；其余 crate 与 `drivers/modbus`、`apps/` 仍为占位。仓库已推送至 GitHub（origin，默认分支 `main`）；GitHub Actions CI 见 `.github/workflows/ci.yml`。
+- 当前已完成：核心规范模型（`crates/observation-model`，§96 共享模型）、Driver 契约与 ABI v1 Tag/Envelope 契约（`crates/driver-sdk`，§17）、Profile Engine（`crates/profile-engine`：Device Profile 模型 §37 + 运行逻辑——完整校验 validate、JSON 加载 loader、注册表 registry、读解码/写编码 convert §37.1）、Domain Model 最小映射（`crates/domain-model`：标准路径前缀表 standard、`validate_domain_path`/`build_observation` mapper，observation_id 为长度前缀无歧义编码并嵌入 collector_session_id）；其余 crate 与 `drivers/modbus`、`apps/` 仍为占位。仓库已推送至 GitHub（origin，默认分支 `main`）；GitHub Actions CI 见 `.github/workflows/ci.yml`。
 - 唯一架构依据是 `Rust工业IoT采集平台架构设计方案.md`，提出架构或编写代码前必须阅读相关章节。
 - 日常编码、测试和变更要求遵循 `开发规范.md`。
 - 文档是渐进式设计：冲突时以后文及“更新后”“最终”章节为准；仍无法判断时先询问，不自行创造第三种方案。
