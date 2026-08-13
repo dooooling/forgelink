@@ -31,3 +31,5 @@ driver-write = []
 control-engine = []
 
 [dependencies]
+diagnostics = { path = "../../crates/diagnostics" }
+tracing = "0.1"
