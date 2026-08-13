@@ -1042,6 +1042,45 @@ pub struct FfiWriteItem {
 
 `expected_type/value_type` 的数值映射由 ABI v1 固定；`value_bytes` 的具体标量编码由对应 type 规定，复杂结果统一通过带 schema 的 UTF-8 JSON envelope 返回。
 
+### 类型 Tag 表（ABI v1 固定）
+
+| Tag | 数值 | 说明 |
+|---|---|---|
+| `TAG_UNKNOWN` | 0 | 未指定（线格式哨兵值，不是合法的 `TypeTag`） |
+| Bool | 1 | 1 字节 |
+| I8 | 2 | 1 字节 |
+| I16 | 3 | 2 字节 |
+| I32 | 4 | 4 字节 |
+| I64 | 5 | 8 字节 |
+| U8 | 6 | 1 字节 |
+| U16 | 7 | 2 字节 |
+| U32 | 8 | 4 字节 |
+| U64 | 9 | 8 字节 |
+| F32 | 10 | IEEE-754 binary32，4 字节 |
+| F64 | 11 | IEEE-754 binary64，8 字节 |
+| String | 12 | UTF-8 |
+| Bytes | 13 | 原样字节 |
+| Array | 14 | 复杂类型，仅允许作为 `expected_type` 提示 |
+| Struct | 15 | 复杂类型，仅允许作为 `expected_type` 提示 |
+
+映射规则：
+
+- `expected_type = 0`（`TAG_UNKNOWN`）表示未指定类型，是合法输入；
+  Core/Plugin 统一通过 `Option<DataType> ↔ u32` 转换：`None → 0`、`0 → None`。
+- `Array`/`Struct` 只能作为 `expected_type` 提示（元素/字段 schema 由 Profile
+  提供），缺少 schema 时无法还原为完整 `DataType`。
+- 增删改 Tag 属于 ABI 破坏性变更，必须升级 ABI major（§18）。
+
+### value_bytes 标量编码（ABI v1 固定）
+
+- 整数：定宽**小端序**（little-endian），字节数由 Tag 决定且必须精确匹配。
+- Bool：恰好 1 字节，`0x00 = false`、`0x01 = true`。
+- F32/F64：IEEE-754 小端编码（4 / 8 字节）。
+- String：UTF-8 字节，长度 = `FfiStr.len`，不要求 NUL 结尾；Bytes：原样字节。
+- `Array`/`Struct` **不允许**写入 `value_bytes`：复杂结果统一通过带
+  `schema_version` 的 UTF-8 JSON envelope 返回（§17.9），
+  ABI v1 不提供复杂值写入通道。
+
 ## 17.3 内存所有权
 
 跨 DLL/SO 禁止 Core 直接释放 Plugin allocator 分配的内存，反之亦然。
@@ -1217,6 +1256,16 @@ pub struct DriverApiV1 {
 ```
 
 `FfiOwnedBuffer` 中 read/write/execute/browse/history 的 payload，以及 subscription/event callback 的 `event_json`，都必须由 ABI minor 固定。v1 初始实现统一使用稳定、带 `schema_version` 的 UTF-8 JSON envelope；后续若引入二进制编码必须通过 feature flag/新 minor 协商，不得静默改变。
+
+Envelope 契约（ABI 1.0 固定）：
+
+- 所有请求/结果/事件 Envelope 必须携带 `schema_version` 字段，v1 固定为 `"1.0"`，
+  与 ABI minor 同步演进。
+- Core/Plugin 反序列化时必须校验 `schema_version`，与自身支持版本不一致的
+  Envelope 必须直接拒绝，不得降级解析。
+- 同一 ABI minor 内 Envelope 结构不变，新增可选字段属于 minor 演进；
+  破坏性变更必须升级 ABI major（§17.4、§18）。
+- 例外：`get_last_error_json`（§17.6）保持固定形状，不携带 `schema_version`。
 
 ---
 
