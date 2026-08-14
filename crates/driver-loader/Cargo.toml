@@ -4,5 +4,18 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Native Plugin 加载器：加载/校验驱动动态库并适配为同步调用接口（§19、§20）"
 
 [dependencies]
+driver-sdk = { path = "../driver-sdk" }
+libloading = "0.8"
+serde = "1"
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+observation-model = { path = "../observation-model" }
+
+[[example]]
+name = "test_driver_plugin"
+crate-type = ["cdylib"]
