@@ -43,6 +43,12 @@ pub struct NativeDriver {
     connected: bool,
 }
 
+// Safety: `handle` 为不透明指针（`DriverHandle.ptr`）。句柄默认非重入、非并发
+// 安全（§17.5），本结构所有方法均接收 `&mut self` 串行化调用；跨线程**转移**
+// （Send）本身不引入并发调用。`plugin`（`Arc<NativePlugin>`）内部的
+// `libloading::Library` 与 `&'static DriverApiV1` 均为 `Send + Sync`。
+unsafe impl Send for NativeDriver {}
+
 /// Plugin 分配的 owned buffer 的 RAII 包装（§17.3 谁分配谁释放）。
 ///
 /// Drop 时通过 `free_buffer` 释放；不可复制，独占所有权。
