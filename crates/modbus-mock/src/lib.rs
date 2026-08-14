@@ -1,9 +1,12 @@
-//! 同步 mock Modbus TCP server（集成测试共用）。
+//! 同步 Mock Modbus TCP server（测试共用，非生产代码）。
 //!
-//! 支持行为配置：寄存器表（按 unit/kind/offset 的值）、指定地址返回异常、
-//! 响应延迟、连接立即断开。
-
-#![allow(dead_code)]
+//! 供 Modbus Driver 与上层全链路测试复用：支持行为配置——寄存器表
+//! （按 unit/kind/offset 的值）、指定地址返回异常、畸形异常响应、
+//! 响应延迟、错误字节计数、连接立即断开，以及请求计数统计。
+//!
+//! # 注意
+//!
+//! 本 crate 仅用于测试，不参与生产构建路径。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -331,7 +334,7 @@ fn handle_connection(
     }
 }
 
-/// 便捷：配置 host/port 的连接 JSON。
+/// 便捷：配置 host/port 的连接 JSON（Modbus Driver `mode=tcp`）。
 pub fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
     serde_json::json!({
         "mode": "tcp",

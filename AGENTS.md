@@ -2,7 +2,7 @@
 
 ## 仓库状态
 
-- 当前已完成：核心规范模型（`crates/observation-model`，§96 共享模型）、Driver 契约与 ABI v1 Tag/Envelope 契约（`crates/driver-sdk`，§17）、日志基础设施（`crates/diagnostics`，§6）、Native Plugin 加载器（`crates/driver-loader`，§19/§20）、Profile Engine（`crates/profile-engine`：Device Profile 模型 §37 + 运行逻辑——完整校验 validate、JSON 加载 loader、注册表 registry、读解码/写编码 convert §37.1）、Domain Model 最小映射（`crates/domain-model`：标准路径前缀表 standard、`validate_domain_path`/`build_observation` mapper，observation_id 为长度前缀无歧义编码并嵌入 collector_session_id）、Poll Engine（`crates/poll-engine`：周期调度/超时/退避重试/取消，PR #9 已合并）、Modbus Driver MVP（`drivers/modbus`：TCP/RTU、地址解析 `1!40001`/`coil:00001`/`input:30001`、批量合并读 FC01~FC04、Native Plugin C ABI v1、超时/断线重连；测试含 mock Modbus TCP server 的 ABI 全链路与 poll-engine 最小集成）。`drivers/modbus` 测试加载真实 cdylib 产物，产物缺失时自动 `cargo build -p driver-modbus`（嵌套 build 安全）。尚未完成的主要能力包括 MQTT 输出、REST API、Local Buffer/WAL、Control Engine、设备管理和三个运行程序的完整组装。仓库已推送至 GitHub（origin，默认分支 `main`）；GitHub Actions CI 见 `.github/workflows/ci.yml`。
+- 当前已完成：核心规范模型（`crates/observation-model`，§96 共享模型）、Driver 契约与 ABI v1 Tag/Envelope 契约（`crates/driver-sdk`，§17）、日志基础设施（`crates/diagnostics`，§6）、Native Plugin 加载器（`crates/driver-loader`，§19/§20）、Profile Engine（`crates/profile-engine`：Device Profile 模型 §37 + 运行逻辑——完整校验 validate、JSON 加载 loader、注册表 registry、读解码/写编码 convert §37.1）、Domain Model 最小映射（`crates/domain-model`：标准路径前缀表 standard、`validate_domain_path`/`build_observation` mapper，observation_id 为长度前缀无歧义编码并嵌入 collector_session_id）、Poll Engine（`crates/poll-engine`：周期调度/超时/退避重试/取消，PR #9 已合并）、Modbus Driver MVP（`drivers/modbus`：TCP/RTU、地址解析 `1!40001`/`coil:00001`/`input:30001`、批量合并读 FC01~FC04、Native Plugin C ABI v1、超时/断线重连；测试含 mock Modbus TCP server 的 ABI 全链路与 poll-engine 最小集成）、设备管理（`crates/device-manager`：设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、RawReadResult→Profile→Domain→Observation 全链路映射，含 Modbus Mock 全链路测试；测试共用 `crates/modbus-mock`）。`drivers/modbus` 测试加载真实 cdylib 产物，产物缺失时自动 `cargo build -p driver-modbus`（嵌套 build 安全）。尚未完成的主要能力包括 MQTT 输出、REST API、Local Buffer/WAL、Control Engine 和三个运行程序的完整组装。仓库已推送至 GitHub（origin，默认分支 `main`）；GitHub Actions CI 见 `.github/workflows/ci.yml`。
 - 唯一架构依据是 `Rust工业IoT采集平台架构设计方案.md`，提出架构或编写代码前必须阅读相关章节。
 - 日常编码、测试和变更要求遵循 `开发规范.md`。
 - 文档是渐进式设计：冲突时以后文及“更新后”“最终”章节为准；仍无法判断时先询问，不自行创造第三种方案。
@@ -31,7 +31,7 @@
 - 新增或修改架构文档使用中文，并检查术语、章节编号、交叉引用和代码示例一致性。
 - 代码应有充分且合理的注释；公共 API 必须使用 Rustdoc，详细要求见 `开发规范.md`。
 - 网络 I/O、采集调度和消息管道应合理使用 Rust 异步机制，并采用有界并发、背压和阻塞任务隔离；不得无限制创建异步任务。
-- 工具链：Rust 1.95+，edition 2024。构建验证命令：`cargo check --workspace`（全部 17 个成员）。当前 CI 实际覆盖 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace`、`cargo doc --workspace --no-deps`；带 `--all-targets --all-features` 的完整检查和 Clippy 由开发规范要求在本地或 CI 增强任务中执行。
+- 工具链：Rust 1.95+，edition 2024。构建验证命令：`cargo check --workspace`（全部 18 个成员）。当前 CI 实际覆盖 `cargo fmt --all --check`、`cargo check --workspace`、`cargo test --workspace`、`cargo doc --workspace --no-deps`；带 `--all-targets --all-features` 的完整检查和 Clippy 由开发规范要求在本地或 CI 增强任务中执行。
 - Collector 的 `collector`/`control` feature 目前为空占位标记；接入控制链路（control-engine、driver-write）后，必须验证 `cargo check -p collector --no-default-features --features collector` 的构建产物不包含控制代码。
 - Git 操作必须遵循 `开发规范.md`：禁止直接在 `main` 分支开发、提交或推送，所有变更通过独立分支和 Pull Request 合并。
 - 保持任务范围最小，不重新讨论文档中已确定的决策。

@@ -81,6 +81,20 @@ version = "0.1.0"
 [[package]]
 name = "device-manager"
 version = "0.1.0"
+dependencies = [
+ "diagnostics",
+ "domain-model",
+ "driver-loader",
+ "driver-sdk",
+ "modbus-mock",
+ "observation-model",
+ "poll-engine",
+ "profile-engine",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "diagnostics"
@@ -119,6 +133,7 @@ version = "0.1.0"
 dependencies = [
  "driver-loader",
  "driver-sdk",
+ "modbus-mock",
  "observation-model",
  "poll-engine",
  "serde",
@@ -283,6 +298,13 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
+name = "modbus-mock"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "mqtt-client"
