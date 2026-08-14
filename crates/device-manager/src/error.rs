@@ -30,6 +30,10 @@ pub enum DeviceManagerError {
         driver_id: String,
         reason: String,
     },
+    /// 默认采集间隔为 0（外部配置非法，不终止进程）。
+    InvalidDefaultInterval { interval_ms: u64 },
+    /// 读取项采集间隔为 0（Profile 配置非法）。
+    InvalidReadItemInterval { device_id: String, path: String },
 }
 
 impl fmt::Display for DeviceManagerError {
@@ -66,6 +70,12 @@ impl fmt::Display for DeviceManagerError {
                 f,
                 "设备 `{device_id}` 绑定 driver `{driver_id}` 失败: {reason}"
             ),
+            Self::InvalidDefaultInterval { interval_ms } => {
+                write!(f, "默认采集间隔 {interval_ms}ms 必须大于 0")
+            }
+            Self::InvalidReadItemInterval { device_id, path } => {
+                write!(f, "设备 `{device_id}` 读取项 `{path}` 的采集间隔必须大于 0")
+            }
         }
     }
 }

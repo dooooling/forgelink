@@ -14,6 +14,8 @@ pub enum BindError {
     UnknownDriver { driver_id: String },
     /// Driver 实例创建失败（配置非法等）。
     CreateFailed { driver_id: String, error: String },
+    /// 同名 Driver 已注册（`add_plugin` 拒绝重复注册）。
+    DuplicateDriver { driver_id: String },
 }
 
 impl fmt::Display for BindError {
@@ -22,6 +24,9 @@ impl fmt::Display for BindError {
             Self::UnknownDriver { driver_id } => write!(f, "driver `{driver_id}` 不可用"),
             Self::CreateFailed { driver_id, error } => {
                 write!(f, "driver `{driver_id}` 创建失败: {error}")
+            }
+            Self::DuplicateDriver { driver_id } => {
+                write!(f, "driver `{driver_id}` 已注册，拒绝重复注册")
             }
         }
     }
@@ -53,7 +58,7 @@ pub trait DriverFactory: Send + Sync {
 
 /// 基于 Native Plugin（C ABI v1）的默认 Driver 工厂（§19、§20）。
 ///
-/// 上层负责按 `driver_id` 预加载 [`NativePlugin`]（Manifest 解析见 §20），
+/// 上层负责按需加载 [`NativePlugin`]（Manifest 解析见 §20），
 /// 本工厂只做"插件 → 实例"的创建与适配。
 #[derive(Debug, Default)]
 pub struct NativeDriverFactory {
@@ -66,9 +71,18 @@ impl NativeDriverFactory {
         Self::default()
     }
 
-    /// 注册一个已加载的 Native Plugin（按 Manifest `id` 索引）。
-    pub fn add_plugin(&mut self, driver_id: String, plugin: Arc<NativePlugin>) {
+    /// 注册一个已加载的 Native Plugin。
+    ///
+    /// `driver_id` 取自插件 Manifest 的 `id` 字段（§20），调用方传入的
+    /// ID 不可覆盖 Manifest 声明，避免错误绑定；
+    /// 同名 Driver 重复注册返回 [`BindError::DuplicateDriver`]。
+    pub fn add_plugin(&mut self, plugin: Arc<NativePlugin>) -> Result<(), BindError> {
+        let driver_id = plugin.manifest().id.clone();
+        if self.plugins.contains_key(&driver_id) {
+            return Err(BindError::DuplicateDriver { driver_id });
+        }
         self.plugins.insert(driver_id, plugin);
+        Ok(())
     }
 }
 

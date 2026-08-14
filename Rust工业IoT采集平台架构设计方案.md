@@ -2318,7 +2318,7 @@ V0.4: FANUC FOCAS Process Plugin
 
 ## 34.7 当前仓库实施状态（非架构决策）
 
-截至 Modbus Driver MVP 合并，以下能力已经在 workspace 中实现并有自动化测试：
+截至设备管理合并，以下能力已经在 workspace 中实现并有自动化测试：
 
 ```text
 observation-model     共享规范模型
@@ -2329,12 +2329,14 @@ profile-engine        Profile 校验、加载、注册与读写转换
 domain-model          Domain 路径校验与 Observation 映射
 poll-engine           周期调度、超时、指数退避、取消与阻塞隔离
 driver-modbus         Modbus TCP/RTU 读取 Driver MVP
+device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射
+modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 
 以下能力仍未完成端到端交付：
 
 ```text
-MQTT 输出、REST API、Local Buffer/WAL、Control Engine、设备管理，
+MQTT 输出、REST API、Local Buffer/WAL、Control Engine，
 以及 collector / edge-server / manager 的完整运行时组装、三平台部署、
 性能基准和长时间稳定性验收。
 ```

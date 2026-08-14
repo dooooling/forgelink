@@ -24,9 +24,11 @@ mod error;
 mod instance;
 mod pipeline;
 mod read_items;
+mod sequence;
 
 pub use bind::{BindError, DriverFactory, NativeDriverFactory};
 pub use error::DeviceManagerError;
 pub use instance::{DeviceInstance, DeviceManager};
 pub use pipeline::{MapContext, map_failure, map_results, reason_for_driver_error};
-pub use read_items::{ReadGroup, ReadItem, generate_read_items, group_read_items};
+pub use read_items::{ReadGroup, ReadItem, ReadItemsError, generate_read_items, group_read_items};
+pub use sequence::SequenceAllocator;

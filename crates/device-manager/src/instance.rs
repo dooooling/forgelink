@@ -52,9 +52,15 @@ impl DeviceInstance {
 
     /// 生成本设备的所有 Poll 目标（§22 Group → PollTarget）。
     ///
+    /// 设备 `enabled == false`（§4.2）时返回空列表：禁用设备不参与采集，
+    /// 上层不得为其生成调度任务。
+    ///
     /// 返回的每个目标与 `driver` 一一配对即可交给
     /// [`PollScheduler`](poll_engine::PollScheduler) 调度。
     pub fn poll_targets(&self) -> Vec<PollTarget> {
+        if !self.device.enabled {
+            return Vec::new();
+        }
         self.groups
             .iter()
             .map(|group| PollTarget {
@@ -91,19 +97,23 @@ impl DeviceManager {
     ///
     /// - `profiles`：Profile 注册表（§38）；
     /// - `drivers`：Driver 工厂（Native Plugin / 测试替身）；
-    /// - `default_interval_ms`：默认采集间隔，必须大于 0。
+    /// - `default_interval_ms`：属性未声明 `default_interval_ms` 时的默认
+    ///   采集间隔（毫秒），必须大于 0，否则返回
+    ///   [`DeviceManagerError::InvalidDefaultInterval`]。
     pub fn new(
         profiles: ProfileRegistry,
         drivers: Box<dyn DriverFactory>,
         default_interval_ms: u64,
-    ) -> Self {
-        assert!(default_interval_ms > 0, "默认采集间隔必须大于 0");
-        Self {
+    ) -> Result<Self, DeviceManagerError> {
+        if default_interval_ms == 0 {
+            return Err(DeviceManagerError::InvalidDefaultInterval { interval_ms: 0 });
+        }
+        Ok(Self {
             profiles,
             drivers,
             default_interval_ms,
             devices: HashMap::new(),
-        }
+        })
     }
 
     /// 注册设备实例（§100：Load Profile → Load Driver → 生成读取项）。
@@ -155,7 +165,14 @@ impl DeviceManager {
                 "设备无任何可读属性（无轮询组）"
             );
         }
-        let groups = group_read_items(read_items.clone());
+        let groups = group_read_items(read_items.clone()).map_err(|error| {
+            DeviceManagerError::InvalidReadItemInterval {
+                device_id: device.id.clone(),
+                path: match error {
+                    crate::read_items::ReadItemsError::InvalidInterval { path } => path,
+                },
+            }
+        })?;
 
         let instance = DeviceInstance {
             device,
@@ -269,7 +286,7 @@ mod tests {
     fn manager() -> DeviceManager {
         let mut registry = ProfileRegistry::new();
         registry.register(profile()).unwrap();
-        DeviceManager::new(registry, Box::new(StubFactory), 1000)
+        DeviceManager::new(registry, Box::new(StubFactory), 1000).expect("默认间隔合法")
     }
 
     fn device() -> Device {
@@ -355,5 +372,29 @@ mod tests {
         assert_eq!(mgr.len(), 1);
         assert!(mgr.remove("vfd-01").is_some());
         assert!(mgr.is_empty());
+    }
+
+    #[test]
+    fn disabled_device_generates_no_poll_targets() {
+        let mut mgr = manager();
+        let mut d = device();
+        d.enabled = false;
+        mgr.register_device(d).unwrap();
+        let instance = mgr.get("vfd-01").expect("已注册");
+        assert!(
+            instance.poll_targets().is_empty(),
+            "禁用设备不得生成采集任务"
+        );
+        assert_eq!(instance.groups.len(), 1, "读取项分组仍保留（注册时生成）");
+    }
+
+    #[test]
+    fn rejects_zero_default_interval() {
+        let registry = ProfileRegistry::new();
+        let result = DeviceManager::new(registry, Box::new(StubFactory), 0);
+        assert!(matches!(
+            result,
+            Err(DeviceManagerError::InvalidDefaultInterval { interval_ms: 0 })
+        ));
     }
 }

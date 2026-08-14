@@ -9,11 +9,31 @@
 //!   默认组（§100 采集配置）；同一设备不同组的读取项互不重叠。
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
 
 use driver_sdk::DriverReadItem;
 use observation_model::PropertyPath;
 use profile_engine::{DeviceProfile, ProfileProperty};
+
+/// 读取项分组的配置错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadItemsError {
+    /// 读取项采集间隔为 0（`default_interval_ms` 非法，§37 校验拒绝该值）。
+    InvalidInterval { path: PropertyPath },
+}
+
+impl fmt::Display for ReadItemsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInterval { path } => {
+                write!(f, "属性 `{path}` 的采集间隔必须大于 0")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReadItemsError {}
 
 /// 单个读取项（§22 Tag）。
 #[derive(Debug, Clone, PartialEq)]
@@ -68,20 +88,19 @@ pub fn generate_read_items(profile: &DeviceProfile, default_interval_ms: u64) ->
 
 /// 按 `interval_ms` 分组（§22 Group），组间顺序按间隔升序。
 ///
-/// # Panics
+/// # Errors
 ///
-/// 读取项 `interval_ms` 为 0 时 panic（上层应在配置校验中拒绝）。
-pub fn group_read_items(items: Vec<ReadItem>) -> Vec<ReadGroup> {
+/// 任一读取项 `interval_ms` 为 0（非法默认间隔或 Profile 配置）时返回
+/// [`ReadItemsError::InvalidInterval`]，不产生分组结果。
+pub fn group_read_items(items: Vec<ReadItem>) -> Result<Vec<ReadGroup>, ReadItemsError> {
     let mut by_interval: BTreeMap<u64, Vec<ReadItem>> = BTreeMap::new();
     for item in items {
-        assert!(
-            item.interval_ms > 0,
-            "读取项 `{}` 的采集间隔必须大于 0",
-            item.path
-        );
+        if item.interval_ms == 0 {
+            return Err(ReadItemsError::InvalidInterval { path: item.path });
+        }
         by_interval.entry(item.interval_ms).or_default().push(item);
     }
-    by_interval
+    Ok(by_interval
         .into_iter()
         .map(|(interval_ms, read_items)| ReadGroup {
             interval_ms,
@@ -91,7 +110,7 @@ pub fn group_read_items(items: Vec<ReadItem>) -> Vec<ReadGroup> {
                 .collect(),
             read_items,
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -173,7 +192,7 @@ mod tests {
     #[test]
     fn groups_by_declared_interval_and_default() {
         let items = generate_read_items(&sample_profile(), 1000);
-        let groups = group_read_items(items);
+        let groups = group_read_items(items).expect("间隔合法");
         assert_eq!(groups.len(), 2);
         // 间隔升序：100ms 组（a、b），1000ms 默认组（c）。
         assert_eq!(groups[0].interval_ms, 100);
@@ -188,6 +207,14 @@ mod tests {
                 .flat_map(|g| &g.read_items)
                 .all(|i| i.path != "drive.write_only")
         );
+    }
+
+    #[test]
+    fn rejects_zero_interval() {
+        let mut item = generate_read_items(&sample_profile(), 1000).remove(0);
+        item.interval_ms = 0;
+        let err = group_read_items(vec![item]).expect_err("0 间隔必须拒绝");
+        assert!(matches!(err, ReadItemsError::InvalidInterval { path } if path == "drive.a"));
     }
 
     #[test]

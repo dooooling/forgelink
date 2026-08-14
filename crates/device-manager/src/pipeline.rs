@@ -15,7 +15,8 @@
 //! - 整批失败（`PollEvent::Failed`）→ 批内每个读取项产出 `Bad`，
 //!   原因按 Driver 错误码映射（超时/连接/协议），原始 `protocol_code` 保留；
 //! - 未知 `item_id`（驱动返回未请求项）→ 跳过并告警，不伪造值；
-//! - `observation_id` 与 `sequence` 由本模块按批内顺序递增生成（§31.3）。
+//! - `sequence` 由 [`SequenceAllocator`] 按设备统一分配：多采集组、多批次
+//!   共享同一序列源，保证同设备同会话内单调递增（§31.3）。
 
 use domain_model::{DomainError, build_observation};
 use driver_sdk::{DriverErrorInfo, DriverReadItem};
@@ -26,22 +27,22 @@ use profile_engine::{DecodedRead, decode_read};
 use tracing::warn;
 
 use crate::instance::DeviceInstance;
+use crate::sequence::SequenceAllocator;
 
-/// 单批映射上下文（`collector_session_id` 与 `sequence` 由上层维护）。
+/// 单批映射上下文（`collector_session_id` 与时间戳由上层维护）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapContext {
     /// Collector 会话 ID（§31.3 去重；`build_observation` 要求非空）。
     pub collector_session_id: String,
     /// 采集端收到数据的时刻（§8 `ingest_timestamp_ns`）。
     pub ingest_timestamp_ns: TimestampNs,
-    /// 本批首个 `Observation` 的序列号（批内递增）。
-    pub sequence_start: u64,
 }
 
 /// 成功批次映射：`RawReadResult` 列表 → `Observation` 列表（§47）。
 ///
 /// - 每条结果按 `item_id` 回指 Profile 属性并解码；
 /// - 未请求的 `item_id` 跳过并告警；
+/// - `sequence` 由 `sequences` 按设备连续分配（批内递增、跨批单调，§31.3）；
 /// - 返回顺序与 `results` 一致。
 ///
 /// # Errors
@@ -52,7 +53,9 @@ pub fn map_results(
     instance: &DeviceInstance,
     results: &[RawReadResult],
     ctx: &MapContext,
+    sequences: &mut SequenceAllocator,
 ) -> Result<Vec<Observation>, DomainError> {
+    let sequence_start = sequences.allocate(&instance.device.id, results.len());
     let mut observations = Vec::with_capacity(results.len());
     for (index, result) in results.iter().enumerate() {
         let Some(item) = instance.item(result.item_id) else {
@@ -73,7 +76,7 @@ pub fn map_results(
             decoded,
             result.source_timestamp_ns,
             ctx.ingest_timestamp_ns,
-            ctx.sequence_start + index as u64,
+            sequence_start + index as u64,
             &ctx.collector_session_id,
         )?;
         observations.push(observation);
@@ -83,13 +86,17 @@ pub fn map_results(
 
 /// 整批失败映射：`PollEvent::Failed` → 批内每个读取项产出 `Bad`（§9）。
 ///
-/// 返回顺序与 `items` 一致；`protocol_code` 保留 Driver 原始错误码。
+/// `sequence` 由 `sequences` 按设备连续分配（与成功批次共享同一序列源，
+/// 保证同设备内单调，§31.3）；返回顺序与 `items` 一致；
+/// `protocol_code` 保留 Driver 原始错误码。
 pub fn map_failure(
     instance: &DeviceInstance,
     items: &[DriverReadItem],
     error: &DriverErrorInfo,
     ctx: &MapContext,
+    sequences: &mut SequenceAllocator,
 ) -> Result<Vec<Observation>, DomainError> {
+    let sequence_start = sequences.allocate(&instance.device.id, items.len());
     let mut observations = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
         let Some(read_item) = instance.item(item.id) else {
@@ -118,7 +125,7 @@ pub fn map_failure(
             decoded,
             None,
             ctx.ingest_timestamp_ns,
-            ctx.sequence_start + index as u64,
+            sequence_start + index as u64,
             &ctx.collector_session_id,
         )?;
         observations.push(observation);
@@ -220,7 +227,7 @@ mod tests {
     fn instance() -> DeviceInstance {
         let profile = std::sync::Arc::new(profile());
         let read_items = crate::read_items::generate_read_items(&profile, 1000);
-        let groups = crate::read_items::group_read_items(read_items.clone());
+        let groups = crate::read_items::group_read_items(read_items.clone()).expect("间隔合法");
         DeviceInstance {
             device: device(),
             profile,
@@ -245,8 +252,11 @@ mod tests {
         MapContext {
             collector_session_id: "sess-1".to_owned(),
             ingest_timestamp_ns: 1_700_000_000_000_000_000,
-            sequence_start: 42,
         }
+    }
+
+    fn allocator() -> SequenceAllocator {
+        SequenceAllocator::new()
     }
 
     fn raw_result(item_id: u64) -> RawReadResult {
@@ -263,7 +273,7 @@ mod tests {
     #[test]
     fn maps_good_results_with_scaling() {
         let results = vec![raw_result(0)];
-        let observations = map_results(&instance(), &results, &ctx()).unwrap();
+        let observations = map_results(&instance(), &results, &ctx(), &mut allocator()).unwrap();
         assert_eq!(observations.len(), 1);
         let obs = &observations[0];
         // 5000 * 0.01 = 50.0 Hz（§47 示例）。
@@ -271,7 +281,7 @@ mod tests {
         assert_eq!(obs.quality.level, QualityLevel::Good);
         assert_eq!(obs.path, "drive.output.frequency");
         assert_eq!(obs.device_id, "vfd-01");
-        assert_eq!(obs.sequence, 42);
+        assert_eq!(obs.sequence, 0);
         assert!(obs.observation_id.contains("vfd-01"));
         assert!(obs.observation_id.contains("sess-1"));
     }
@@ -285,7 +295,7 @@ mod tests {
             protocol_code: Some(2),
             retryable: false,
         });
-        let observations = map_results(&instance(), &[result], &ctx()).unwrap();
+        let observations = map_results(&instance(), &[result], &ctx(), &mut allocator()).unwrap();
         assert_eq!(observations[0].value, None);
         assert_eq!(observations[0].quality.level, QualityLevel::Bad);
         assert_eq!(observations[0].quality.reason, QualityReason::ProtocolError);
@@ -294,7 +304,8 @@ mod tests {
 
     #[test]
     fn skips_unknown_item_ids() {
-        let observations = map_results(&instance(), &[raw_result(99)], &ctx()).unwrap();
+        let observations =
+            map_results(&instance(), &[raw_result(99)], &ctx(), &mut allocator()).unwrap();
         assert!(observations.is_empty());
     }
 
@@ -309,7 +320,7 @@ mod tests {
             std::sync::Arc::new(p)
         };
         inst.profile = plc_profile;
-        let err = map_results(&inst, &[raw_result(0)], &ctx()).unwrap_err();
+        let err = map_results(&inst, &[raw_result(0)], &ctx(), &mut allocator()).unwrap_err();
         assert!(matches!(err, DomainError::PathPrefix { .. }));
     }
 
@@ -333,13 +344,14 @@ mod tests {
                 expected_type: Some(DataType::U16),
             },
         ];
-        let observations = map_failure(&instance(), &items, &error, &ctx()).unwrap();
+        let observations =
+            map_failure(&instance(), &items, &error, &ctx(), &mut allocator()).unwrap();
         assert_eq!(observations.len(), 1); // item 99 未请求，跳过
         let obs = &observations[0];
         assert_eq!(obs.value, None);
         assert_eq!(obs.quality.level, QualityLevel::Bad);
         assert_eq!(obs.quality.reason, QualityReason::Timeout);
-        assert_eq!(obs.sequence, 42);
+        assert_eq!(obs.sequence, 0);
     }
 
     #[test]
@@ -365,16 +377,61 @@ mod tests {
     }
 
     #[test]
-    fn context_controls_sequence_and_session() {
-        let observations = map_results(&instance(), &[raw_result(0)], &ctx()).unwrap();
-        assert_eq!(observations[0].sequence, 42);
-        let mut ctx2 = ctx();
-        ctx2.sequence_start = 7;
-        let observations2 = map_results(&instance(), &[raw_result(0)], &ctx2).unwrap();
-        assert_eq!(observations2[0].sequence, 7);
-        assert_ne!(
-            observations[0].observation_id,
-            observations2[0].observation_id
-        );
+    fn allocator_keeps_sequence_monotonic_across_batches() {
+        // 多批次共享同一分配器：sequence 跨批单调递增（§31.3）。
+        let mut seq = allocator();
+        let first = map_results(&instance(), &[raw_result(0)], &ctx(), &mut seq).unwrap();
+        assert_eq!(first[0].sequence, 0);
+        let second = map_results(
+            &instance(),
+            &[raw_result(0), raw_result(1)],
+            &ctx(),
+            &mut seq,
+        )
+        .unwrap();
+        assert_eq!(second[0].sequence, 1);
+        assert_eq!(second[1].sequence, 2);
+        // 失败批次共享同一序列源，不产生重复。
+        let error = DriverErrorInfo {
+            code: "timeout".to_owned(),
+            message: String::new(),
+            protocol_code: None,
+            retryable: true,
+        };
+        let failed = map_failure(
+            &instance(),
+            &[DriverReadItem {
+                id: 0,
+                address: "1!40001".to_owned(),
+                expected_type: Some(DataType::U16),
+            }],
+            &error,
+            &ctx(),
+            &mut seq,
+        )
+        .unwrap();
+        assert_eq!(failed[0].sequence, 3);
+
+        let all: Vec<u64> = first
+            .iter()
+            .chain(&second)
+            .chain(&failed)
+            .map(|o| o.sequence)
+            .collect();
+        let mut sorted = all.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(all, sorted, "同一设备 sequence 必须唯一且单调递增");
+    }
+
+    #[test]
+    fn different_devices_have_independent_sequences() {
+        let mut seq = allocator();
+        let mut other = instance();
+        other.device.id = "vfd-02".to_owned();
+        let a = map_results(&instance(), &[raw_result(0)], &ctx(), &mut seq).unwrap();
+        let b = map_results(&other, &[raw_result(0)], &ctx(), &mut seq).unwrap();
+        assert_eq!(a[0].sequence, 0);
+        assert_eq!(b[0].sequence, 0);
     }
 }

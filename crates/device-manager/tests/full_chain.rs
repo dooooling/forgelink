@@ -23,7 +23,8 @@ mod common;
 use std::time::{Duration, Instant};
 
 use device_manager::{
-    DeviceManager, DeviceManagerError, MapContext, NativeDriverFactory, map_results,
+    DeviceManager, DeviceManagerError, MapContext, NativeDriverFactory, SequenceAllocator,
+    map_results,
 };
 use modbus_mock::{MockBehavior, MockServer};
 use observation_model::{Device, DeviceConnection, DomainKind, QualityLevel, Value};
@@ -130,8 +131,8 @@ fn manager_with_device(mock: &MockServer) -> DeviceManager {
     let mut registry = ProfileRegistry::new();
     register_profile(&mut registry);
     let mut factory = NativeDriverFactory::new();
-    factory.add_plugin("modbus-tcp".to_owned(), load_plugin());
-    let mut manager = DeviceManager::new(registry, Box::new(factory), 1000);
+    factory.add_plugin(load_plugin()).expect("插件注册成功");
+    let mut manager = DeviceManager::new(registry, Box::new(factory), 1000).expect("默认间隔合法");
     manager
         .register_device(device(mock))
         .expect("设备注册应成功");
@@ -173,8 +174,10 @@ fn rejects_binding_mismatches() {
     let mut registry = ProfileRegistry::new();
     register_profile(&mut registry);
     let mut factory = NativeDriverFactory::new();
-    factory.add_plugin("modbus-tcp".to_owned(), load_plugin());
-    let mut manager = DeviceManager::new(registry, Box::new(factory), 1000);
+    factory.add_plugin(load_plugin()).expect("插件注册成功");
+    // 同名插件重复注册必须拒绝，且不覆盖已有绑定。
+    assert!(factory.add_plugin(load_plugin()).is_err());
+    let mut manager = DeviceManager::new(registry, Box::new(factory), 1000).expect("默认间隔合法");
 
     // 未知 Profile。
     let mut d = device(&server);
@@ -229,36 +232,45 @@ async fn full_chain_mock_modbus_to_observations() {
             .expect("调度配置合法");
     }
 
-    // 等待两个组各至少产出一次 Batch。
-    let mut batches = Vec::new();
+    // 按 interval_ms 收齐两个不同采集组（50ms 与 100ms）各至少一轮：
+    // 避免"连续收到同一组两次"造成的假通过。
+    // 批次按到达顺序保存（即 sequence 分配顺序，保证后续单调性断言有效）。
+    let mut batches: Vec<poll_engine::PollBatch> = Vec::new();
+    let mut seen_intervals: std::collections::HashSet<u64> = Default::default();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while batches.len() < 2 {
+    while seen_intervals.len() < 2 {
         assert!(Instant::now() < deadline, "等待两个采集组超时");
         let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .expect("事件通道应保持打开")
             .expect("事件通道已关闭");
         match event {
-            PollEvent::Batch(batch) => batches.push(batch),
+            PollEvent::Batch(batch) => {
+                if seen_intervals.insert(batch.interval_ms) {
+                    batches.push(batch);
+                }
+            }
             PollEvent::Failed { error, .. } => panic!("采集不应失败: {error:?}"),
         }
     }
     scheduler.shutdown().await;
+    assert_eq!(batches.len(), 2, "两个不同采集组都必须产出");
 
     // 合并两个组的原始结果，全链路映射为 Observation。
+    // sequence 由同一分配器按设备统一分配：跨组、跨批次单调递增（§31.3）。
     let ctx = MapContext {
         collector_session_id: "test-session-001".to_owned(),
         ingest_timestamp_ns: 1_700_000_000_000_000_000,
-        sequence_start: 0,
     };
+    let mut sequences = SequenceAllocator::new();
     let mut observations = Vec::new();
     for batch in &batches {
-        let mapped =
-            map_results(instance, &batch.results, &ctx).expect("Profile 路径与 Domain 一致");
+        let mapped = map_results(instance, &batch.results, &ctx, &mut sequences)
+            .expect("Profile 路径与 Domain 一致");
         observations.extend(mapped);
     }
 
-    // 3 个属性各出现一次（两个组各一轮）。
+    // 三个属性都必须出现（空集合循环断言是假通过）。
     let by_path = |path: &str| {
         observations
             .iter()
@@ -268,7 +280,7 @@ async fn full_chain_mock_modbus_to_observations() {
 
     // 40001 = 5000，scale 0.01 → 50.0 Hz（§47 示例）。
     let freq = by_path("drive.output.frequency");
-    assert!(!freq.is_empty(), "frequency 应被采集");
+    assert!(!freq.is_empty(), "frequency 必须被采集");
     for obs in &freq {
         assert_eq!(obs.value, Some(Value::F64(50.0)));
         assert_eq!(obs.quality.level, QualityLevel::Good);
@@ -279,16 +291,28 @@ async fn full_chain_mock_modbus_to_observations() {
     }
 
     // 40002 = 2000，scale 0.01 → 20.0 A。
-    for obs in by_path("drive.output.current") {
+    let current = by_path("drive.output.current");
+    assert!(!current.is_empty(), "current 必须被采集");
+    for obs in &current {
         assert_eq!(obs.value, Some(Value::F64(20.0)));
         assert_eq!(obs.quality.level, QualityLevel::Good);
     }
 
     // coil:1 = true。
-    for obs in by_path("drive.run.status") {
+    let status = by_path("drive.run.status");
+    assert!(!status.is_empty(), "status 必须被采集");
+    for obs in &status {
         assert_eq!(obs.value, Some(Value::Bool(true)));
         assert_eq!(obs.quality.level, QualityLevel::Good);
     }
+
+    // sequence 跨组唯一且单调递增（同设备同会话，§31.3）。
+    let seqs: Vec<u64> = observations.iter().map(|o| o.sequence).collect();
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(seqs.len(), sorted.len(), "sequence 必须唯一：{seqs:?}");
+    assert_eq!(sorted, seqs, "sequence 必须单调递增：{seqs:?}");
 
     // 所有 Observation 具备时间戳与序列（§8）。
     assert!(observations.iter().all(|o| o.ingest_timestamp_ns > 0));
