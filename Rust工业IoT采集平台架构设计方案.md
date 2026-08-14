@@ -2138,6 +2138,9 @@ MQTT v1
 REST v1
 ```
 
+以上是 MVP 的目标范围，不表示当前仓库已经全部交付。当前实现进度见 §34.7；
+未完成能力仍以本章验收标准为准，不得在部署文档中按已实现功能使用。
+
 ## 34.1 功能验收
 
 必须完成：
@@ -2245,7 +2248,10 @@ forced process restart during WAL write
 ```text
 连接、请求 timeout 可配置。
 断线后自动重连。
-默认指数退避：1s -> 2s -> 4s ... 上限 30s。
+Poll Engine 默认使用指数退避：1s -> 2s -> 4s ... 上限 30s。
+Driver 内部的连接尝试属于协议会话职责，间隔和次数由具体 Driver 配置决定；
+Modbus MVP 使用 `reconnect_delay_ms` 固定间隔和 `reconnect_max_attempts` 次数，
+不替代 Poll Engine 的批次级退避。
 成功重连后退避重置。
 单设备故障不得阻塞其他设备。
 ```
@@ -2309,6 +2315,31 @@ V0.4: FANUC FOCAS Process Plugin
 ```
 
 每增加一个 Driver，都必须通过同一套 Driver Contract、Quality、Timeout、Reconnect、Batch 与 ABI/Process isolation 测试。
+
+## 34.7 当前仓库实施状态（非架构决策）
+
+截至 Modbus Driver MVP 合并，以下能力已经在 workspace 中实现并有自动化测试：
+
+```text
+observation-model     共享规范模型
+driver-sdk            Driver 契约与 ABI v1 Tag/Envelope
+diagnostics           结构化日志、级别/格式切换与脱敏
+driver-loader         Native Plugin 加载、ABI 校验与句柄生命周期
+profile-engine        Profile 校验、加载、注册与读写转换
+domain-model          Domain 路径校验与 Observation 映射
+poll-engine           周期调度、超时、指数退避、取消与阻塞隔离
+driver-modbus         Modbus TCP/RTU 读取 Driver MVP
+```
+
+以下能力仍未完成端到端交付：
+
+```text
+MQTT 输出、REST API、Local Buffer/WAL、Control Engine、设备管理，
+以及 collector / edge-server / manager 的完整运行时组装、三平台部署、
+性能基准和长时间稳定性验收。
+```
+
+本节只记录实现进度，不改变前述 Normative 契约和 MVP 验收标准。
 
 ---
 
@@ -5918,17 +5949,20 @@ Industrial Control Gateway
 
 实现前必须检查：
 
-- [ ] Driver `read()` 返回 `RawReadResult`，而不是 Observation。
+- [x] Driver `read()` 返回 `RawReadResult`，而不是 Observation。
 - [ ] Subscription/Event callback 返回 Raw Result/Event，仍经过 Profile/Domain。
-- [ ] `Device` 同时包含 `domain / driver_id / profile_id`。
-- [ ] `Resource / Property / DataType / Value / FieldValue` 均有正式定义。
-- [ ] Timestamp 使用 UTC Unix Epoch ns，并区分 source / ingest。
-- [ ] Bad/Timeout 新结果 `value = None`；缓存值只能以 `Uncertain/Stale` 返回。
-- [ ] Driver ABI 定义字符串编码、ptr+len、内存释放、panic、thread、callback、error 与版本兼容。
-- [ ] Protocol/Profile/Domain Capabilities 不混层。
+- [x] `Device` 同时包含 `domain / driver_id / profile_id`。
+- [x] `Resource / Property / DataType / Value / FieldValue` 均有正式定义。
+- [x] Timestamp 使用 UTC Unix Epoch ns，并区分 source / ingest。
+- [x] Bad/Timeout 新结果 `value = None`；缓存值只能以 `Uncertain/Stale` 返回。
+- [x] Driver ABI 定义字符串编码、ptr+len、内存释放、panic、thread、callback、error 与版本兼容。
+- [x] Protocol/Profile/Domain Capabilities 不混层。
 - [ ] Property Write 和 Command Execute 都必须经过 Control Engine。
 - [ ] MQTT 明确 topic、QoS、retain、schema、去重和重传语义。
 - [ ] REST Control 使用 `202 + request_id` 异步模型。
 - [ ] MVP 有性能、重连、缓存、断电恢复和三平台验收测试。
+
+其中 `[x]` 表示当前仓库已有实现与测试，`[ ]` 表示仍需后续功能或验收；
+清单不替代 §34 的完整验收标准。
 
 如果未来修改上述任何契约，应直接修改 Normative 章节并同步测试，不再通过在文末追加相互冲突的新草案来覆盖旧定义。
