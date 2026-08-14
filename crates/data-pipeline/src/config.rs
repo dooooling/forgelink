@@ -11,6 +11,15 @@ pub const DEFAULT_INPUT_CAPACITY: usize = 4096;
 /// 默认停机有界排空时限。
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 内部缓存统一容量系数（软边界）。
+///
+/// `pending + outbox` 中缓存的 Observation 总数上限 =
+/// `max_batch_size × BUFFER_BATCH_MULTIPLIER`，达到后暂停消费输入
+/// （背压传导至采集侧，§22 有界并发/背压）。该统一容量同时约束聚合中的
+/// partial 批次与在途 Batch，多设备场景也不会绕过边界累积
+/// `设备数 × max_batch_size` 条数据。
+pub(crate) const BUFFER_BATCH_MULTIPLIER: usize = 16;
+
 /// data-pipeline 配置（§31.2）。
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -60,6 +69,19 @@ impl PipelineConfig {
         }
         if self.max_batch_size == 0 {
             return Err("max_batch_size 必须大于 0".to_owned());
+        }
+        // P2：内部缓存容量 = max_batch_size × BUFFER_BATCH_MULTIPLIER，
+        // 乘法溢出直接拒绝配置（饱和到 usize::MAX 等同取消背压，
+        // 与"内部缓存有界"冲突）。
+        if self
+            .max_batch_size
+            .checked_mul(BUFFER_BATCH_MULTIPLIER)
+            .is_none()
+        {
+            return Err(format!(
+                "max_batch_size（{}）× BUFFER_BATCH_MULTIPLIER（{BUFFER_BATCH_MULTIPLIER}）溢出，配置过大",
+                self.max_batch_size
+            ));
         }
         if self.flush_interval.is_zero() {
             return Err("flush_interval 必须大于 0".to_owned());

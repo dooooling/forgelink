@@ -10,14 +10,14 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::batch::ObservationBatch;
-use crate::config::PipelineConfig;
+use crate::config::{BUFFER_BATCH_MULTIPLIER, PipelineConfig};
 
 /// 管道错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PipelineError {
     /// 配置非法（`PipelineConfig::validate` 拒绝）。
     InvalidConfig { reason: String },
-    /// 管道已关闭（已停机或所有 ingest 发送端已释放）。
+    /// 管道已关闭（已停机、输出接收端已关闭或所有 ingest 发送端已释放）。
     Closed,
     /// 后台任务异常终止（panic），统计结果不可信。
     TaskFailed { reason: String },
@@ -36,14 +36,6 @@ impl fmt::Display for PipelineError {
 }
 
 impl std::error::Error for PipelineError {}
-
-/// 在途输出批次上限（软边界）。
-///
-/// 输出通道满、`reserve()` 阻塞期间，已完成批次暂存于 outbox；为保持全链路
-/// 有界（§22 有界并发/背压），outbox 达到该上限时暂停消费输入（背压传导
-/// 至采集侧），等待发送腾出空位。每批 ≤ `max_batch_size`，因此该边界下的
-/// 在途数据总量 ≤ `OUTBOX_BATCH_LIMIT × max_batch_size`。
-const OUTBOX_BATCH_LIMIT: usize = 16;
 
 /// 管道运行统计（停机排空结果）。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -90,8 +82,9 @@ impl Pipeline {
     /// 启动管道。
     ///
     /// - `output`：输出有界通道（容量由调用方决定），消费者收取稳定的
-    ///   [`ObservationBatch`]；输出通道关闭时管道停止消费输入（背压），
-    ///   剩余数据在停机排空时统计丢弃，不静默丢失。
+    ///   [`ObservationBatch`]；输出接收端永久关闭时管道立即终止：
+    ///   `ingest()` 返回 [`PipelineError::Closed`]，剩余数据结算为丢弃
+    ///   统计，不静默丢失。
     /// - 配置非法时返回 [`PipelineError::InvalidConfig`]，不启动任务。
     pub fn spawn(
         config: PipelineConfig,
@@ -149,8 +142,8 @@ impl Pipeline {
 ///   `outbox`）；
 /// - `outbox`：已完成、等待输出的 [`ObservationBatch`]（发送与停机信号
 ///   在同一 `select!` 中竞争，输出队列满时停机仍可中断在途发送）；
-/// - outbox 达到 [`OUTBOX_BATCH_LIMIT`] 时暂停消费输入（背压），
-///   慢消费者下内存保持有界。
+/// - `buffered`：`pending + outbox` 缓存的 Observation 总数，达到统一上限
+///   （[`BUFFER_BATCH_MULTIPLIER`]）时暂停消费输入（背压），内存保持有界。
 async fn run(
     config: PipelineConfig,
     mut ingest_rx: mpsc::Receiver<Observation>,
@@ -160,8 +153,14 @@ async fn run(
     let mut pending: HashMap<String, PendingBatch> = HashMap::new();
     let mut device_sequence: HashMap<String, u64> = HashMap::new();
     let mut outbox: VecDeque<ObservationBatch> = VecDeque::new();
-    let mut output_dead = false;
+    let mut buffered = 0usize;
     let mut stats = DrainStats::default();
+    // P2：`PipelineConfig::validate()` 已拒绝乘法溢出的配置，
+    // 此处不会溢出（不 panic、不回绕）。
+    let buffer_limit = config
+        .max_batch_size
+        .checked_mul(BUFFER_BATCH_MULTIPLIER)
+        .expect("validate() 已拒绝溢出的 max_batch_size");
 
     // 定时刷新（§31.2）：首个 tick 对齐到 flush_interval，首批数据完整
     // 等待一个刷新周期后才输出（P2：interval() 首 tick 立即触发）。
@@ -174,7 +173,12 @@ async fn run(
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
-                if changed.is_ok() && *shutdown_rx.borrow() {
+                if changed.is_err() {
+                    // 停机发送端已释放（Pipeline 被 drop）：取消路径，
+                    // 立即停止，不排空（P1：不得空转空耗）。
+                    break;
+                }
+                if *shutdown_rx.borrow() {
                     // 优雅停机：收齐输入队列中已送入的观测 → 剩余 partial
                     // 全部转为 Batch → 在 drain_timeout 时限内有界输出。
                     while let Ok(observation) = ingest_rx.try_recv() {
@@ -186,14 +190,13 @@ async fn run(
                     break;
                 }
             }
-            _ = flush.tick(), if !output_dead && outbox.len() < OUTBOX_BATCH_LIMIT => {
-                if !output_dead {
-                    flush_pending_to_outbox(&config, &mut pending, &mut device_sequence, &mut outbox);
-                }
+            _ = flush.tick() => {
+                flush_pending_to_outbox(&config, &mut pending, &mut device_sequence, &mut outbox);
             }
-            maybe = ingest_rx.recv(), if !output_dead && outbox.len() < OUTBOX_BATCH_LIMIT => {
+            maybe = ingest_rx.recv(), if buffered < buffer_limit => {
                 match maybe {
                     Some(observation) => {
+                        buffered += 1;
                         // 按设备聚合；新设备批次序号取该设备的下一序号（独立批次序号）。
                         let device_id = observation.device_id.clone();
                         let full = {
@@ -225,30 +228,81 @@ async fn run(
                     None => break,
                 }
             }
-            result = output_tx.reserve(), if !outbox.is_empty() && !output_dead => {
+            result = output_tx.reserve(), if !outbox.is_empty() => {
                 match result {
                     Ok(permit) => {
                         let batch = outbox.pop_front().expect("guard 保证 outbox 非空");
                         let count = batch.observations.len();
                         permit.send(batch);
+                        buffered -= count;
                         stats.batches_emitted += 1;
                         stats.observations_emitted += count;
                     }
                     Err(_) => {
-                        // 输出通道已关闭：停止消费输入（背压不破坏），
-                        // 剩余数据在停机排空时统计丢弃（不静默丢失）。
-                        output_dead = true;
-                        warn!(
-                            component = "data-pipeline",
-                            error_code = "pipeline_output_closed",
-                            "输出通道已关闭，停止消费输入（背压）；剩余批次在停机排空时统计丢弃"
-                        );
+                        // P1：reserve 失败即输出接收端永久消失 → 终止管道。
+                        terminate_on_output_closed(
+                            &config,
+                            &mut ingest_rx,
+                            &mut pending,
+                            &mut device_sequence,
+                            &mut outbox,
+                            &mut stats,
+                        )
+                        .await;
+                        break;
                     }
                 }
+            }
+            _ = output_tx.closed() => {
+                // P1：输出接收端已释放（无需等待发送失败）→ 终止管道，
+                // 不遗留空转的后台任务。
+                terminate_on_output_closed(
+                    &config,
+                    &mut ingest_rx,
+                    &mut pending,
+                    &mut device_sequence,
+                    &mut outbox,
+                    &mut stats,
+                )
+                .await;
+                break;
             }
         }
     }
     stats
+}
+
+/// 输出接收端永久关闭：终止管道（P1）。
+///
+/// 先 `close()` 输入 Receiver 阻断新发送（此后 `ingest()` 返回
+/// [`PipelineError::Closed`]），再**异步排空**：`close()` 后必须持续
+/// `recv()` 直到 `None`，才能等待所有已取得 Permit 的在途发送完成并收齐
+/// 消息（tokio 明确规定；`try_recv()` 遇暂时为空便退出会漏计并发发送）。
+/// 随后剩余 partial 全部转为 Batch，连同 outbox 中未发出的批次一并计入
+/// 丢弃统计（结算，不静默丢失）。任务返回后 `ingest_rx` 随之释放。
+async fn terminate_on_output_closed(
+    config: &PipelineConfig,
+    ingest_rx: &mut mpsc::Receiver<Observation>,
+    pending: &mut HashMap<String, PendingBatch>,
+    device_sequence: &mut HashMap<String, u64>,
+    outbox: &mut VecDeque<ObservationBatch>,
+    stats: &mut DrainStats,
+) {
+    ingest_rx.close();
+    while let Some(observation) = ingest_rx.recv().await {
+        aggregate_observation(pending, device_sequence, observation);
+    }
+    flush_pending_to_outbox(config, pending, device_sequence, outbox);
+    let dropped_batches = outbox.len();
+    let dropped_observations: usize = outbox.iter().map(|b| b.observations.len()).sum();
+    stats.batches_dropped += dropped_batches;
+    stats.observations_dropped += dropped_observations;
+    warn!(
+        component = "data-pipeline",
+        error_code = "pipeline_output_closed",
+        "输出接收端已关闭，管道终止；{dropped_batches} 个批次（{dropped_observations} 条观测）结算为丢弃"
+    );
+    outbox.clear();
 }
 
 /// 聚合一条观测到对应设备的待输出批次（新设备取下一批次序号）。
@@ -686,7 +740,8 @@ mod tests {
         let pipeline = Pipeline::spawn(config, out_tx).unwrap();
 
         // 输出通道容量 1 且无人消费 → 任务阻塞在输出 reserve，
-        // 输入队列不再被排空 → 持续送入直到输入队列满（有界背压，§22）。
+        // 内部缓存（pending + outbox）达到统一上限后暂停消费输入 →
+        // 持续送入直到输入队列满（有界背压，§22）。
         let mut sent = 0u64;
         let mut blocked = false;
         for sequence in 1..=100 {
@@ -711,9 +766,9 @@ mod tests {
                 Err(_) => break,
             }
         }
-        // 后台持续消费，保证停机排空时 outbox 中最多可达 OUTBOX_BATCH_LIMIT
-        // 个批次都能在 drain_timeout 内送达（无消费者时 drain 会在时限内
-        // 阻塞并把剩余批次计入丢弃）。
+        // 后台持续消费，保证停机排空时内部缓存（最多
+        // BUFFER_BATCH_MULTIPLIER × max_batch_size 条观测）都能在
+        // drain_timeout 内送达（无消费者时 drain 会在时限内阻塞并丢弃）。
         let consumer = tokio::spawn(async move { while out_rx.recv().await.is_some() {} });
 
         // 停机（排空剩余 partial）：成功送入的观测必须全部输出，不得丢弃。
@@ -760,51 +815,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_consuming_when_output_closed() {
-        // P1：输出端关闭后不得继续消费输入并丢弃数据——必须停止消费
-        // （ingest 背压），剩余数据在停机排空时统计丢弃。
+    async fn terminates_and_closes_ingest_when_output_closed() {
+        // P1：输出接收端永久关闭 → 管道立即终止：ingest() 返回 Closed
+        // （不永久阻塞等待），剩余数据结算为丢弃统计（不静默丢失）。
         let mut config = cfg("plant-a", "s1", 2, Duration::from_secs(60));
-        config.input_capacity = 1;
+        config.input_capacity = 4;
         let (out_tx, mut out_rx) = mpsc::channel(2);
         let pipeline = Pipeline::spawn(config, out_tx).unwrap();
-        for sequence in 1..=2 {
+        for sequence in 1..=3 {
             pipeline
                 .ingest(make_obs("dev-a", "drive.a", sequence))
                 .await
                 .unwrap();
         }
-        // 先确认首批已成功输出，避免与"关闭"竞态（批次已进入通道缓冲）。
+        // obs1/2 → 满批输出；obs3 → partial（已送入，尚未成批）。
         let first = out_rx.recv().await.expect("首批应已输出");
         assert_eq!(first.observations.len(), 2);
-        drop(out_rx); // 输出端关闭。
+        drop(out_rx); // 输出接收端永久关闭。
 
-        // obs3/obs4 聚合为第二批后，reserve 检测到关闭 → output_dead，
-        // 停止消费输入。
-        for sequence in 3..=4 {
-            pipeline
-                .ingest(make_obs("dev-a", "drive.a", sequence))
-                .await
-                .unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await; // 等待任务进入 output_dead。
-        // 停止消费输入（背压）：obs5 填满输入队列（容量 1），obs6 必须阻塞。
-        pipeline
-            .ingest(make_obs("dev-a", "drive.a", 5))
-            .await
-            .unwrap();
-        let blocked = tokio::time::timeout(
-            Duration::from_millis(100),
-            pipeline.ingest(make_obs("dev-a", "drive.a", 6)),
-        )
-        .await;
-        assert!(blocked.is_err(), "输出关闭后必须停止消费输入（背压）");
+        // 管道终止：后续 ingest 必须返回 Closed，不得永久等待。
+        // 终止前成功送入的观测计入"剩余数据"统一结算。
+        let extra_sent = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut sent = 0usize;
+            loop {
+                if pipeline
+                    .ingest(make_obs("dev-a", "drive.a", 99))
+                    .await
+                    .is_err()
+                {
+                    return sent;
+                }
+                sent += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("输出关闭后 ingest 必须返回 Closed，不得永久等待");
 
-        // 停机排空：剩余数据统计丢弃，不静默丢失。
+        // 结算：首批（obs1/2）已输出；obs3 与终止前送入的观测全部计入
+        // 丢弃统计，不得静默丢失。
         let stats = pipeline.shutdown().await.unwrap();
         assert_eq!(stats.batches_emitted, 1);
         assert_eq!(stats.observations_emitted, 2);
-        assert_eq!(stats.batches_dropped, 2);
-        assert_eq!(stats.observations_dropped, 3);
+        assert_eq!(
+            stats.observations_emitted + stats.observations_dropped,
+            3 + extra_sent,
+            "已送入观测必须全部输出或计入丢弃统计"
+        );
+        assert!(
+            stats.batches_dropped >= 1 && stats.observations_dropped >= 1,
+            "obs3 至少计入一个丢弃批次"
+        );
     }
 
     #[tokio::test]
@@ -852,6 +913,30 @@ mod tests {
             sizes.push(batch.observations.len());
         }
         assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn rejects_overflowing_max_batch_size() {
+        // P2：max_batch_size × BUFFER_BATCH_MULTIPLIER 溢出 → validate()
+        // 拒绝该配置；不得饱和到 usize::MAX（等同取消背压，
+        // 与"内部缓存有界"冲突）。
+        let (out_tx, _out_rx) = mpsc::channel(4);
+        let mut config = cfg("plant-a", "s1", usize::MAX, Duration::from_secs(60));
+        assert!(matches!(
+            Pipeline::spawn(config.clone(), out_tx.clone()).unwrap_err(),
+            PipelineError::InvalidConfig { .. }
+        ));
+
+        // 恰好不溢出的边界值：正常启动、正常停机分块输出。
+        config.max_batch_size = usize::MAX / BUFFER_BATCH_MULTIPLIER;
+        let pipeline = Pipeline::spawn(config, out_tx).unwrap();
+        pipeline
+            .ingest(make_obs("dev-a", "drive.a", 1))
+            .await
+            .unwrap();
+        let stats = pipeline.shutdown().await.unwrap();
+        assert_eq!(stats.batches_emitted, 1);
+        assert_eq!(stats.observations_emitted, 1);
     }
 
     #[tokio::test]
