@@ -20,7 +20,9 @@ type GroupEntry = (u64, ModbusAddress, Option<observation_model::DataType>);
 /// 一个读请求计划（一次 Modbus 读帧）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadPlan {
+    /// 目标从站号（地址未显式指定时取连接配置默认值）。
     pub unit_id: u8,
+    /// 数据段（决定功能码 FC01~FC04）。
     pub kind: RegisterKind,
     /// 协议偏移起点（0-based，`40001 -> 0`）。
     pub start_offset: u16,
@@ -33,9 +35,11 @@ pub struct ReadPlan {
 /// 计划内单个 item 的定位信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedItem {
+    /// 请求项 ID（`DriverReadItem.id`，结果按此回传）。
     pub item_id: u64,
     /// 相对本帧数据起始的偏移（位偏移或寄存器偏移）。
     pub offset_in_frame: u16,
+    /// 期望类型（None 表示未指定，解码按段默认：位段 Bool、寄存器段 U16）。
     pub expected_type: Option<observation_model::DataType>,
     /// 本 item 期望类型占用的单元数（寄存器数或位数，解码用）。
     pub width: u16,
@@ -56,6 +60,16 @@ pub fn plan_batch(
     for item in items {
         let address = crate::address::parse_address(&item.address, default_unit_id)
             .map_err(|e| crate::error::ModbusError::invalid_address(e.to_string()))?;
+        // 多寄存器 item 占多个单元：偏移 + 宽度必须落在协议 16 位偏移范围内
+        // （如 holding:105536 读 F64 会越过 65535）。
+        let width = item_width(address.kind, item.expected_type.as_ref()) as u32;
+        let end = address.offset() as u32 + width;
+        if end > u16::MAX as u32 + 1 {
+            return Err(crate::error::ModbusError::invalid_address(format!(
+                "地址 {} 连同类型宽度 {width} 超出协议偏移上限 65535",
+                address.canonical()
+            )));
+        }
         groups
             .entry((address.unit_id, address.kind))
             .or_default()
@@ -300,6 +314,17 @@ mod tests {
         let err = plan_batch(&[item(1, "40001", None), item(2, "holding:x", None)], 1).unwrap_err();
         assert_eq!(err.code, "invalid_address");
         assert!(!err.retryable);
+    }
+
+    #[test]
+    fn rejects_address_with_width_beyond_protocol_offset() {
+        // 最大偏移 65535（holding:105536）+ U32（2 寄存器）越过 16 位偏移上限。
+        let err = plan_batch(&[item(1, "holding:105536", Some(DataType::U32))], 1).unwrap_err();
+        assert_eq!(err.code, "invalid_address");
+        // 单个 U16（1 寄存器）在边界上合法。
+        let plans = plan_batch(&[item(1, "holding:105536", Some(DataType::U16))], 1).unwrap();
+        assert_eq!(plans[0].start_offset, 65_535);
+        assert_eq!(plans[0].quantity, 1);
     }
 
     #[test]

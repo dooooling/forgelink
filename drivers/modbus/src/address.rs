@@ -21,8 +21,8 @@
 //! ```
 //!
 //! 地址号换算协议偏移：`offset = address - segment_base`（如 `40001 -> offset 0`）。
-//! 显式段名形式不受 5 位数字段限制，允许协议 16 位偏移全范围
-//! （如 `holding:65537`），仅受数据段上限约束。
+//! 显式段名形式同样要求地址号 ≥ 段基数（`holding:1` 非法，会下溢），
+//! 上限允许协议 16 位偏移全范围（如 `holding:105536`，offset 65535）。
 //!
 //! 规范化形式（`validate_address` / 去重）：`{unit}!{kind}:{address}`，
 //! 如 `1!holding:40001`、`3!coil:1`。
@@ -217,10 +217,13 @@ fn infer_kind_from_numeric(number: u32) -> Result<RegisterKind, AddressError> {
 }
 
 /// 校验地址号范围并构造 `ModbusAddress`（不含 unit）。
+///
+/// 数字段形式已由 `matches_numeric` 限定（传统 5 位数字段）；
+/// 显式段名形式允许协议 16 位偏移全范围，但地址号必须 ≥ 段基数，
+/// 否则 `offset = address - segment_base` 会下溢（调试构建 panic、
+/// 发布构建读错地址）。
 fn validate(kind: RegisterKind, number: u32) -> Result<ModbusAddress, AddressError> {
-    // 数字段形式已由 matches_numeric 限定（传统 5 位数字段）；
-    // 显式段名形式允许协议 16 位偏移全范围。
-    if number == 0 || number > kind.explicit_max() {
+    if number < kind.segment_base() || number > kind.explicit_max() {
         return Err(AddressError::OutOfRange(number.to_string()));
     }
     Ok(ModbusAddress {
@@ -317,6 +320,23 @@ mod tests {
         assert!(parse_address("coil:65536", 1).is_ok());
         assert_eq!(parse_address("coil:65536", 1).unwrap().offset(), 65_535);
         assert!(parse_address("coil:65537", 1).is_err());
+    }
+
+    #[test]
+    fn rejects_explicit_address_below_segment_base() {
+        // 地址号低于段基数会令 offset 下溢，必须拒绝（曾可读错地址/panic）。
+        assert!(parse_address("holding:1", 1).is_err());
+        assert!(parse_address("holding:40000", 1).is_err());
+        assert!(parse_address("input:1", 1).is_err());
+        assert!(parse_address("discrete:1", 1).is_err());
+        assert!(parse_address("2!holding:40000", 1).is_err());
+        // 超过段基数 + 协议偏移全范围（holding 最大 105536）。
+        assert!(parse_address("2!holding:105537", 1).is_err());
+        // 段基数本身合法（offset 0）。
+        assert_eq!(parse_address("holding:40001", 1).unwrap().offset(), 0);
+        assert_eq!(parse_address("input:30001", 1).unwrap().offset(), 0);
+        assert_eq!(parse_address("discrete:10001", 1).unwrap().offset(), 0);
+        assert_eq!(parse_address("coil:1", 1).unwrap().offset(), 0);
     }
 
     #[test]

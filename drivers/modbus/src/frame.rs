@@ -7,12 +7,16 @@ use crate::address::RegisterKind;
 
 /// 读功能码（FC01/FC02/FC03/FC04）。
 pub const FC_READ_COILS: u8 = 0x01;
+/// 读离散输入功能码。
 pub const FC_READ_DISCRETE_INPUTS: u8 = 0x02;
+/// 读保持寄存器功能码。
 pub const FC_READ_HOLDING_REGISTERS: u8 = 0x03;
+/// 读输入寄存器功能码。
 pub const FC_READ_INPUT_REGISTERS: u8 = 0x04;
 
 /// 协议帧上限：单次寄存器读 125 个寄存器、线圈/离散读 2000 位。
 pub const MAX_REGISTERS_PER_REQUEST: u16 = 125;
+/// 位读（FC01/FC02）单帧最大数量（2000 位）。
 pub const MAX_BITS_PER_REQUEST: u16 = 2_000;
 
 /// 功能码对应的读请求类型。
@@ -80,7 +84,9 @@ pub fn build_rtu_read_request(
 /// - 响应数据（body）首字节为功能码：高位为 1 表示异常响应（后续 2 字节异常码）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpResponseHeader {
+    /// 事务号（须与请求一致）。
     pub transaction_id: u16,
+    /// 从站号（须与请求一致）。
     pub unit_id: u8,
     /// 紧随头部之后的数据字节数（含 body 首字节功能码）。
     pub data_len: usize,
@@ -112,9 +118,13 @@ pub fn parse_tcp_response_header(header: &[u8]) -> Result<TcpResponseHeader, Fra
 /// RTU 响应（unit + function + data + CRC）解析结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtuResponseMeta {
+    /// 从站号。
     pub unit_id: u8,
+    /// 功能码（异常响应时已去除高位）。
     pub function: u8,
+    /// 是否异常响应（功能码高位为 1）。
     pub is_exception: bool,
+    /// 数据字节数（异常响应恒为 1：异常码；正常响应为帧长 - 5）。
     pub data_len: usize,
 }
 
@@ -133,11 +143,12 @@ pub fn rtu_response_total_len(
     if function != request_function {
         return Err(FrameError::Invalid("响应功能码与请求不一致"));
     }
-    // 异常响应：unit + fc + 异常码 + CRC = 5 字节。
+    // 正常响应：unit + fc + byte count + data + CRC = 5 + data_len 字节；
+    // 异常响应：unit + fc(置高位) + 异常码 + CRC = 5 字节（无 byte count）。
     let data_len = if is_exception {
         1
     } else {
-        expected_data_len(function, request_quantity)
+        1 + expected_data_len(function, request_quantity)
     };
     Ok(2 + data_len + 2)
 }
@@ -152,7 +163,8 @@ pub fn parse_rtu_response_meta(frame: &[u8]) -> Result<RtuResponseMeta, FrameErr
     let data_len = if raw_function & 0x80 != 0 {
         1
     } else {
-        frame.len() - 4
+        // 数据字节数 = 帧长 - unit - fc - byte count - CRC。
+        frame.len() - 5
     };
     Ok(RtuResponseMeta {
         unit_id,
@@ -254,18 +266,24 @@ mod tests {
 
     #[test]
     fn rtu_total_len_matches() {
+        // FC03 读 2 寄存器：unit+fc+byte count+4 数据+CRC = 9 字节。
         assert_eq!(
             rtu_response_total_len(&[0x01, 0x03], FC_READ_HOLDING_REGISTERS, 2).unwrap(),
-            8
+            9
         );
         assert_eq!(
             rtu_response_total_len(&[0x01, 0x83], FC_READ_HOLDING_REGISTERS, 2).unwrap(),
             5
         );
-        // 3 位线圈 -> 1 字节数据 + 2 CRC。
+        // 3 位线圈 -> 1 字节数据 + byte count + 2 CRC。
         assert_eq!(
             rtu_response_total_len(&[0x01, 0x01], FC_READ_COILS, 3).unwrap(),
-            5
+            6
+        );
+        // 125 寄存器 -> 1 + 250 字节。
+        assert_eq!(
+            rtu_response_total_len(&[0x01, 0x03], FC_READ_HOLDING_REGISTERS, 125).unwrap(),
+            2 + 1 + 250 + 2
         );
     }
 

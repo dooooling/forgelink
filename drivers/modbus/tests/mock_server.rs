@@ -25,6 +25,15 @@ pub enum Kind {
 /// 地址键：`(unit, kind, offset)`。
 type AddrKey = (u8, Kind, u16);
 
+/// 畸形异常响应模式（模拟坏实现，驱动必须按响应失步拒绝）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedException {
+    /// 异常码缺失：body 仅 1 字节（fc|0x80）。
+    MissingCode,
+    /// 异常响应多余字节：body 3 字节（fc|0x80 + 异常码 + 额外 1 字节）。
+    ExtraByte,
+}
+
 /// Mock 服务器行为配置。
 #[derive(Debug, Clone, Default)]
 pub struct MockBehavior {
@@ -36,6 +45,10 @@ pub struct MockBehavior {
     pub response_delay: Option<Duration>,
     /// 是否在响应前立即断开连接（模拟断线）。
     pub drop_connection: bool,
+    /// 声明错误的字节计数：Byte Count 与实际数据长度不符（模拟坏实现）。
+    pub declare_wrong_byte_count: bool,
+    /// 畸形异常响应模式（配合 `exception_at` 使用）。
+    pub malformed_exception: Option<MalformedException>,
     /// 统计：收到的请求数。
     pub request_count: Arc<AtomicU32>,
 }
@@ -47,6 +60,8 @@ impl MockBehavior {
             exception_at: HashMap::new(),
             response_delay: None,
             drop_connection: false,
+            declare_wrong_byte_count: false,
+            malformed_exception: None,
             request_count: Arc::new(AtomicU32::new(0)),
         }
     }
@@ -237,13 +252,23 @@ fn handle_connection(
         // 读数据段：寄存器 2 字节大端；线圈/离散按位打包（LSB 优先）。
         let data: Vec<u8> = if let Some(code) = exception {
             // 异常响应：功能码置高位 + 异常码，连接保持。
-            let mut response = vec![0u8; 9];
+            // 畸形模式按配置改变 body 字节数（缺异常码 / 多余字节）。
+            let malformed = guard.malformed_exception;
+            let mut body = vec![function | 0x80, code];
+            match malformed {
+                Some(MalformedException::MissingCode) => {
+                    body.pop();
+                }
+                Some(MalformedException::ExtraByte) => body.push(0x00),
+                None => {}
+            }
+            let mut response = vec![0u8; 7 + body.len()];
             response[0..2].copy_from_slice(&header[0..2]);
             response[2..4].copy_from_slice(&[0x00, 0x00]);
-            response[4..6].copy_from_slice(&[0x00, 0x03]);
+            // MBAP length = unit + body 字节数。
+            response[4..6].copy_from_slice(&((1 + body.len()) as u16).to_be_bytes());
             response[6] = unit;
-            response[7] = function | 0x80;
-            response[8] = code;
+            response[7..].copy_from_slice(&body);
             if stream.write_all(&response).is_err() {
                 return;
             }
@@ -276,6 +301,9 @@ fn handle_connection(
             }
             bytes
         };
+        // 坏实现标志：Byte Count 声明多 1 字节、body 随之多 1 字节，
+        // 与驱动期望（expected + 2）不符，必须被拒绝。
+        let wrong_byte_count = guard.declare_wrong_byte_count;
         drop(guard);
 
         // 组装响应：MBAP 头 + unit + fc + byte count + 数据。
@@ -283,12 +311,20 @@ fn handle_connection(
         response.extend_from_slice(&transaction_id.to_be_bytes());
         response.extend_from_slice(&[0x00, 0x00]);
         // MBAP length = unit + fc + byte count + 数据。
-        let body_len = (data.len() + 3) as u16;
+        let declared_len = if wrong_byte_count {
+            data.len() + 1
+        } else {
+            data.len()
+        };
+        let body_len = (declared_len + 3) as u16;
         response.extend_from_slice(&body_len.to_be_bytes());
         response.push(unit);
         response.push(function);
-        response.push(data.len() as u8);
+        response.push(declared_len as u8);
         response.extend_from_slice(&data);
+        if wrong_byte_count {
+            response.push(0x00);
+        }
         if stream.write_all(&response).is_err() {
             return;
         }

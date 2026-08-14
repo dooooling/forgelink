@@ -68,8 +68,9 @@ impl ModbusDriver {
     fn create(config_json: &str) -> Result<Self, ModbusError> {
         let config = ModbusConfig::from_json(config_json)
             .map_err(|e| ModbusError::config_error(e.to_string()))?;
+        let transport = session::create_transport(&config)?;
         Ok(Self {
-            transport: Some(session::create_transport(&config)),
+            transport: Some(transport),
             config,
             last_error: None,
         })
@@ -120,8 +121,12 @@ impl ModbusDriver {
             self.ensure_connected_before_plan()?;
             let data = match self.request_plan(plan) {
                 Ok(data) => data,
+                // 传输级失败（连接断开/建连失败/超时/响应失步）：会话已不可用，
+                // 必须整体失败返回（PollDriver 约定 §22），由上层退避/重连；
+                // 不得转成单项错误伪装成成功批次。
+                Err(e) if e.is_transport_level() => return Err(e),
+                // 协议级错误（从站异常等）：会话仍可用，逐项标记后继续。
                 Err(e) => {
-                    // 计划级失败：该计划覆盖的全部 item 标记错误（§7.2）。
                     for planned in &plan.items {
                         results.push(error_result(planned.item_id, &e));
                     }
@@ -129,7 +134,12 @@ impl ModbusDriver {
                 }
             };
             for planned in &plan.items {
-                results.push(decode_item(&plan.kind, &data, planned));
+                results.push(decode_item(
+                    &plan.kind,
+                    &data,
+                    planned,
+                    self.config.word_order,
+                ));
             }
         }
         // 结果顺序与请求 item 顺序一致（供上层按 item_id 关联）。
@@ -157,8 +167,9 @@ impl ModbusDriver {
         );
         match result {
             Ok(data) => Ok(data),
-            // 连接类错误：标记断开，下次请求前自动重连。
-            Err(e) if e.code == "connection_lost" || e.code == "connection_failed" => {
+            // 传输级错误：会话已失步/断开，标记断开供下次请求自动重连，
+            // 并原样整体返回（调用方按 `is_transport_level` 决定是否整体失败）。
+            Err(e) if e.is_transport_level() => {
                 transport.disconnect();
                 Err(e)
             }
@@ -188,6 +199,7 @@ fn decode_item(
     kind: &crate::address::RegisterKind,
     data: &[u8],
     planned: &PlannedItem,
+    word_order: crate::config::WordOrder,
 ) -> RawReadResult {
     let now = now_ns();
     match decode::decode_register_value(
@@ -195,6 +207,7 @@ fn decode_item(
         data,
         planned.offset_in_frame,
         planned.expected_type.as_ref(),
+        word_order,
     ) {
         Ok(value) => RawReadResult {
             item_id: planned.item_id,
@@ -284,24 +297,51 @@ fn driver_mut<'a>(handle: DriverHandle) -> Option<&'a mut ModbusDriver> {
     Some(unsafe { &mut *(handle.ptr as *mut ModbusDriver) })
 }
 
+/// §17.7 统一 panic 隔离：任何 Rust panic 都不得穿过 C ABI 边界。
+///
+/// 每个 ABI 入口必须用本封装包裹主体逻辑；panic 被捕获后转换为
+/// `DRIVER_PANIC` 错误（写入句柄 `last_error`，供 `get_last_error_json`
+/// 查询）并返回 `None`，调用方回退为非零状态码。
+///
+/// `api_create` 阶段尚无句柄可写错误，单独处理（panic 直接返回失败）。
+fn catch_abi_panic<T>(
+    handle: DriverHandle,
+    f: impl FnOnce() -> T + std::panic::UnwindSafe,
+) -> Option<T> {
+    match std::panic::catch_unwind(f) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            if let Some(driver) = driver_mut(handle) {
+                driver.last_error = Some(
+                    ModbusError::driver_panic("内部 panic 已被 ABI 边界捕获（§17.7）".to_owned())
+                        .into_info(),
+                );
+            }
+            None
+        }
+    }
+}
+
 unsafe extern "C" fn api_create(config: FfiStr, out_handle: *mut DriverHandle) -> i32 {
     if out_handle.is_null() {
         return -1;
     }
-    // create 失败也写入句柄（指向可查询 last_error 的状态），Loader 会读取
-    // 详情并 destroy 清理（§17.5 句柄值未定义时可能为空）。
-    let (status, driver, error) = match unsafe { ffi_str_to_str(config) } {
-        Some(json) => match ModbusDriver::create(json) {
-            Ok(driver) => (0, Some(driver), None),
-            Err(e) => (-1, None, Some(e)),
-        },
-        None => (
-            -1,
-            None,
-            Some(ModbusError::config_error("config 非 UTF-8".to_owned())),
-        ),
-    };
-    unsafe {
+    // create 阶段无句柄可写 last_error：panic 直接返回非零（Loader 视为失败，
+    // §17.5 句柄值未定义时可能为空）。
+    std::panic::catch_unwind(|| unsafe {
+        // create 失败也写入句柄（指向可查询 last_error 的状态），Loader 会读取
+        // 详情并 destroy 清理（§17.5 句柄值未定义时可能为空）。
+        let (status, driver, error) = match ffi_str_to_str(config) {
+            Some(json) => match ModbusDriver::create(json) {
+                Ok(driver) => (0, Some(driver), None),
+                Err(e) => (-1, None, Some(e)),
+            },
+            None => (
+                -1,
+                None,
+                Some(ModbusError::config_error("config 非 UTF-8".to_owned())),
+            ),
+        };
         let mut driver = match driver {
             Some(driver) => driver,
             None => ModbusDriver {
@@ -316,56 +356,69 @@ unsafe extern "C" fn api_create(config: FfiStr, out_handle: *mut DriverHandle) -
         *out_handle = DriverHandle {
             ptr: Box::into_raw(Box::new(driver)) as *mut c_void,
         };
-    }
-    status
+        status
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_destroy(handle: DriverHandle) -> i32 {
-    if !handle.ptr.is_null() {
-        unsafe {
-            drop(Box::from_raw(handle.ptr as *mut ModbusDriver));
+    catch_abi_panic(handle, || {
+        if !handle.ptr.is_null() {
+            unsafe {
+                drop(Box::from_raw(handle.ptr as *mut ModbusDriver));
+            }
         }
-    }
-    0
+        0
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_connect(handle: DriverHandle) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    match driver.connect() {
-        Ok(()) => 0,
-        Err(e) => {
-            let info = e.clone().into_info();
-            driver.last_error = Some(info);
-            -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        match driver.connect() {
+            Ok(()) => 0,
+            Err(e) => {
+                let info = e.clone().into_info();
+                driver.last_error = Some(info);
+                -1
+            }
         }
-    }
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_disconnect(handle: DriverHandle) -> i32 {
-    if let Some(driver) = driver_mut(handle) {
-        driver.disconnect();
-    }
-    0
+    catch_abi_panic(handle, || {
+        if let Some(driver) = driver_mut(handle) {
+            driver.disconnect();
+        }
+        0
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_get_capabilities_json(
     handle: DriverHandle,
     out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let envelope = CapabilitiesEnvelope::new(CAPABILITIES);
-    match serde_json::to_vec(&envelope) {
-        Ok(bytes) => write_buffer(out, &bytes),
-        Err(_) => {
-            driver.last_error = Some(ModbusError::not_implemented("能力声明序列化").into_info());
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
             return -1;
+        };
+        let envelope = CapabilitiesEnvelope::new(CAPABILITIES);
+        match serde_json::to_vec(&envelope) {
+            Ok(bytes) => write_buffer(out, &bytes),
+            Err(_) => {
+                driver.last_error = Some(ModbusError::unsupported("能力声明序列化").into_info());
+                return -1;
+            }
         }
-    }
-    0
+        0
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_validate_address(
@@ -373,32 +426,35 @@ unsafe extern "C" fn api_validate_address(
     address: FfiStr,
     out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let address = match unsafe { ffi_str_to_str(address) } {
-        Some(a) => a,
-        None => {
-            driver.last_error =
-                Some(ModbusError::invalid_address("地址非 UTF-8".to_owned()).into_info());
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
             return -1;
-        }
-    };
-    match driver.validate_address(address) {
-        Ok(meta) => {
-            let envelope = AddressEnvelope::new(meta);
-            match serde_json::to_vec(&envelope) {
-                Ok(bytes) => write_buffer(out, &bytes),
-                Err(_) => return -1,
+        };
+        let address = match unsafe { ffi_str_to_str(address) } {
+            Some(a) => a,
+            None => {
+                driver.last_error =
+                    Some(ModbusError::invalid_address("地址非 UTF-8".to_owned()).into_info());
+                return -1;
             }
-            0
+        };
+        match driver.validate_address(address) {
+            Ok(meta) => {
+                let envelope = AddressEnvelope::new(meta);
+                match serde_json::to_vec(&envelope) {
+                    Ok(bytes) => write_buffer(out, &bytes),
+                    Err(_) => return -1,
+                }
+                0
+            }
+            Err(e) => {
+                let info = e.clone().into_info();
+                driver.last_error = Some(info);
+                -1
+            }
         }
-        Err(e) => {
-            let info = e.clone().into_info();
-            driver.last_error = Some(info);
-            -1
-        }
-    }
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_read(
@@ -407,43 +463,60 @@ unsafe extern "C" fn api_read(
     len: usize,
     out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    if items.is_null() && len > 0 {
-        driver.last_error =
-            Some(ModbusError::invalid_address("items 指针为空但长度非 0".to_owned()).into_info());
-        return -1;
-    }
-    let items: Vec<driver_sdk::DriverReadItem> = (0..len)
-        .map(|i| {
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        if items.is_null() && len > 0 {
+            driver.last_error = Some(
+                ModbusError::invalid_address("items 指针为空但长度非 0".to_owned()).into_info(),
+            );
+            return -1;
+        }
+        let mut read_items: Vec<driver_sdk::DriverReadItem> = Vec::with_capacity(len);
+        for i in 0..len {
             let item = unsafe { &*items.add(i) };
-            driver_sdk::DriverReadItem {
+            // 复杂类型 Tag（Array/Struct 缺 schema）与未知 Tag 必须整体失败
+            // （invalid_type，§17.2）：不得静默降级为"未指定类型"（否则会按
+            // U16 解码出错误数值）。
+            let expected_type = match driver_sdk::abi::tag::tag_to_data_type(item.expected_type) {
+                Ok(t) => t,
+                Err(e) => {
+                    driver.last_error = Some(
+                        ModbusError::invalid_type(format!(
+                            "item {} 期望类型 Tag 非法：{e}",
+                            item.id
+                        ))
+                        .into_info(),
+                    );
+                    return -1;
+                }
+            };
+            read_items.push(driver_sdk::DriverReadItem {
                 id: item.id,
                 address: unsafe { ffi_str_to_str(item.address) }
                     .unwrap_or_default()
                     .to_owned(),
-                expected_type: driver_sdk::abi::tag::tag_to_data_type(item.expected_type)
-                    .ok()
-                    .flatten(),
-            }
-        })
-        .collect();
-    match driver.read_batch(&items) {
-        Ok(results) => {
-            let envelope = ReadEnvelope::new(results);
-            match serde_json::to_vec(&envelope) {
-                Ok(bytes) => write_buffer(out, &bytes),
-                Err(_) => return -1,
-            }
-            0
+                expected_type,
+            });
         }
-        Err(e) => {
-            let info = e.clone().into_info();
-            driver.last_error = Some(info);
-            -1
+        match driver.read_batch(&read_items) {
+            Ok(results) => {
+                let envelope = ReadEnvelope::new(results);
+                match serde_json::to_vec(&envelope) {
+                    Ok(bytes) => write_buffer(out, &bytes),
+                    Err(_) => return -1,
+                }
+                0
+            }
+            Err(e) => {
+                let info = e.clone().into_info();
+                driver.last_error = Some(info);
+                -1
+            }
         }
-    }
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_write(
@@ -452,12 +525,15 @@ unsafe extern "C" fn api_write(
     _len: usize,
     _out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("写");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("写");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_execute(
@@ -465,12 +541,15 @@ unsafe extern "C" fn api_execute(
     _command_json: FfiStr,
     _out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("execute");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("execute");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_browse(
@@ -478,12 +557,15 @@ unsafe extern "C" fn api_browse(
     _path: FfiStr,
     _out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("browse");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("browse");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_subscribe(
@@ -493,21 +575,27 @@ unsafe extern "C" fn api_subscribe(
     _user_data: *mut c_void,
     _out_subscription_id: *mut u64,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("subscribe");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("subscribe");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_unsubscribe(handle: DriverHandle, _subscription_id: u64) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("unsubscribe");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("unsubscribe");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_query_history(
@@ -515,47 +603,57 @@ unsafe extern "C" fn api_query_history(
     _request_json: FfiStr,
     _out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    let e = ModbusError::not_implemented("query_history");
-    driver.last_error = Some(e.clone().into_info());
-    -1
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        let e = ModbusError::unsupported("query_history");
+        driver.last_error = Some(e.clone().into_info());
+        -1
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_get_last_error_json(
     handle: DriverHandle,
     out: *mut FfiOwnedBuffer,
 ) -> i32 {
-    let Some(driver) = driver_mut(handle) else {
-        return -1;
-    };
-    match &driver.last_error {
-        Some(error) => {
-            let envelope = ErrorEnvelope::from(error);
-            match serde_json::to_vec(&envelope) {
-                Ok(bytes) => write_buffer(out, &bytes),
-                Err(_) => return -1,
+    catch_abi_panic(handle, || {
+        let Some(driver) = driver_mut(handle) else {
+            return -1;
+        };
+        match &driver.last_error {
+            Some(error) => {
+                let envelope = ErrorEnvelope::from(error);
+                match serde_json::to_vec(&envelope) {
+                    Ok(bytes) => write_buffer(out, &bytes),
+                    Err(_) => return -1,
+                }
             }
+            None => unsafe {
+                *out = FfiOwnedBuffer {
+                    ptr: std::ptr::null_mut(),
+                    len: 0,
+                    capacity: 0,
+                };
+            },
         }
-        None => unsafe {
-            *out = FfiOwnedBuffer {
-                ptr: std::ptr::null_mut(),
-                len: 0,
-                capacity: 0,
-            };
-        },
-    }
-    0
+        0
+    })
+    .unwrap_or(-1)
 }
 
 unsafe extern "C" fn api_free_buffer(buffer: FfiOwnedBuffer) {
-    if !buffer.ptr.is_null() {
-        // 由 write_buffer 的 Vec 重建并释放（§17.3 谁分配谁释放）。
-        unsafe {
-            drop(Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.capacity));
+    // §17.7：free 路径同样不允许 panic 穿过 ABI 边界（这里没有句柄可写
+    // 错误，panic 直接静默返回）。
+    let _ = std::panic::catch_unwind(|| {
+        if !buffer.ptr.is_null() {
+            // 由 write_buffer 的 Vec 重建并释放（§17.3 谁分配谁释放）。
+            unsafe {
+                drop(Vec::from_raw_parts(buffer.ptr, buffer.len, buffer.capacity));
+            }
         }
-    }
+    });
 }
 
 // ----------------------------------------------------------------- helpers
@@ -627,6 +725,39 @@ mod tests {
         let json = String::from_utf8(bytes.to_vec()).unwrap();
         let envelope: ErrorEnvelope = serde_json::from_str(&json).unwrap();
         assert_eq!(envelope.code, "config_error");
+        assert!(!envelope.retryable);
+        unsafe { api_free_buffer(out) };
+        unsafe { api_destroy(handle) };
+    }
+
+    /// §17.7：ABI 入口内的 panic 必须被统一捕获为 `DRIVER_PANIC`，
+    /// 不得穿过 C ABI 边界终止宿主进程。
+    #[test]
+    fn panic_is_caught_at_abi_boundary() {
+        let mut handle = DriverHandle {
+            ptr: std::ptr::null_mut(),
+        };
+        let status = unsafe { api_create(FfiStr::empty(), &mut handle) };
+        assert_eq!(status, -1);
+        assert!(!handle.ptr.is_null());
+
+        // 注入 panic：wrapper 必须返回 None（入口回退为 -1）并记录
+        // DRIVER_PANIC，供 get_last_error_json 查询。
+        let caught = catch_abi_panic(handle, || panic!("注入的 panic"));
+        assert_eq!(caught, None);
+
+        let mut out = FfiOwnedBuffer {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            capacity: 0,
+        };
+        let status = unsafe { api_get_last_error_json(handle, &mut out) };
+        assert_eq!(status, 0);
+        assert!(!out.ptr.is_null());
+        let bytes = unsafe { std::slice::from_raw_parts(out.ptr, out.len) };
+        let json = String::from_utf8(bytes.to_vec()).unwrap();
+        let envelope: ErrorEnvelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(envelope.code, "DRIVER_PANIC");
         assert!(!envelope.retryable);
         unsafe { api_free_buffer(out) };
         unsafe { api_destroy(handle) };

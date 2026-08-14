@@ -14,9 +14,11 @@ use observation_model::DriverErrorInfo;
 pub struct ModbusError {
     /// 稳定错误码（`DriverErrorInfo.code`）。
     pub code: &'static str,
+    /// 人类可读的错误详情（如连接目标、帧内容、异常说明）。
     pub message: String,
     /// Modbus 异常码（仅 `modbus_exception` 类错误）。
     pub protocol_code: Option<i64>,
+    /// 是否可重试（连接/超时/设备瞬态为 true；配置、地址、解码、非法参数为 false）。
     pub retryable: bool,
 }
 
@@ -75,11 +77,25 @@ impl ModbusError {
         Self::new("decode_error", message, false)
     }
 
-    /// 本 MVP 未实现的功能。
-    pub fn not_implemented(feature: &str) -> Self {
+    /// 期望类型 Tag 非法（未知 Tag 或 Array/Struct 复杂类型缺 schema，§17.2）。
+    pub fn invalid_type(message: String) -> Self {
+        Self::new("invalid_type", message, false)
+    }
+
+    /// Driver 内部 panic 被 C ABI 边界捕获（§17.7 DRIVER_PANIC）。
+    pub fn driver_panic(message: String) -> Self {
+        Self::new("DRIVER_PANIC", message, false)
+    }
+
+    /// 标准 `Unsupported` 错误（capability 为 `false` 的方法必须返回，§15）。
+    ///
+    /// code 固定为 `"unsupported"`，调用方据此稳定识别“能力未声明”，
+    /// 与 `QualityReason::Unsupported` 及能力声明语义一致；不得使用
+    /// 非标准码（如 `not_implemented`）替代。
+    pub fn unsupported(feature: &str) -> Self {
         Self::new(
-            "not_implemented",
-            format!("{feature} 未实现（本阶段仅支持读取）"),
+            "unsupported",
+            format!("{feature} 未声明（capability=false，本阶段仅支持读取）"),
             false,
         )
     }
@@ -92,6 +108,19 @@ impl ModbusError {
             protocol_code: self.protocol_code,
             retryable: self.retryable,
         }
+    }
+
+    /// 是否属于传输级错误：连接断开 / 建连失败 / 超时 / 响应失步。
+    ///
+    /// 这类错误表示会话已不可用（或设备不可达），批量读取必须整体失败
+    /// 返回（PollDriver 约定：连接错误与超时返回整体失败，由上层退避/重连，
+    /// §22、§34.3）；不得转成单项错误伪装成成功批次。其余错误（从站异常、
+    /// 解码失败等）属于协议/业务级，会话仍可用，可逐项标记。
+    pub fn is_transport_level(&self) -> bool {
+        matches!(
+            self.code,
+            "connection_lost" | "connection_failed" | "timeout" | "invalid_response"
+        )
     }
 }
 
