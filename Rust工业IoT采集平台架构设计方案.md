@@ -1848,6 +1848,26 @@ MVP 默认约定：
 }
 ```
 
+字段语义（更新后）：
+
+- `sequence` 是**独立批次序号（Batch Sequence）**，与 Observation 的
+  `sequence` 正交：同一 `device_id` 在单一 Collector session 内单调递增
+  （从 0 开始），表示"该设备的第几个批"，不取首条或末条 Observation 的
+  sequence。Observation 原有的 `sequence` 在批内原样保留，data-pipeline
+  不得重新编号。
+- `message_id` 由 **data-pipeline 在组包时生成**，采用**长度前缀无歧义
+  编码**（与 `observation_id` 同风格，§47）：每段先写十进制长度再写内容，
+  `sequence` 为末段按剩余内容整体解析；格式：
+  `{session_len}:{collector_session_id}{device_len}:{device_id}{sequence}`。
+  `collector_session_id`/`device_id` 允许包含 `-`、`:` 等字符而不会碰撞
+  （如 `session="a-b"、device="c"` 与 `session="a"、device="b-c"` 生成
+  不同的 `message_id`），嵌入会话 ID 保证 Collector 重启后消息级去重键
+  不冲突（§31.3），并天然带设备维度。
+- data-pipeline 默认配置：`max_batch_size = 1000`（对齐 §34.2 单批验收
+  目标）、`flush_interval = 1s`；两者均可配置。
+- 禁止跨设备混批：一个 Batch 只属于一个 `device_id`，不要求全局有序，
+  跨设备可并行输出。
+
 每个 Observation 至少携带：
 
 ```text
@@ -1901,6 +1921,11 @@ request_id        - 控制请求级幂等/关联
 - 仍使用 QoS 1。
 - 网络恢复后按本地持久化顺序补传。
 - Broker ACK 后才能删除对应 WAL 记录。
+
+WAL 持久化单位为**完整 Batch**（与 MQTT 发布单位一致）：每条 WAL 记录对应
+一个 `message_id` 的完整 Batch，PUBACK 后整条删除；消息级去重键
+（`message_id`，§31.3）与 WAL 记录一一对应，不做单条 Observation 粒度的
+持久化与补传。
 
 ## 31.5 REST v1
 
@@ -2318,7 +2343,7 @@ V0.4: FANUC FOCAS Process Plugin
 
 ## 34.7 当前仓库实施状态（非架构决策）
 
-截至设备管理合并，以下能力已经在 workspace 中实现并有自动化测试：
+截至数据管道合并，以下能力已经在 workspace 中实现并有自动化测试：
 
 ```text
 observation-model     共享规范模型
@@ -2330,6 +2355,7 @@ domain-model          Domain 路径校验与 Observation 映射
 poll-engine           周期调度、超时、指数退避、取消与阻塞隔离
 driver-modbus         Modbus TCP/RTU 读取 Driver MVP
 device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射
+data-pipeline         Telemetry Batch 聚合输出（有界队列、按设备分批、背压/取消/有界排空）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 

@@ -4,5 +4,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "数据管道（§31.2）：有界队列、按设备聚合的 Telemetry Batch 输出（背压/取消/有界排空）"
 
 [dependencies]
+diagnostics = { path = "../diagnostics" }
+observation-model = { path = "../observation-model" }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
