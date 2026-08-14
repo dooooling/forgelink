@@ -4,5 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "周期轮询调度引擎（§22）：设备级异步轮询、超时、指数退避重试与取消"
 
 [dependencies]
+diagnostics = { path = "../diagnostics" }
+driver-loader = { path = "../driver-loader" }
+driver-sdk = { path = "../driver-sdk" }
+observation-model = { path = "../observation-model" }
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
