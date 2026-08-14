@@ -4,5 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "设备实例管理：Driver/Profile 绑定、读取项生成与 RawReadResult→Profile→Domain→Observation 全链路映射（§2、§22、§47、§63、§72、§100）"
 
 [dependencies]
+diagnostics = { path = "../diagnostics" }
+domain-model = { path = "../domain-model" }
+driver-loader = { path = "../driver-loader" }
+driver-sdk = { path = "../driver-sdk" }
+observation-model = { path = "../observation-model" }
+poll-engine = { path = "../poll-engine" }
+profile-engine = { path = "../profile-engine" }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+modbus-mock = { path = "../modbus-mock" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
