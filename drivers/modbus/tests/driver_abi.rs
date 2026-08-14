@@ -6,13 +6,12 @@
 //! 每 item 错误/类型/质量保留）、异常响应、断线重连与超时。
 
 mod common;
-mod mock_server;
 
 use std::time::Duration;
 
 use driver_loader::NativeDriver;
 use driver_sdk::{AddressMetadata, DriverReadItem};
-use mock_server::{MockBehavior, MockServer};
+use modbus_mock::{MockBehavior, MockServer};
 use observation_model::{DataType, RawValue};
 
 use common::load_plugin;
@@ -29,6 +28,11 @@ fn item(id: u64, address: &str, expected_type: Option<DataType>) -> DriverReadIt
     }
 }
 
+/// 连接配置：`mode=tcp` + mock server 地址。
+fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
+    modbus_mock::tcp_config(server, timeout_ms)
+}
+
 /// 从整体调用失败中取出驱动错误详情（Loader 经 `get_last_error_json` 回传）。
 fn error_info(err: driver_loader::LoaderError) -> driver_sdk::DriverErrorInfo {
     match err {
@@ -43,7 +47,7 @@ fn error_info(err: driver_loader::LoaderError) -> driver_sdk::DriverErrorInfo {
 fn create_connect_validate_round_trip() {
     let behavior = MockBehavior::new();
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
 
     driver.connect().expect("connect 失败");
     assert!(driver.is_connected());
@@ -74,7 +78,7 @@ fn create_connect_validate_round_trip() {
 #[test]
 fn validate_address_rejects_invalid() {
     let server = MockServer::start(MockBehavior::new());
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     let err = driver
         .validate_address("20001")
         .expect_err("未知段必须被拒绝");
@@ -85,7 +89,7 @@ fn validate_address_rejects_invalid() {
 fn reads_multiple_addresses_with_types_and_quality() {
     let behavior = MockBehavior::new().with_holding_range(1, 0, &[0x1388, 0x0001]); // 40001, 40002
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     let results = driver
@@ -112,7 +116,7 @@ fn reads_coils_and_input_registers() {
         .with_coil_range(1, 0, &[true, false, true])
         .with_input_range(1, 0, &[0x002A]);
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     let results = driver
@@ -137,7 +141,7 @@ fn merge_does_not_cross_unit_or_requests() {
         .with_holding_range(1, 0, &[0x11, 0x22, 0x33])
         .with_holding_range(2, 1, &[0xAA, 0xBB]);
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     // unit 1 的 40001..40003 与 unit 2 的 40002..40003：分属两个请求。
@@ -172,8 +176,8 @@ fn preserves_per_item_errors_on_plan_failure() {
         .lock()
         .unwrap()
         .exception_at
-        .insert((1, mock_server::Kind::HoldingRegister, 1), 0x02);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+        .insert((1, modbus_mock::Kind::HoldingRegister, 1), 0x02);
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     let results = driver
@@ -206,7 +210,7 @@ fn preserves_per_item_errors_on_plan_failure() {
 fn timeout_returns_retryable_error() {
     let behavior = MockBehavior::new().with_response_delay(Duration::from_millis(500));
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 100));
+    let mut driver = create(&tcp_config(&server, 100));
     driver.connect().expect("connect 失败");
 
     // 超时属于传输级失败：必须整体失败返回（PollDriver 约定 §22），
@@ -227,7 +231,7 @@ fn timeout_then_recovery_reconnects() {
         .with_holding_range(1, 0, &[0x2A])
         .with_response_delay(Duration::from_millis(500));
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 100));
+    let mut driver = create(&tcp_config(&server, 100));
     driver.connect().expect("connect 失败");
 
     let err = driver
@@ -250,7 +254,7 @@ fn timeout_then_recovery_reconnects() {
 #[test]
 fn rejects_explicit_address_below_segment_base() {
     let server = MockServer::start(MockBehavior::new());
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     // 地址号低于段基数会让 offset 下溢（曾 panic / 读错地址）。
     for bad in [
         "holding:1",
@@ -272,7 +276,7 @@ fn rejects_explicit_address_below_segment_base() {
 #[test]
 fn rejects_complex_type_tag() {
     let server = MockServer::start(MockBehavior::new());
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
     // Array/Struct 复杂 Tag 缺少 schema，不得当作未指定类型。
     let err = driver
@@ -291,7 +295,7 @@ fn rejects_complex_type_tag() {
 fn rejects_bool_on_register_segment() {
     let behavior = MockBehavior::new().with_holding_range(1, 0, &[0x2A]);
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     // 寄存器段 expected_type=Bool 必须返回明确解码错误（decode_error），
@@ -312,7 +316,7 @@ fn rejects_response_body_length_mismatch() {
     let behavior = MockBehavior::new().with_holding_range(1, 0, &[0x2A]);
     let server = MockServer::start(behavior);
     server.behavior().lock().unwrap().declare_wrong_byte_count = true;
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     let err = driver
@@ -332,8 +336,8 @@ fn rejects_malformed_exception_response() {
     // 异常响应必须恰好 2 字节（fc|0x80 + 异常码）：缺异常码或多余字节的
     // 畸形帧不得被映射为可重试的 Modbus 异常，必须按响应失步整体失败。
     for malformed in [
-        mock_server::MalformedException::MissingCode,
-        mock_server::MalformedException::ExtraByte,
+        modbus_mock::MalformedException::MissingCode,
+        modbus_mock::MalformedException::ExtraByte,
     ] {
         let behavior = MockBehavior::new().with_holding_range(1, 0, &[0x2A]);
         let server = MockServer::start(behavior);
@@ -343,8 +347,8 @@ fn rejects_malformed_exception_response() {
             .lock()
             .unwrap()
             .exception_at
-            .insert((1, mock_server::Kind::HoldingRegister, 0), 0x02);
-        let mut driver = create(&mock_server::tcp_config(&server, 1000));
+            .insert((1, modbus_mock::Kind::HoldingRegister, 0), 0x02);
+        let mut driver = create(&tcp_config(&server, 1000));
         driver.connect().expect("connect 失败");
 
         let err = driver
@@ -367,7 +371,7 @@ fn unsupported_capabilities_return_standard_code() {
     // capability=false 的方法必须返回标准 Unsupported 错误（code =
     // "unsupported"，§15），调用方据此稳定识别"不支持"，不得 panic。
     let server = MockServer::start(MockBehavior::new());
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
 
     let err = driver
         .write(&[driver_sdk::DriverWriteItem {
@@ -412,7 +416,7 @@ fn unsupported_capabilities_return_standard_code() {
 fn connection_drop_then_reconnect() {
     let behavior = MockBehavior::new().with_holding_range(1, 0, &[0x2A]);
     let server = MockServer::start(behavior);
-    let mut driver = create(&mock_server::tcp_config(&server, 1000));
+    let mut driver = create(&tcp_config(&server, 1000));
     driver.connect().expect("connect 失败");
 
     // 第一次读取成功。

@@ -6,19 +6,18 @@
 //! 周期轮询，断言 `PollEvent::Batch` 携带正确的值、质量与错误语义。
 
 mod common;
-mod mock_server;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use driver_loader::NativeDriver;
 use driver_sdk::DriverReadItem;
+use modbus_mock::{MockBehavior, MockServer};
 use observation_model::{DataType, RawValue};
 use poll_engine::{PollConfig, PollDriver, PollEvent, PollScheduler, PollTarget};
 use tokio::sync::mpsc;
 
 use common::load_plugin;
-use mock_server::{MockBehavior, MockServer};
 
 /// 事件快照。
 #[derive(Debug, Clone)]
@@ -65,7 +64,7 @@ async fn polls_modbus_driver_via_native_plugin() {
         .with_holding_range(1, 0, &[0x1388]) // 40001 = 5000
         .with_coil_range(1, 0, &[true, false]);
     let server = MockServer::start(behavior);
-    let mut driver = NativeDriver::create(load_plugin(), &mock_server::tcp_config(&server, 1000))
+    let mut driver = NativeDriver::create(load_plugin(), &modbus_mock::tcp_config(&server, 1000))
         .expect("create 失败");
     driver.connect().expect("connect 失败");
 
