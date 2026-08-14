@@ -500,9 +500,10 @@ async fn non_retryable_error_returns_to_cycle() {
         assert!(!error.retryable);
     }
     // 若进入退避循环间隔应 ~10ms；回到周期节律则为 ~50ms。
+    // 阈值 30ms：既要区分两者，又容忍负载下的调度抖动（曾实测 37ms）。
     let gap = fails[1].at_ms - fails[0].at_ms;
     assert!(
-        gap >= 40,
+        gap >= 30,
         "永久错误应回到周期节律而非退避重试，实际间隔 {gap}ms"
     );
 }
