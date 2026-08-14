@@ -70,6 +70,14 @@ dependencies = [
 [[package]]
 name = "driver-loader"
 version = "0.1.0"
+dependencies = [
+ "driver-sdk",
+ "libloading",
+ "observation-model",
+ "serde",
+ "serde_json",
+ "tracing",
+]
 
 [[package]]
 name = "driver-modbus"
@@ -105,6 +113,16 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "local-buffer"
