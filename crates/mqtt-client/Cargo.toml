@@ -6,3 +6,18 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+data-pipeline = { path = "../data-pipeline" }
+ring = "0.17"
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+rustls = "0.22"
+rustls-pemfile = "2"
+# rustls-webpki 包的 [lib] 名称为 webpki，代码中以 webpki:: 引用。
+rustls-webpki = "0.102"
+serde_json = "1"
+tokio = { version = "1", features = ["sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-rustls = "0.25"

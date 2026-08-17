@@ -1833,6 +1833,40 @@ MVP 默认约定：
 
 `status` 使用 retained message + MQTT LWT 表示在线状态；Telemetry 不 retain，避免新订阅者误把旧值当作实时值。
 
+### 31.1.1 Status Envelope（更新后）
+
+在线 / 离线状态载荷统一为 Status Envelope，`schema` 为 `forgelink.status.v1`：
+
+```json
+{
+  "schema": "forgelink.status.v1",
+  "site_id": "plant-a",
+  "device_id": "cnc-01",
+  "status": "online",
+  "sent_at_ns": 1780000000000000000
+}
+```
+
+字段语义：
+
+- `status`：`online`（客户端 `publish_online` 发布）或 `offline`（客户端显式发布 / LWT 代发）。
+- `sent_at_ns`：客户端发布（在线、显式离线、重连重发、停机）时刻的真实时间戳——重发时必须重新生成时间戳，不得复用旧载荷；**LWT 固定为 `0`**——Will 载荷在 CONNECT 时固化、由 broker 在断连时按原样发布，客户端无法预知真实发布时间，消费者必须以消息到达时间作为离线发生时间。
+
+在线状态覆盖规则（更新后）：
+
+- 客户端按 `(site_id, device_id)` 逐设备记录已发布的在线状态；异常断线重连后（broker 已发布 retained 离线 LWT）逐设备重新发布在线状态，避免设备恢复采集后仍显示离线。
+- **每次断线重建完整重发周期**：断线时清空待重发队列，以在线设备全集重新填充——上一轮周期中已确认推送（已从队列弹出）的设备在二次断线时必须重新入队，否则其 LWT 已发布、重连后永久离线。未确认的在线状态由 rumqttc 在重连后原样重发，与重建周期的重发布幂等（同一 retained 主题，最终值一致）。
+- **重发优先于普通请求**：worker 每轮先执行重发（再接收新请求），保证断线重连后持续业务流量占满 pending 时重发不被饿死（普通请求可等待，重发受断线窗口限制）。
+- 重发在 pending 队列有空位时即执行（同一连接内完成，不依赖下一次重连）；**重发进度保存在待重发队列中，从队首推进**：设备数超过 `publish_capacity` 时每轮只推进部分设备，下一轮从断点继续——不得每次从头遍历，否则尾部设备永久遗漏。
+- `publish_offline`（设备下线 / 删除）：发布 retained 离线状态并立即停止该设备的在线跟踪（清除待重发队列与已入队在线重发条目），重连时不再重新标记在线。
+
+离线闭环（更新后）：
+
+- 单个 MQTT 客户端只能配置一个 LWT（MQTT 3.1.1 限制），覆盖一个设备（通常为主设备）：任意断连（含进程崩溃）由 broker 代为发布其离线状态。
+- **优雅停机**：客户端在发送 DISCONNECT 前为**所有**已跟踪设备显式发布 retained 离线状态（DISCONNECT 不触发 LWT，不主动发布则设备将长期显示在线）。离线请求**逐条转发送达**：rumqttc 通道容量有限（= `publish_capacity`），设备数超过容量时单次转发装不下，客户端循环"转发 + 泵事件循环腾出通道空间"直到全部入队或停机期限届满（与 DISCONNECT 冲刷共享 `GRACE_PERIOD` 预算）；期限内未能送达的剩余离线请求按 Closed 结算并告警，不得静默丢弃。
+- **异常断线且无法恢复**（网络分区、进程崩溃、重连上限耗尽）：除 Will 设备外，broker 无法感知客户端已死——**broker 侧会话过期只清理会话状态，不会删除 retained 在线消息**，其余设备可能长期显示在线。客户端在断连期间无法发布任何消息，该场景必须由消费端兜底：**不得单独以 retained 在线消息判断设备在线**，应以最后刷新时间 + 合理超时（含客户端重连预算与余量）推断离线，并据此告警或降级。
+- **续租规则（更新后）**：最后刷新时间以该设备**任意消息**（Telemetry 或 Status）的最后到达时间为准——Telemetry 即续租，消费端无需依赖周期性的状态心跳。正常业务下采集流量持续续租，设备不会因"仅在连接时发布一次在线状态"而被误判离线；仅当设备无采集数据（如已停用但未显式下线）时可能超时误判，此时由 `publish_offline` 显式注销避免。周期状态心跳仅作为无业务流量场景的可选演进（需同步调整 §31.1.1 的 LWT 与租约语义），当前版本不引入。
+
 ## 31.2 Telemetry Batch Envelope
 
 ```json
@@ -1921,6 +1955,9 @@ request_id        - 控制请求级幂等/关联
 - 仍使用 QoS 1。
 - 网络恢复后按本地持久化顺序补传。
 - Broker ACK 后才能删除对应 WAL 记录。
+- 客户端不得因协议层面的**包标识碰撞**（broker 乱序确认导致 pkid 回绕撞上未确认消息，rumqttc 发出 `Outgoing::AwaitAck`）提前结算：碰撞消息在旧同标识消息确认前未写出，`acked()` 必须以真实确认（其消息实际被 broker 收到）为返回 `Ok` 的依据，碰撞恢复后照常结算——防止未送达消息被误判成功、WAL 记录被提前删除。
+- 碰撞未决时断线重连，rumqttc 重发保留原包标识：重连后的首个同标识**写事件是重发**（碰撞尚未解决、不得解除碰撞消息的停放），旧同标识消息确认后的同标识写事件才是**碰撞恢复写**（解除停放并关联标识）。客户端必须区分二者，否则碰撞消息可能被后续写事件抢占标识、PUBACK 关联错位、WAL 记录被提前删除；停机排空各阶段与主循环统一按此规则处理。
+- rumqttc 的碰撞槽是单个，第二个未决碰撞会覆盖槽位（旧碰撞消息永久丢失，其恢复写永远不会出现）。客户端必须**立即失败结算**被覆盖的碰撞请求（以专用错误 `CollisionOverwritten` 失败——区别于"客户端已关闭"的 `Closed`，客户端本身仍正常运行，调用方不得因此停止客户端；WAL 记录保留可重试补传——连接保持健康时不得让请求永久等待），并把碰撞标识切换到 rumqttc 实际保存的新碰撞；仍可恢复的碰撞消息按配对标识正常恢复确认。
 
 WAL 持久化单位为**完整 Batch**（与 MQTT 发布单位一致）：每条 WAL 记录对应
 一个 `message_id` 的完整 Batch，PUBACK 后整条删除；消息级去重键
@@ -2343,7 +2380,7 @@ V0.4: FANUC FOCAS Process Plugin
 
 ## 34.7 当前仓库实施状态（非架构决策）
 
-截至数据管道合并，以下能力已经在 workspace 中实现并有自动化测试：
+截至 MQTT 客户端合并，以下能力已经在 workspace 中实现并有自动化测试：
 
 ```text
 observation-model     共享规范模型
@@ -2356,13 +2393,14 @@ poll-engine           周期调度、超时、指数退避、取消与阻塞隔�
 driver-modbus         Modbus TCP/RTU 读取 Driver MVP
 device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射
 data-pipeline         Telemetry Batch 聚合输出（有界队列、按设备分批、背压/取消/有界排空）
+mqtt-client           MQTT 北向客户端（QoS 1 发布、自动重连退避、LWT、TLS/mTLS、有界队列与背压）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 
 以下能力仍未完成端到端交付：
 
 ```text
-MQTT 输出、REST API、Local Buffer/WAL、Control Engine，
+REST API、Local Buffer/WAL、Control Engine，
 以及 collector / edge-server / manager 的完整运行时组装、三平台部署、
 性能基准和长时间稳定性验收。
 ```
