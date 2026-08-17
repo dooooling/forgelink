@@ -16,12 +16,13 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 - `drivers/modbus`：Modbus TCP/RTU、地址解析、批量读取、超时/断线重连和 Native Plugin C ABI
 - `device-manager`：设备实例注册、Driver/Profile 绑定校验、读取项生成与全链路数据映射
 - `data-pipeline`：Telemetry Batch 组包、按设备聚合、背压/取消/有界排空
+- `mqtt-client`：QoS 1 北向发布（rumqttc）、Topic 命名空间与 Status Envelope、断线重发与指数退避重连、LWT、TLS/mTLS、优雅停机排空
 - `modbus-mock`：测试共用 Mock Modbus TCP server（非生产）
 
 仍在建设中的能力：
 
 - `collector`、`edge-server`、`manager` 尚未完成运行时组装
-- MQTT 输出、REST API、Local Buffer/WAL、Control Engine 仍为占位
+- REST API、Local Buffer/WAL、Control Engine 仍为占位
 - 尚未完成三平台真实部署、性能基准和长时间稳定性验收
 
 架构依据见：
