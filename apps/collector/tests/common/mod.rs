@@ -1,15 +1,11 @@
 //! Collector 集成测试公用：cdylib 加载、Profile 装配、运行时 Harness。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use collector::config::CollectorConfig;
 use collector::config::{
     AbiSpec, BufferOptions, DeviceSpec, DriverSpec, ManifestSpec, MqttOptions, NorthboundConfig,
 };
-use driver_loader::NativePlugin;
-use driver_sdk::DriverManifest;
-use driver_sdk::abi::ENTRY_SYMBOL;
 use modbus_mock::{MockBehavior, MockServer};
 
 /// cdylib 产物文件名（Windows: `.dll`，Linux: `.so`）。
@@ -30,6 +26,8 @@ pub fn plugin_file() -> PathBuf {
 }
 
 /// 确保 cdylib 已构建（`cargo test` 不产出 cdylib 时自动 `cargo build -p driver-modbus`）。
+/// 进程内统一执行一次（OnceLock）；cargo build 为增量，测试阶段主 cargo
+/// 已释放编译锁，嵌套 build 安全（与 `drivers/modbus` 测试同模式）。
 fn ensure_plugin_built() {
     static BUILD_GUARD: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     BUILD_GUARD.get_or_init(|| {
@@ -42,26 +40,6 @@ fn ensure_plugin_built() {
             "cargo build -p driver-modbus 失败：cdylib 产物缺失或构建出错"
         );
     });
-}
-
-/// 加载 Modbus Native Plugin（Manifest 与 `driver-modbus` 保持一致）。
-///
-/// 由 Harness 经配置加载（§100 启动路径）；直接调用仅用于构造期自检。
-#[allow(dead_code)]
-pub fn load_plugin() -> Arc<NativePlugin> {
-    ensure_plugin_built();
-    let manifest = DriverManifest {
-        id: "modbus-tcp".to_owned(),
-        name: "Modbus TCP".to_owned(),
-        version: "0.1.0".to_owned(),
-        entry: ENTRY_SYMBOL.to_owned(),
-        abi: driver_sdk::manifest::AbiVersion { major: 1, minor: 0 },
-        platforms: vec![],
-    };
-    Arc::new(
-        NativePlugin::load(&plugin_file(), manifest)
-            .expect("cdylib 产物缺失，请先构建 driver-modbus"),
-    )
 }
 
 /// 示例 Profile（与 `crates/device-manager` 集成测试同源）。
@@ -159,6 +137,7 @@ impl Harness {
     /// 装配配置（不启动 Collector 运行时）。同步构造；Broker 由测试
     /// `MockBroker::start().await` 启动后传入端口。
     pub fn new(behavior: MockBehavior, broker_port: u16) -> Self {
+        ensure_plugin_built();
         let server = MockServer::start(behavior);
         let temp = tempfile::tempdir().expect("临时目录");
         write_profiles(temp.path());
