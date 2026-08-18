@@ -8,28 +8,73 @@ license.workspace = true
 [features]
 default = ["collector"]
 
-# 纯采集：编译期不含控制链路（§98、§106）
+# 纯采集运行时（§92/§93/§98）：编译期不含控制链路。
+# `collector` 由三个子 feature 组合，逐个落地真实依赖：
+#   driver-read  -> 采集与映射链路（device-manager/poll-engine/driver-loader/...）
+#   mqtt         -> 北向 MQTT 输出
+#   local-cache  -> Local Buffer/WAL（断线落盘、按序补传）
 collector = [
     "driver-read",
     "mqtt",
     "local-cache",
 ]
 
-# 启用控制链路（driver-write、control-engine）
+# 启用控制链路（driver-write、control-engine）。当前阶段保持空占位：
+# 接入控制链路后必须验证只读构建
+# （cargo check -p collector --no-default-features --features collector）
+# 的产物不包含控制代码。
 control = [
     "driver-write",
     "control-engine",
 ]
 
-# 占位：依赖落地后改为 `dep:xxx` 或 `xxx/feature` 形式（§98）。
-# 接入控制链路后必须验证只读构建（--no-default-features --features collector）
-# 不包含控制代码（无 control-engine / driver-write）。
-driver-read = []
-mqtt = []
-local-cache = []
+driver-read = [
+    "dep:device-manager",
+    "dep:driver-loader",
+    "dep:driver-sdk",
+    "dep:poll-engine",
+    "dep:profile-engine",
+    "dep:domain-model",
+    "dep:observation-model",
+    "dep:data-pipeline",
+    "dep:diagnostics",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde_yaml",
+    "dep:tokio",
+]
+mqtt = ["dep:mqtt-client"]
+local-cache = ["dep:local-buffer"]
 driver-write = []
 control-engine = []
 
 [dependencies]
-diagnostics = { path = "../../crates/diagnostics" }
+# 采集与映射链路（driver-read）
+data-pipeline = { path = "../../crates/data-pipeline", optional = true }
+device-manager = { path = "../../crates/device-manager", optional = true }
+diagnostics = { path = "../../crates/diagnostics", optional = true }
+domain-model = { path = "../../crates/domain-model", optional = true }
+driver-loader = { path = "../../crates/driver-loader", optional = true }
+driver-sdk = { path = "../../crates/driver-sdk", optional = true }
+observation-model = { path = "../../crates/observation-model", optional = true }
+poll-engine = { path = "../../crates/poll-engine", optional = true }
+profile-engine = { path = "../../crates/profile-engine", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"], optional = true }
+
+# 北向 MQTT 输出（mqtt）
+mqtt-client = { path = "../../crates/mqtt-client", optional = true }
+
+# Local Buffer/WAL（local-cache）
+local-buffer = { path = "../../crates/local-buffer", optional = true }
+
 tracing = "0.1"
+
+[dev-dependencies]
+modbus-mock = { path = "../../crates/modbus-mock" }
+mqtt-client = { path = "../../crates/mqtt-client", features = ["test-utils"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }

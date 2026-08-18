@@ -5,6 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# 测试支撑：公开 Mock MQTT Broker（`mock` 模块），供上层 crate（如
+# collector 端到端测试）复用。不携带任何生产功能；需要的 tokio 子
+# feature（net/io-util/rt-multi-thread/macros）与 TLS 依赖一并在此
+# 激活，避免无谓放大普通构建的依赖图。
+[features]
+test-utils = [
+    "dep:tokio-rustls",
+    "tokio/net",
+    "tokio/io-util",
+    "tokio/macros",
+    "tokio/rt-multi-thread",
+]
+
 [dependencies]
 data-pipeline = { path = "../data-pipeline" }
 ring = "0.17"
@@ -15,6 +28,8 @@ rustls-pemfile = "2"
 rustls-webpki = "0.102"
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time"] }
+# 仅 test-utils 需要（mock broker 的 TLS 变体）。
+tokio-rustls = { version = "0.25", optional = true }
 tracing = "0.1"
 
 [dev-dependencies]

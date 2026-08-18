@@ -1,0 +1,391 @@
+//! Collector 运行时组装（§93/§100）。
+//!
+//! 启动顺序：Load Config → Load Driver → Load Profile → Register Device
+//! → Start Pipeline / Buffer / MQTT → Polling → Observation → Upload。
+//!
+//! 链路（只读，§98/§106）：
+//!
+//! ```text
+//! Poll Engine ── PollEvent ──> DeviceManager 映射（Profile+Domain）── Observations
+//!   ──> Data Pipeline（按设备聚合组包）──> Local Buffer/WAL（落盘）
+//!   ──> 发送循环：next ──> MQTT publish_batch ──> PUBACK ──> ack（唯一删除路径）
+//!   失败（Closed/Disconnected/CollisionOverwritten）──> requeue（保留补传）
+//! ```
+//!
+//! 停机编排（有序 + 有限排空）：
+//!
+//! ```text
+//! 信号 ──> PollScheduler.shutdown（停止采集）
+//!      ──> pump join（剩余事件映射入管道）
+//!      ──> Pipeline.shutdown（组包排空到输出端）
+//!      ──> forward 排空（输出端收完 + WAL 能发的发完，期限内）
+//!      ──> MqttClient.shutdown（DISCONNECT，未确认以 Closed 结算，WAL 保留）
+//!      ──> LocalBuffer.shutdown（未确认记录保留，下次启动补传）
+//! ```
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use device_manager::{DeviceManager, NativeDriverFactory};
+use driver_loader::NativePlugin;
+use driver_sdk::DriverManifest;
+use observation_model::Device;
+use poll_engine::PollScheduler;
+use tokio::sync::{mpsc, watch};
+use tracing::{error, info, warn};
+
+use crate::config::CollectorConfig;
+use crate::error::CollectorError;
+use crate::health::CollectorHealth;
+use crate::tasks::{HealthState, run_forward, run_heartbeat, run_pump};
+
+/// 心跳日志周期（§104 长期稳定性观测）。
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Collector 运行时：持有全部组件与工作任务句柄。
+pub struct CollectorRuntime {
+    site_id: String,
+    session_id: String,
+    health: Arc<HealthState>,
+    devices: Vec<(String, bool, usize, usize)>,
+    scheduler: PollScheduler,
+    pipeline: Arc<data_pipeline::Pipeline>,
+    buffer: Arc<local_buffer::LocalBuffer>,
+    mqtt: Option<Arc<mqtt_client::MqttClient>>,
+    pump: tokio::task::JoinHandle<()>,
+    forward: tokio::task::JoinHandle<()>,
+    heartbeat: tokio::task::JoinHandle<()>,
+    stopping: watch::Sender<bool>,
+    config: CollectorConfig,
+}
+
+impl CollectorRuntime {
+    /// 加载配置并按 §100 顺序组装全部组件，随后立即开始采集。
+    ///
+    /// 失败语义：任何组件启动失败（Profile 缺失 / Driver ABI 不符 /
+    /// 设备绑定失败 / 管道或缓冲配置非法）都显式返回错误，不静默降级。
+    pub async fn start(config: CollectorConfig) -> Result<Self, CollectorError> {
+        config.validate()?;
+        let session_id = config.effective_session_id();
+        let started_at_ns = crate::now_ns();
+        info!(
+            component = "collector",
+            site_id = %config.site_id,
+            session_id = %session_id,
+            "Collector 启动"
+        );
+
+        // 1) Load Profile（§38：Profile 不写死在主程序）。
+        let mut registry = profile_engine::ProfileRegistry::new();
+        let loaded = registry
+            .load_dir(&config.profiles_dir)
+            .map_err(|e| CollectorError::Profiles(e.to_string()))?;
+        info!(
+            component = "collector",
+            profiles_dir = %config.profiles_dir.display(),
+            profiles = loaded,
+            "Device Profile 已加载"
+        );
+
+        // 2) Load Driver（§19/§20：Native Plugin + Manifest）。
+        let manifest = DriverManifest {
+            id: config.driver.manifest.id.clone(),
+            name: config.driver.manifest.name.clone(),
+            version: config.driver.manifest.version.clone(),
+            entry: driver_sdk::abi::ENTRY_SYMBOL.to_owned(),
+            abi: driver_sdk::manifest::AbiVersion {
+                major: config.driver.manifest.abi.major,
+                minor: config.driver.manifest.abi.minor,
+            },
+            platforms: vec![],
+        };
+        let plugin = Arc::new(
+            NativePlugin::load(&config.driver.plugin, manifest)
+                .map_err(|e| CollectorError::Driver(Box::new(e)))?,
+        );
+        info!(
+            component = "collector",
+            plugin = %config.driver.plugin.display(),
+            driver_id = %config.driver.manifest.id,
+            "Driver 已加载"
+        );
+        let mut factory = NativeDriverFactory::new();
+        factory
+            .add_plugin(plugin)
+            .map_err(|e| CollectorError::Driver(Box::new(e)))?;
+
+        // 3) 构造设备（domain 缺省取 Profile 决定，§100 device.yaml），
+        //    随后注册绑定 Driver/Profile 并生成读取项（§37）。
+        let mut devices: Vec<Device> = Vec::with_capacity(config.devices.len());
+        for spec in &config.devices {
+            let domain = match &spec.domain {
+                Some(d) => d.clone(),
+                None => registry
+                    .get(&spec.profile)
+                    .ok_or_else(|| {
+                        CollectorError::Profiles(format!(
+                            "设备 {} 引用的 Profile {} 未注册",
+                            spec.id, spec.profile
+                        ))
+                    })?
+                    .domain
+                    .clone(),
+            };
+            devices.push(Device {
+                id: spec.id.clone(),
+                name: spec.name.clone().unwrap_or_else(|| spec.id.clone()),
+                domain,
+                driver_id: spec.driver.clone(),
+                profile_id: spec.profile.clone(),
+                connection: observation_model::DeviceConnection {
+                    config: spec.connection.clone(),
+                },
+                enabled: spec.enabled,
+                labels: spec.labels.clone(),
+            });
+        }
+        let mut manager =
+            DeviceManager::new(registry, Box::new(factory), config.poll.default_interval_ms)?;
+        for device in &devices {
+            manager.register_device(device.clone())?;
+            info!(
+                component = "collector",
+                device_id = %device.id,
+                driver_id = %device.driver_id,
+                profile_id = %device.profile_id,
+                "设备已注册"
+            );
+        }
+
+        // 4) 数据管道 / 本地缓冲 / MQTT（§31.2/§103/§31）。
+        let pipeline_cfg = config
+            .pipeline
+            .to_pipeline_config(&config.site_id, &session_id)?;
+        let (out_tx, out_rx) = mpsc::channel(pipeline_cfg.max_batch_size);
+        let pipeline = data_pipeline::Pipeline::spawn(pipeline_cfg, out_tx)?;
+        let pipeline_arc = Arc::new(pipeline);
+
+        let buffer_cfg = config.buffer.to_buffer_config()?;
+        if let Some(parent) = buffer_cfg.db_path.parent()
+            && !parent.as_os_str().is_empty()
+            && !parent.exists()
+        {
+            warn!(
+                component = "collector",
+                db_dir = %parent.display(),
+                "缓冲数据库父目录不存在（重启恢复依赖目录持久化，请提前创建）"
+            );
+        }
+        let buffer = Arc::new(local_buffer::LocalBuffer::open(buffer_cfg).await?);
+
+        let mqtt_cfg = config.northbound.mqtt.to_client_config(&config.site_id)?;
+        let mqtt = mqtt_client::MqttClient::spawn(mqtt_cfg)?;
+        let mqtt_arc = Arc::new(mqtt);
+
+        // 5) 在线状态（§31.1：retained status envelope，每设备；断线后
+        //    mqtt-client 按设备全集重建重发周期，失败不阻塞启动）。
+        for device_id in manager.device_ids() {
+            if let Err(e) = mqtt_arc.publish_online(&config.site_id, device_id).await {
+                warn!(
+                    component = "collector",
+                    device_id,
+                    error = %e,
+                    "在线状态发布失败（重连后自动重建重发）"
+                );
+            }
+        }
+
+        // 6) Poll Scheduler：按读取项分组启动轮询任务（§22/§34.3）。
+        let poll_cfg = config.poll.to_poll_config();
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let mut scheduler = PollScheduler::new();
+        let mut device_meta: Vec<(String, bool, usize, usize)> = Vec::new();
+        for device_id in manager.device_ids() {
+            let instance = manager.get(device_id).expect("已注册");
+            let targets = instance.poll_targets();
+            device_meta.push((
+                device_id.clone(),
+                instance.device.enabled,
+                targets.iter().map(|t| t.items.len()).sum(),
+                targets.len(),
+            ));
+            for target in &targets {
+                scheduler.spawn(
+                    target.clone(),
+                    instance.driver.clone(),
+                    poll_cfg.clone(),
+                    events_tx.clone(),
+                )?;
+            }
+            if targets.is_empty() {
+                warn!(
+                    component = "collector",
+                    device_id, "设备没有可采集的读取项（Profile 无可读属性或设备被禁用）"
+                );
+            }
+        }
+
+        // 7) 工作任务：pump（事件→映射→管道）、forward（管道→缓冲→MQTT）、
+        //    heartbeat（健康状态日志，§104）。
+        let (stopping_tx, stopping_rx) = watch::channel(false);
+        let health = Arc::new(HealthState::default());
+        health.started_at_ns.store(started_at_ns, Ordering::Relaxed);
+        let manager_arc = Arc::new(manager);
+        let pump = tokio::spawn(run_pump(
+            events_rx,
+            Arc::clone(&manager_arc),
+            Arc::clone(&pipeline_arc),
+            session_id.clone(),
+            stopping_rx.clone(),
+            Arc::clone(&health),
+        ));
+        let forward = tokio::spawn(run_forward(
+            out_rx,
+            Arc::clone(&buffer),
+            Arc::clone(&mqtt_arc),
+            stopping_rx.clone(),
+            Arc::clone(&health),
+            Duration::from_millis(config.forward_poll_ms.max(50)),
+            Duration::from_secs(config.buffer.drain_timeout_secs),
+        ));
+        let heartbeat = tokio::spawn(run_heartbeat(
+            stopping_rx.clone(),
+            Arc::clone(&health),
+            HEARTBEAT_INTERVAL,
+        ));
+
+        let runtime = Self {
+            site_id: config.site_id.clone(),
+            session_id: session_id.clone(),
+            health: Arc::clone(&health),
+            devices: device_meta,
+            scheduler,
+            pipeline: pipeline_arc,
+            buffer,
+            mqtt: Some(mqtt_arc),
+            pump,
+            forward,
+            heartbeat,
+            stopping: stopping_tx,
+            config,
+        };
+        runtime.log_health("启动完成").await;
+        Ok(runtime)
+    }
+
+    /// 站点标识。
+    pub fn site_id(&self) -> &str {
+        &self.site_id
+    }
+
+    /// 采集会话标识。
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// 健康状态快照（§104：设备/缓冲/发布三面；REST 阶段暴露 HTTP 端点）。
+    pub fn health(&self) -> CollectorHealth {
+        let mut h = self.health.snapshot(&self.devices);
+        h.site_id = self.site_id.clone();
+        h.session_id = self.session_id.clone();
+        h.buffer.db_path = self.config.buffer.db_path.display().to_string();
+        h
+    }
+
+    async fn log_health(&self, stage: &str) {
+        let h = self.health();
+        if h.has_device_errors() {
+            warn!(component = "collector", stage, health = %h, "Collector 健康状态（存在设备异常）");
+        } else {
+            info!(component = "collector", stage, health = %h, "Collector 健康状态");
+        }
+    }
+
+    /// 等待停机信号并执行有序停机（§104：Service Restart 语义下的优雅
+    /// 退出）。停机信号来自 `watch::Receiver<bool>`（由 main 挂接系统
+    /// 信号）；发送循环异常终止也会触发停机并返回错误。
+    pub async fn run_until_shutdown(
+        mut self,
+        mut signal: watch::Receiver<bool>,
+    ) -> Result<(), CollectorError> {
+        tokio::select! {
+            r = signal.changed() => {
+                if r.is_err() {
+                    warn!(component = "collector", "停机信号通道关闭，按停机处理");
+                }
+            }
+            r = &mut self.forward => {
+                let msg = format!("发送循环异常退出: {r:?}");
+                error!(component = "collector", "{msg}");
+                self.stopping.send(true).ok();
+                return Err(CollectorError::Task(msg));
+            }
+        }
+        info!(component = "collector", "收到停机信号，开始有序停机");
+        self.shutdown().await
+    }
+
+    /// 有序停机（§104/§31.3：有限排空 + 未确认记录保留，重启补传）。
+    pub async fn shutdown(mut self) -> Result<(), CollectorError> {
+        self.stopping.send(true).ok();
+        // 停机全程的健康快照：字段级取出，避免后续部分 move 的借用冲突。
+        let final_health = self.health();
+
+        // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。
+        self.scheduler.shutdown().await;
+        let pump_result = tokio::time::timeout(Duration::from_secs(5), &mut self.pump)
+            .await
+            .map_err(|_| CollectorError::ShutdownTimeout { stage: "pump" })?;
+        if let Err(e) = pump_result {
+            warn!(component = "collector", error = %e, "pump 任务异常结束");
+        }
+
+        // 2) 管道排空：剩余 Observation 组包输出到 forward 的输出端。
+        //    pump 已退出，Arc 引用可安全收回消费式 shutdown。
+        let pipeline = Arc::try_unwrap(self.pipeline)
+            .map_err(|_| CollectorError::Task("pipeline 引用未释放".to_owned()))?;
+        let drained = pipeline.shutdown().await?;
+        info!(
+            component = "collector",
+            batches = drained.batches_emitted,
+            observations = drained.observations_emitted,
+            dropped = drained.observations_dropped,
+            "管道排空完成"
+        );
+
+        // 3) 发送循环有限排空：输出端收完 + WAL 能发的发完（期限内；
+        //    超时或发布失败的记录保留，下次启动补传）。
+        let forward_result = tokio::time::timeout(Duration::from_secs(30), &mut self.forward)
+            .await
+            .map_err(|_| CollectorError::ShutdownTimeout { stage: "forward" })?;
+        if let Err(e) = forward_result {
+            warn!(component = "collector", error = %e, "发送循环异常结束");
+        }
+
+        // 4) MQTT 结算：DISCONNECT（不触发 LWT）+ 未确认发布以 Closed
+        //    结算——WAL 记录不删除（保留补传，§31.3）。forward 已退出，
+        //    引用可收回。
+        if let Some(mqtt) = self.mqtt.take() {
+            let mqtt = Arc::try_unwrap(mqtt)
+                .map_err(|_| CollectorError::Task("mqtt 引用未释放".to_owned()))?;
+            mqtt.shutdown().await?;
+        }
+
+        // 5) 缓冲关闭：未确认记录保留（§103 停机语义）。
+        self.buffer.shutdown().await?;
+
+        // 6) 心跳任务结束。
+        self.heartbeat.abort();
+        let _ = (&mut self.heartbeat).await;
+
+        info!(
+            component = "collector",
+            site_id = %self.site_id,
+            session_id = %self.session_id,
+            health = %final_health,
+            "Collector 有序停机完成"
+        );
+        Ok(())
+    }
+}

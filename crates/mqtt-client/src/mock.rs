@@ -1,4 +1,4 @@
-//! 测试专用 Mock MQTT 3.1.1 Broker（仅 `cfg(test)` 编译）。
+//! 测试专用 Mock MQTT 3.1.1 Broker（`cfg(test)` 或 `test-utils` feature 编译）。
 //!
 //! 支持：CONNECT/CONNACK、PUBLISH/PUBACK、SUBSCRIBE/SUBACK、PINGREQ/PINGRESP、
 //! DISCONNECT；异常断开（未收到 DISCONNECT 报文）时按 CONNECT 中的 Will
@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 
 /// 被捕获的一条 PUBLISH 报文。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CapturedPublish {
+pub struct CapturedPublish {
     pub topic: String,
     pub payload: Vec<u8>,
     pub qos: u8,
@@ -27,7 +27,7 @@ pub(crate) struct CapturedPublish {
 
 /// 从 CONNECT 报文中捕获的 Will（LWT）配置。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CapturedWill {
+pub struct CapturedWill {
     pub topic: String,
     pub payload: Vec<u8>,
     pub qos: u8,
@@ -73,7 +73,7 @@ struct Subscriber {
 }
 
 /// 测试用 Mock MQTT broker。
-pub(crate) struct MockBroker {
+pub struct MockBroker {
     addr: std::net::SocketAddr,
     state: Arc<Mutex<MockState>>,
     shutdown_tx: watch::Sender<bool>,
@@ -82,13 +82,13 @@ pub(crate) struct MockBroker {
 
 impl MockBroker {
     /// 启动明文 TCP broker，监听 127.0.0.1 的随机端口。
-    pub(crate) async fn start() -> Self {
+    pub async fn start() -> Self {
         Self::start_inner(None).await
     }
 
     /// 启动 TLS broker（`client_ca_der` 为 `Some` 时启用 mTLS，
     /// 要求客户端出示由该 CA 签发的证书）。
-    pub(crate) async fn start_tls(
+    pub async fn start_tls(
         server_cert_der: Vec<u8>,
         server_key_der: Vec<u8>,
         client_ca_der: Option<Vec<u8>>,
@@ -140,27 +140,27 @@ impl MockBroker {
     }
 
     /// broker 监听地址。
-    pub(crate) fn addr(&self) -> std::net::SocketAddr {
+    pub fn addr(&self) -> std::net::SocketAddr {
         self.addr
     }
 
     /// 累计连接次数。
-    pub(crate) fn connections(&self) -> usize {
+    pub fn connections(&self) -> usize {
         self.state.lock().expect("state 锁中毒").connections
     }
 
     /// 捕获到的全部 PUBLISH。
-    pub(crate) fn publishes(&self) -> Vec<CapturedPublish> {
+    pub fn publishes(&self) -> Vec<CapturedPublish> {
         self.state.lock().expect("state 锁中毒").publishes.clone()
     }
 
     /// 捕获到的全部 Will（按连接顺序）。
-    pub(crate) fn wills(&self) -> Vec<CapturedWill> {
+    pub fn wills(&self) -> Vec<CapturedWill> {
         self.state.lock().expect("state 锁中毒").wills.clone()
     }
 
     /// 未收到 DISCONNECT 报文即断开的连接数。
-    pub(crate) fn abnormal_disconnects(&self) -> usize {
+    pub fn abnormal_disconnects(&self) -> usize {
         self.state
             .lock()
             .expect("state 锁中毒")
@@ -168,13 +168,13 @@ impl MockBroker {
     }
 
     /// 测试钩子：下一个收到 PUBLISH 的连接不回复 PUBACK 直接断开。
-    pub(crate) fn drop_connection_after_publish(&self) {
+    pub fn drop_connection_after_publish(&self) {
         self.drop_connection_after_publishes(1);
     }
 
     /// 测试钩子：收到第 N 个 PUBLISH 后不回复 PUBACK 直接断开（先记录
     /// 报文；重连后 rumqttc 会重发相同报文）。
-    pub(crate) fn drop_connection_after_publishes(&self, n: usize) {
+    pub fn drop_connection_after_publishes(&self, n: usize) {
         self.state
             .lock()
             .expect("state 锁中毒")
@@ -185,7 +185,7 @@ impl MockBroker {
     /// （先记录报文，不回复 PUBACK）。与 [`Self::drop_connection_after_publishes`]
     /// 按全局计数不同，本钩子按连接定位：可用于断言"上一轮重发周期中
     /// 已确认的设备在二次断线后会被重新加入重发"。
-    pub(crate) fn drop_connection_number(&self, conn_index: usize, publish_count: usize) {
+    pub fn drop_connection_number(&self, conn_index: usize, publish_count: usize) {
         self.state
             .lock()
             .expect("state 锁中毒")
@@ -193,20 +193,20 @@ impl MockBroker {
     }
 
     /// 测试钩子：延迟指定时长后再回复 PUBACK（默认立即回复）。
-    pub(crate) fn set_puback_delay(&self, delay: Duration) {
+    pub fn set_puback_delay(&self, delay: Duration) {
         self.state.lock().expect("state 锁中毒").puback_delay = delay;
     }
 
     /// 测试钩子：挂起第 N 个 QoS 1 PUBLISH 的 PUBACK，直到返回的
     /// `AtomicBool` 被置为 `true`（用于构造 pkid 回绕碰撞场景）。
-    pub(crate) fn hold_puback(&self, nth: usize) -> Arc<std::sync::atomic::AtomicBool> {
+    pub fn hold_puback(&self, nth: usize) -> Arc<std::sync::atomic::AtomicBool> {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.state.lock().expect("state 锁中毒").puback_hold_n = Some((nth, flag.clone()));
         flag
     }
 
     /// 注册精确主题订阅，返回消息接收端（含 LWT 发布）。
-    pub(crate) async fn subscribe(&self, topic: &str) -> mpsc::UnboundedReceiver<CapturedPublish> {
+    pub async fn subscribe(&self, topic: &str) -> mpsc::UnboundedReceiver<CapturedPublish> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.state
             .lock()
@@ -222,7 +222,7 @@ impl MockBroker {
     /// 中断全部客户端连接（模拟网络故障）。注意：任务被 `abort` 中止后
     /// 无法运行连接结束逻辑，因此 `abnormal_disconnects` 不会增加、LWT
     /// 也不会发布——与真实的 TCP 断连不同，这是测试钩子的已知语义。
-    pub(crate) fn drop_all_connections(&self) {
+    pub fn drop_all_connections(&self) {
         let mut state = self.state.lock().expect("state 锁中毒");
         for task in state.connection_tasks.drain(..) {
             task.abort();
@@ -230,7 +230,7 @@ impl MockBroker {
     }
 
     /// 停止 broker 并等待服务端任务退出（测试收尾）。
-    pub(crate) async fn stop(self) {
+    pub async fn stop(self) {
         let _ = self.shutdown_tx.send(true);
         let _ = self.server_task.await;
     }
@@ -657,13 +657,13 @@ impl<'a> Cursor<'a> {
 }
 
 /// 发送原始 MQTT 客户端报文（测试中直接构造 CONNECT 等）。
-pub(crate) struct RawClient {
+pub struct RawClient {
     stream: TcpStream,
 }
 
 impl RawClient {
     /// 建立 TCP 连接并发送 CONNECT（可选 Will），返回已连接客户端。
-    pub(crate) async fn connect_with_will(
+    pub async fn connect_with_will(
         addr: std::net::SocketAddr,
         will: Option<&CapturedWill>,
     ) -> Self {
@@ -700,13 +700,13 @@ impl RawClient {
     }
 
     /// 直接关闭连接（不发送 DISCONNECT），模拟客户端异常掉线。
-    pub(crate) fn drop(mut self) {
+    pub fn drop(mut self) {
         std::mem::drop(self.stream.shutdown());
     }
 }
 
 /// 测试辅助：在期限内轮询断言。
-pub(crate) async fn wait_until<F>(mut cond: F)
+pub async fn wait_until<F>(mut cond: F)
 where
     F: FnMut() -> bool,
 {
