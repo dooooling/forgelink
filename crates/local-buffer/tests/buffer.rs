@@ -898,23 +898,38 @@ async fn backpressure_wakes_on_retention_expiry() {
     // 可达数十毫秒，若间隔只有 50ms，m-1 会在 m-0 清理后的下一轮
     // 清理中误删）。第二条进入背压等待。此后没有任何命令（无
     // ack / next / push），worker 只能靠保留期限唤醒。
+    //
+    // t_m0_expire 是 m-0 到期时刻的严格下界：worker 最早在 m-0 push
+    // 发起时刻之后才能落盘并登记 created_at，故任何"背压请求被自动
+    // 唤醒"的完成时刻都不可能早于 t_m0_expire——这是无歧义的判定
+    // 基准（与测试线程调度暂停 δ 无关）。
+    let t_m0 = std::time::Instant::now();
     buffer
         .push(batch(&big_id(0), "cnc-01", 0))
         .await
         .expect("push");
+    let t_m0_expire = t_m0 + cfg.retention;
     tokio::time::sleep(Duration::from_millis(250)).await;
     // pin! + 分支内 &mut 借用：select 取消分支不会 drop future，
     // 窗口过后可继续 poll 同一个 pending（tokio mpsc send 支持
     // 取消后重 poll，不丢失已取得的 permit/已发送状态）。
     let mut pending = Box::pin(buffer.push(batch(&big_id(1), "cnc-01", 1)));
 
-    // 必须真实进入背压等待，而非因 m-0 已过期直接成功：select 窗口
-    // 20ms 远早于 m-0 到期时刻（t0+300ms），窗口内 pending 完成只可
-    // 能是"未进入背压直接落盘成功"（慢 CI 上 m-1 命令处理延迟超过
-    // 50ms 时会发生），此时显式失败暴露问题而非静默通过。
+    // 必须真实进入背压等待，而非因 m-0 已过期直接成功。biased 使
+    // sleep 分支优先：观察定时器与 pending 同时就绪时（慢 CI 暂停
+    // 导致窗口跨过 m-0 到期时刻）不随机选分支；pending 分支内再用
+    // t_m0_expire 判定——完成时刻早于它必为直接成功（背压唤醒不可
+    // 能更早），晚于它则是到期后自动入队，均无歧义。
     tokio::select! {
-        r = &mut pending => panic!("m-1 必须进入背压等待，不得直接成功: {r:?}"),
-        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        biased;
+        _ = tokio::time::sleep(Duration::from_millis(40)) => {}
+        r = &mut pending => {
+            let completed = std::time::Instant::now();
+            assert!(
+                completed >= t_m0_expire,
+                "m-1 必须进入背压等待，不得直接成功: {r:?}"
+            );
+        }
     }
 
     // 300ms 后第一条记录到期：worker 超时醒来清理、释放磁盘容量，
