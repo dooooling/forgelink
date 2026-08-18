@@ -893,15 +893,16 @@ async fn backpressure_wakes_on_retention_expiry() {
     };
     let buffer = LocalBuffer::open(cfg.clone()).await.expect("open");
 
-    // 大记录占满磁盘（≈2.7KB）；先等 50ms 让 m-0 的到期时刻早于
-    // m-1（否则两条同时到期，m-1 入队后立即被清理）。第二条进入
-    // 背压等待。此后没有任何命令（无 ack / next / push），worker
-    // 只能靠保留期限唤醒。
+    // 大记录占满磁盘（≈2.7KB）；两条 push 间隔 250ms——安全窗口
+    // = 两条记录到期时刻差 = 250ms（CI 慢机器上 worker 唤醒延迟
+    // 可达数十毫秒，若间隔只有 50ms，m-1 会在 m-0 清理后的下一轮
+    // 清理中误删）。第二条进入背压等待。此后没有任何命令（无
+    // ack / next / push），worker 只能靠保留期限唤醒。
     buffer
         .push(batch(&big_id(0), "cnc-01", 0))
         .await
         .expect("push");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let pending = buffer.push(batch(&big_id(1), "cnc-01", 1));
 
     // 300ms 后第一条记录到期：worker 超时醒来清理、释放磁盘容量，
