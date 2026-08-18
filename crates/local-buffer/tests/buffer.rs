@@ -903,11 +903,23 @@ async fn backpressure_wakes_on_retention_expiry() {
         .await
         .expect("push");
     tokio::time::sleep(Duration::from_millis(250)).await;
-    let pending = buffer.push(batch(&big_id(1), "cnc-01", 1));
+    // pin! + 分支内 &mut 借用：select 取消分支不会 drop future，
+    // 窗口过后可继续 poll 同一个 pending（tokio mpsc send 支持
+    // 取消后重 poll，不丢失已取得的 permit/已发送状态）。
+    let mut pending = Box::pin(buffer.push(batch(&big_id(1), "cnc-01", 1)));
+
+    // 必须真实进入背压等待，而非因 m-0 已过期直接成功：select 窗口
+    // 20ms 远早于 m-0 到期时刻（t0+300ms），窗口内 pending 完成只可
+    // 能是"未进入背压直接落盘成功"（慢 CI 上 m-1 命令处理延迟超过
+    // 50ms 时会发生），此时显式失败暴露问题而非静默通过。
+    tokio::select! {
+        r = &mut pending => panic!("m-1 必须进入背压等待，不得直接成功: {r:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+    }
 
     // 300ms 后第一条记录到期：worker 超时醒来清理、释放磁盘容量，
     // 等待中的 push 自动入队成功。
-    tokio::time::timeout(Duration::from_secs(3), pending)
+    tokio::time::timeout(Duration::from_secs(3), &mut pending)
         .await
         .expect("到期后必须自动入队（不得永久阻塞）")
         .expect("push 必须成功");
