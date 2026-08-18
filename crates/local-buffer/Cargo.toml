@@ -4,5 +4,39 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Local Buffer / WAL：以完整 ObservationBatch 为持久化单位的本地持久化缓冲（SQLite Embedded DB，§103）"
+
+[features]
+# 测试专用二进制开关（评审 P2-1）：wal-crash-helper 是崩溃恢复集成
+# 测试的辅助进程，不作为交付程序——默认构建（不含 --all-features）
+# 不编译该 bin，避免被误认为正式二进制目标。
+test-utils = []
 
 [dependencies]
+data-pipeline = { path = "../data-pipeline" }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde_json = "1"
+# `rt` 供测试辅助二进制 wal-crash-helper 使用（评审 P2-2）：runtime
+# feature 必须由本 crate 显式声明，不能依赖依赖图中其他 crate 的
+# 联合启用。
+tokio = { version = "1", features = ["sync", "rt"] }
+tracing = "0.1"
+
+[[bin]]
+name = "wal-crash-helper"
+path = "src/bin/wal-crash-helper.rs"
+required-features = ["test-utils"]
+
+# 崩溃恢复集成测试同样由 `test-utils` 门控（评审 P1-1）：依赖辅助
+# 二进制 wal-crash-helper，默认 `cargo test --workspace` 不编译
+# 本测试（否则干净 target 下会因找不到辅助二进制失败）；
+# `--all-features` 下执行。其余集成测试（tests/buffer.rs）不受影响。
+[[test]]
+name = "wal_crash"
+path = "tests/wal_crash.rs"
+required-features = ["test-utils"]
+
+[dev-dependencies]
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
