@@ -323,15 +323,18 @@ async fn capacity_backpressure_waits_then_accepts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn retention_expired_records_are_discarded() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // 余量要大于 worker 循环往返（CI 慢机器上可能数十毫秒）：到期
+    // 时刻与清理轮次的间隔太小，新 push 的记录会在下一轮清理中被
+    // 误删（m-1 入队后 if 清理轮次到达其到期时刻）。
     let cfg = LocalBufferConfig {
-        retention: Duration::from_millis(50),
+        retention: Duration::from_millis(300),
         ..config(dir.path(), 100, 1 << 30, CapacityPolicy::Reject)
     };
     let buffer = LocalBuffer::open(cfg.clone()).await.expect("open");
     buffer.push(batch("m-0", "cnc-01", 0)).await.expect("push");
 
     // 超过保留时间后再 push：触发清理（到期未确认记录显式丢弃）。
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
     buffer
         .push(batch("m-1", "cnc-01", 1))
         .await
@@ -883,7 +886,9 @@ async fn next_cancel_before_delivery_requeues_record() {
 async fn backpressure_wakes_on_retention_expiry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let cfg = LocalBufferConfig {
-        retention: Duration::from_millis(100),
+        // 300ms 余量（CI 慢机器上 worker 循环往返可达数十毫秒）：
+        // m-1 入队后若清理轮次立即到达其到期时刻会被误删。
+        retention: Duration::from_millis(300),
         ..config(dir.path(), 100, 4000, CapacityPolicy::Backpressure)
     };
     let buffer = LocalBuffer::open(cfg.clone()).await.expect("open");
@@ -899,7 +904,7 @@ async fn backpressure_wakes_on_retention_expiry() {
     tokio::time::sleep(Duration::from_millis(50)).await;
     let pending = buffer.push(batch(&big_id(1), "cnc-01", 1));
 
-    // 100ms 后第一条记录到期：worker 超时醒来清理、释放磁盘容量，
+    // 300ms 后第一条记录到期：worker 超时醒来清理、释放磁盘容量，
     // 等待中的 push 自动入队成功。
     tokio::time::timeout(Duration::from_secs(3), pending)
         .await
