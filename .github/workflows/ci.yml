@@ -33,5 +33,12 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      # 真实进程强杀 WAL 崩溃恢复（§103 kill -9 验收）：由 test-utils
+      # feature 门控，默认 cargo test --workspace 不执行——单独启用
+      # 该 feature 运行关键验收测试（Windows 句柄释放延迟已带重试；
+      # Linux SIGKILL 下 WAL 恢复 0 丢失）。
+      - name: cargo test (wal_crash, test-utils)
+        run: cargo test -p local-buffer --all-features --test wal_crash
+
       - name: cargo doc
         run: cargo doc --workspace --no-deps
