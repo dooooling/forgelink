@@ -74,8 +74,10 @@
 
 mod client;
 mod config;
-#[cfg(test)]
-mod mock;
+// Mock MQTT Broker：本 crate 测试与上层（collector 端到端测试）共用。
+// 默认仅测试编译；开启 `test-utils` feature 后对外公开（§34 验收）。
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock;
 
 pub use client::{
     MqttClient, MqttClientError, PublishReceipt, STATUS_SCHEMA, status_topic, telemetry_topic,
