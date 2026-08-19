@@ -84,16 +84,29 @@ async fn e2e_modbus_to_mqtt_full_chain() {
     })
     .await;
 
-    // 优雅停机：已确认记录全部删除，WAL 清空（§31.3：PUBACK 是唯一删除路径）。
+    // 优雅停机（§31.3：PUBACK 是唯一删除路径）。停机瞬间若有在途
+    // 发布等待 PUBACK 会被中断并合法保留（重启补传）——慢环境更易
+    // 命中该竞态，故残留记录必须带补传标记，按唯一删除路径 ack 清空。
     runtime.shutdown().await.expect("优雅停机成功");
     let config = local_buffer_config(&harness);
     let buffer = local_buffer::LocalBuffer::open(config)
         .await
         .expect("重开缓冲");
+    let mut retained = 0;
+    while let Some(stored) = buffer.next().await.expect("读取缓冲") {
+        assert!(
+            stored.batch.replayed,
+            "停机保留的记录必须带补传标记（{}）",
+            stored.batch.message_id
+        );
+        buffer.ack(stored.local_seq).await.expect("ack 清空残留");
+        retained += 1;
+    }
     assert!(
-        buffer.next().await.expect("读取缓冲").is_none(),
-        "全部批次已确认，WAL 应为空"
+        retained <= 2,
+        "残留应至多为停机瞬间的在途记录（实际 {retained} 条）"
     );
+    buffer.shutdown().await.expect("关闭缓冲");
 
     // 在线状态（§31.1）：启动时每设备 retained online。
     let publishes = broker.publishes();

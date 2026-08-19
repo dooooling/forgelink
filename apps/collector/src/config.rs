@@ -23,8 +23,10 @@ use crate::error::{CollectorError, ConfigError};
 pub struct CollectorConfig {
     /// 站点标识（§31.2 Telemetry Batch 契约：`site_id` 必填非空）。
     pub site_id: String,
-    /// 采集会话标识；`None` 时运行时生成（启动时刻纳秒，
-    /// `build_observation`/`PipelineConfig` 均拒绝空会话）。
+    /// 采集会话标识（可用作部署标识）；无论配置与否，生效会话
+    /// （[`CollectorConfig::effective_session_id`]）都追加启动时刻纳秒
+    /// 后缀，保证跨重启唯一（`build_observation`/`PipelineConfig` 均
+    /// 拒绝空会话；评审 P1：固定会话会令 message_id 跨重启复用）。
     #[serde(default)]
     pub session_id: Option<String>,
     /// Device Profile 目录（§38：Profile 不写死在主程序，启动加载）。
@@ -436,6 +438,12 @@ impl CollectorConfig {
         if self.site_id.is_empty() {
             return Err(ConfigError::invalid("site_id", "站点标识不能为空").into());
         }
+        // §31.1 主题层级校验：site_id/device_id 为空或含 `/` 会破坏固定
+        // Topic 层级（订阅/ACL 路由错误）。此前仅非空校验，非法标识到
+        // 运行时发布才被拒绝（评审 P2），此处启动即拦截。
+        mqtt_client::telemetry_topic(&self.site_id, "device").map_err(|e| {
+            ConfigError::invalid("site_id", format!("站点标识无法构成合法主题: {e}"))
+        })?;
         if self.session_id.as_ref().is_some_and(|s| s.is_empty()) {
             return Err(ConfigError::invalid("session_id", "会话标识不能为空").into());
         }
@@ -447,6 +455,12 @@ impl CollectorConfig {
             if d.id.is_empty() {
                 return Err(ConfigError::invalid("devices[].id", "设备标识不能为空").into());
             }
+            mqtt_client::telemetry_topic(&self.site_id, &d.id).map_err(|e| {
+                ConfigError::invalid(
+                    "devices[].id",
+                    format!("设备 {} 无法构成合法主题: {e}", d.id),
+                )
+            })?;
             if d.driver.is_empty() {
                 return Err(ConfigError::invalid(
                     "devices[].driver",
@@ -467,6 +481,35 @@ impl CollectorConfig {
                 );
             }
         }
+        // LWT 状态主题（§31.1）与在线/离线状态同一校验，非法标识启动
+        // 即拒绝；且 LWT 必须指向设备清单中存在且**已启用**的设备——
+        // 指向不存在或已禁用的设备会在异常断线时发布虚假设备的离线
+        // 状态（评审 P2）。
+        if let Some(will) = &self.northbound.mqtt.will_device_id {
+            mqtt_client::status_topic(&self.site_id, will).map_err(|e| {
+                ConfigError::invalid(
+                    "northbound.mqtt.will_device_id",
+                    format!("设备 {will} 无法构成合法状态主题: {e}"),
+                )
+            })?;
+            match self.devices.iter().find(|d| &d.id == will) {
+                Some(d) if d.enabled => {}
+                Some(_) => {
+                    return Err(ConfigError::invalid(
+                        "northbound.mqtt.will_device_id",
+                        format!("设备 {will} 已禁用，LWT 不得指向禁用设备"),
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(ConfigError::invalid(
+                        "northbound.mqtt.will_device_id",
+                        format!("设备 {will} 不在设备清单中"),
+                    )
+                    .into());
+                }
+            }
+        }
         if self.driver.plugin.as_os_str().is_empty() {
             return Err(ConfigError::invalid("driver.plugin", "Driver 插件路径不能为空").into());
         }
@@ -480,11 +523,13 @@ impl CollectorConfig {
         Ok(())
     }
 
-    /// 生效的采集会话标识：配置提供则用之，否则按启动时刻生成
-    /// （纳秒时间戳，保证重启后会话不同、观测可区分）。
+    /// 生效的采集会话标识：无论配置与否都追加启动时刻纳秒后缀，
+    /// 保证每次进程启动的会话不同——`message_id`/`observation_id`
+    /// 嵌入会话，跨重启不重复，下游可区分两次运行的观测
+    /// （评审 P1：固定会话会令 message_id 跨重启复用）。
     pub fn effective_session_id(&self) -> String {
         match &self.session_id {
-            Some(s) => s.clone(),
+            Some(s) => format!("{s}-{}", crate::now_ns()),
             None => format!("{}-{}", self.site_id, crate::now_ns()),
         }
     }
@@ -525,6 +570,11 @@ impl MqttOptions {
                 "publish_capacity 与 max_inflight 必须大于 0",
             )
             .into());
+        }
+        if self.will_device_id.as_ref().is_some_and(|d| d.is_empty()) {
+            return Err(
+                ConfigError::invalid("northbound.mqtt.will_device_id", "设备标识不能为空").into(),
+            );
         }
         match &self.tls {
             TlsOptions::None => {}
@@ -578,6 +628,14 @@ impl MqttOptions {
         cfg.username = self.username.clone();
         cfg.password = self.password.clone();
         cfg.tls = self.tls.to_tls_mode()?;
+        // LWT 离线信号（§31.1）：will_device_id 指定的设备以 retained
+        // 离线 Envelope 作为 Will（与 publish_online 在线状态同构，
+        // sent_at_ns=0 以到达时间为准）；主题/载荷合法性由
+        // `WillConfig::offline_status` 校验，启动即失败。此前配置的
+        // will_device_id 从未生效（评审 P2）。
+        if let Some(device_id) = &self.will_device_id {
+            cfg.will = Some(mqtt_client::WillConfig::offline_status(site_id, device_id)?);
+        }
         cfg.validate().map_err(|reason| {
             CollectorError::Config(ConfigError::invalid("northbound.mqtt", reason))
         })?;
