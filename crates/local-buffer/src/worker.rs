@@ -109,6 +109,20 @@ struct PendingPush {
     replies: Vec<oneshot::Sender<Result<(), LocalBufferError>>>,
 }
 
+/// 清理已取消的背压等待者（评审 P2）：调用方 `timeout` 取消 push 后，
+/// reply 通道已关闭（Receiver drop）但等待者仍登记在
+/// [`WorkerState::pending_push`]——同 `message_id` 重试会不断累积
+/// 等待者，达到 [`MAX_WAITERS_PER_RECORD`] 上限后误判永久错误触发
+/// 停机；滞留请求还占用背压等待队列长度。每次处理 `Push` 前调用：
+/// 移除 reply 通道已关闭的等待者；全部关闭则移除整个等待条目
+/// （记录未落盘，重试的 push 重新入队共享结果）。
+fn prune_cancelled_waiters(state: &mut WorkerState) {
+    state.pending_push.retain_mut(|pending| {
+        pending.replies.retain(|reply| !reply.is_closed());
+        !pending.replies.is_empty()
+    });
+}
+
 /// push 内部结果。
 enum PushOutcome {
     /// 请求已处理完毕（入队 / 幂等成功 / 错误已回复）。
@@ -736,6 +750,13 @@ fn worker_loop(
                 check_pending_confirm(&mut conn, &mut state);
                 match cmd {
                     Cmd::Push { batch, reply } => {
+                        prune_cancelled_waiters(&mut state);
+                        // 清理已取消的背压等待者（评审 P2：调用方
+                        // `timeout` 取消 push 后 reply 通道已关闭，但
+                        // 等待者仍登记在 `pending_push`——同 message_id
+                        // 重试会不断累积等待者，达到上限后误判永久错误
+                        // 触发停机；滞留请求还占用等待队列长度）。
+
                         let outcome = push_inner(&mut conn, &mut state, &config, batch, reply);
                         if matches!(outcome, PushOutcome::Backpressured) {
                             // reply 已随请求保存，等待队列消化时回复。

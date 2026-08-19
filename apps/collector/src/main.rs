@@ -7,13 +7,23 @@
 //! 命令行参数：`collector [CONFIG_PATH]`（缺省 `collector.yaml`，
 //! §101 Standalone YAML）。
 
-use std::path::Path;
 use std::process::ExitCode;
 
+// 仅在启用采集功能时引入依赖 crate 的符号：`--no-default-features`
+// 构建为只读占位，tokio/diagnostics/tracing 等依赖随 feature 一起
+// 被禁用，未门控的 import 会导致编译失败（评审 P2）。
+#[cfg(feature = "collector")]
+use std::path::Path;
+
+#[cfg(feature = "collector")]
 use collector::CollectorRuntime;
+#[cfg(feature = "collector")]
 use collector::config::CollectorConfig;
+#[cfg(feature = "collector")]
 use diagnostics::{LoggingConfig, init_logging, redact, shutdown_logging};
+#[cfg(feature = "collector")]
 use tokio::sync::watch;
+#[cfg(feature = "collector")]
 use tracing::{error, info};
 
 fn main() -> ExitCode {
@@ -39,32 +49,36 @@ fn main() -> ExitCode {
             }
         };
 
-        let (sig_tx, sig_rx) = watch::channel(false);
-
-        // 系统信号：Ctrl+C（SIGINT）。Windows 不支持 SIGTERM；UNIX 下
-        // 补充 SIGTERM（docker stop 默认信号）。
-        #[cfg(unix)]
-        {
-            let tx = sig_tx.clone();
-            let mut sigterm =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!(component = "collector", error = %e, "SIGTERM 监听初始化失败");
-                        shutdown_logging();
-                        return ExitCode::FAILURE;
-                    }
-                };
-            tokio::spawn(async move {
-                sigterm.recv().await;
-                info!(component = "collector", "收到 SIGTERM");
-                tx.send(true).ok();
-            });
-        }
-
         let rt = tokio::runtime::Runtime::new();
         match rt {
             Ok(rt) => rt.block_on(async {
+                // 停机信号通道与 SIGTERM 监听必须创建在 Tokio 运行时内：
+                // tokio::signal 与 tokio::spawn 依赖运行时上下文，在
+                // Runtime::new() 之前调用会 panic（评审 P1）。
+                let (sig_tx, sig_rx) = watch::channel(false);
+
+                // 系统信号：Ctrl+C（SIGINT）。Windows 不支持 SIGTERM；
+                // UNIX 下补充 SIGTERM（docker stop 默认信号）。
+                #[cfg(unix)]
+                {
+                    let tx = sig_tx.clone();
+                    let mut sigterm = match tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::terminate(),
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            error!(component = "collector", error = %e, "SIGTERM 监听初始化失败");
+                            shutdown_logging();
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    tokio::spawn(async move {
+                        sigterm.recv().await;
+                        info!(component = "collector", "收到 SIGTERM");
+                        tx.send(true).ok();
+                    });
+                }
+
                 // 启动运行时（配置 → Driver/Profile → 设备 → 管道 → 缓冲
                 // → MQTT，§100 启动顺序）。启动失败不做部分资源清理。
                 let runtime = match CollectorRuntime::start(config).await {
@@ -75,10 +89,20 @@ fn main() -> ExitCode {
                     }
                 };
 
-                // 等待任一停机信号（SIGINT / SIGTERM 任务置位 watch），
-                // 随后交给运行时有序停机。
-                tokio::signal::ctrl_c().await.ok();
-                info!(component = "collector", "收到 SIGINT（Ctrl+C）");
+                // 等待任一停机信号：SIGINT（ctrl_c）或 SIGTERM 任务置位
+                // 的 watch。此前仅等待 ctrl_c，SIGTERM 置位 watch 后 main
+                // 仍阻塞在 ctrl_c，不会触发停机（评审 P1）。
+                let mut signal_wait = sig_rx.clone();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        info!(component = "collector", "收到 SIGINT（Ctrl+C）");
+                    }
+                    r = signal_wait.changed() => {
+                        if r.is_err() {
+                            info!(component = "collector", "停机信号通道关闭，按停机处理");
+                        }
+                    }
+                }
                 sig_tx.send(true).ok();
                 let code = match runtime.run_until_shutdown(sig_rx).await {
                     Ok(()) => ExitCode::SUCCESS,

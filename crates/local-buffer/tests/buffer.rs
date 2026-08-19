@@ -762,6 +762,58 @@ async fn waiters_per_record_is_bounded() {
     buffer.shutdown().await.expect("shutdown");
 }
 
+/// 16.5) 取消的 push 不累积背压等待者（评审 P2）：调用方 `timeout`
+/// 取消 push 后 reply 通道关闭，但等待者曾登记在 `pending_push`——
+/// 同 `message_id` 限时重试（如发送循环的容量等待）若不断累积等待
+/// 者，达到上限后会被误判永久错误触发停机。每次重试前必须清理
+/// 已取消的等待者。
+#[tokio::test(flavor = "multi_thread")]
+async fn push_timeout_cancel_does_not_accumulate_waiters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let buffer = Arc::new(
+        LocalBuffer::open(config(dir.path(), 100, 4000, CapacityPolicy::Backpressure))
+            .await
+            .expect("open"),
+    );
+    buffer
+        .push(batch(&big_id(0), "cnc-01", 0))
+        .await
+        .expect("push");
+    let s1 = buffer.next().await.expect("next").expect("s1"); // 占满磁盘容量
+
+    // 模拟发送循环的限时重试（每次超时取消后同 message_id 再试）：
+    // 次数远超等待者上限（1024），取消不得累积等待者。
+    for _ in 0..1500 {
+        let b = Arc::clone(&buffer);
+        let h = tokio::spawn(async move { b.push(batch(&big_id(1), "cnc-01", 1)).await });
+        // 给 worker 处理入队（登记等待者）的时间，然后取消（reply
+        // 通道关闭）。
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        h.abort();
+    }
+
+    // 最后一次请求应正常进入背压等待，而非误判等待者上限。
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        buffer.push(batch(&big_id(1), "cnc-01", 1)),
+    )
+    .await;
+    if let Ok(r) = result {
+        r.expect("等待中不应报错");
+    }
+
+    // ACK 释放空间：等待者自动落盘成功。
+    buffer.ack(s1.local_seq).await.expect("ack");
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        buffer.push(batch(&big_id(1), "cnc-01", 1)),
+    )
+    .await
+    .expect("释放容量后应落盘")
+    .expect("落盘成功");
+    buffer.shutdown().await.expect("shutdown");
+}
+
 /// 17) 单条记录超过磁盘上限：即使 `Backpressure` 策略也立即拒绝
 ///（评审 P1-1）——任何状态下 `bytes + requested > disk_max_bytes`
 /// 恒成立，背压等待将永久阻塞并拖住后续请求。

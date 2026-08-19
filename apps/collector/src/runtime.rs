@@ -54,7 +54,15 @@ pub struct CollectorRuntime {
     buffer: Arc<local_buffer::LocalBuffer>,
     mqtt: Option<Arc<mqtt_client::MqttClient>>,
     pump: tokio::task::JoinHandle<()>,
-    forward: tokio::task::JoinHandle<()>,
+    // 内部 Result 上报永久性落盘错误等（评审 P1）。
+    forward: tokio::task::JoinHandle<Result<(), CollectorError>>,
+    // 发送循环结果是否已被消费（评审 P1：JoinHandle 输出只能取一次，
+    // `run_until_shutdown` 的 select 分支消费后 `shutdown` 不得再次
+    // join，否则 panic "JoinHandle polled after completion"）。
+    forward_done: bool,
+    // 落盘失败批次收尾队列（评审 P1：push 永久失败/暂停期间容量超限
+    // 的批次不静默丢弃——停机流程在 MQTT 结算后限时重试落盘）。
+    lost_rx: mpsc::Receiver<data_pipeline::ObservationBatch>,
     heartbeat: tokio::task::JoinHandle<()>,
     stopping: watch::Sender<bool>,
     config: CollectorConfig,
@@ -186,13 +194,28 @@ impl CollectorRuntime {
         // 5) 在线状态（§31.1：retained status envelope，每设备；断线后
         //    mqtt-client 按设备全集重建重发周期，失败不阻塞启动）。
         for device_id in manager.device_ids() {
-            if let Err(e) = mqtt_arc.publish_online(&config.site_id, device_id).await {
-                warn!(
-                    component = "collector",
-                    device_id,
-                    error = %e,
-                    "在线状态发布失败（重连后自动重建重发）"
-                );
+            let instance = manager.get(device_id).expect("已注册");
+            if instance.device.enabled {
+                if let Err(e) = mqtt_arc.publish_online(&config.site_id, device_id).await {
+                    warn!(
+                        component = "collector",
+                        device_id,
+                        error = %e,
+                        "在线状态发布失败（重连后自动重建重发）"
+                    );
+                }
+            } else {
+                // 禁用设备：发布 retained 离线并注销在线跟踪，清除
+                // Broker 中之前保留的在线状态——设备从启用变为禁用后
+                // 不得长期显示在线（评审 P2）。
+                if let Err(e) = mqtt_arc.publish_offline(&config.site_id, device_id).await {
+                    warn!(
+                        component = "collector",
+                        device_id,
+                        error = %e,
+                        "离线状态发布失败（重连后自动重建重发）"
+                    );
+                }
             }
         }
 
@@ -229,6 +252,9 @@ impl CollectorRuntime {
         // 7) 工作任务：pump（事件→映射→管道）、forward（管道→缓冲→MQTT）、
         //    heartbeat（健康状态日志，§104）。
         let (stopping_tx, stopping_rx) = watch::channel(false);
+        // 落盘失败批次收尾队列（评审 P1）：有界——容量超限期间的
+        // 暂存上限，满时 forward 明确结算丢弃，不无限堆积内存。
+        let (lost_tx, lost_rx) = mpsc::channel(128);
         let health = Arc::new(HealthState::default());
         health.started_at_ns.store(started_at_ns, Ordering::Relaxed);
         let manager_arc = Arc::new(manager);
@@ -237,7 +263,6 @@ impl CollectorRuntime {
             Arc::clone(&manager_arc),
             Arc::clone(&pipeline_arc),
             session_id.clone(),
-            stopping_rx.clone(),
             Arc::clone(&health),
         ));
         let forward = tokio::spawn(run_forward(
@@ -248,6 +273,7 @@ impl CollectorRuntime {
             Arc::clone(&health),
             Duration::from_millis(config.forward_poll_ms.max(50)),
             Duration::from_secs(config.buffer.drain_timeout_secs),
+            lost_tx,
         ));
         let heartbeat = tokio::spawn(run_heartbeat(
             stopping_rx.clone(),
@@ -266,6 +292,8 @@ impl CollectorRuntime {
             mqtt: Some(mqtt_arc),
             pump,
             forward,
+            forward_done: false,
+            lost_rx,
             heartbeat,
             stopping: stopping_tx,
             config,
@@ -316,10 +344,25 @@ impl CollectorRuntime {
                 }
             }
             r = &mut self.forward => {
-                let msg = format!("发送循环异常退出: {r:?}");
+                // 发送循环结束（非停机路径）：永久性落盘错误等以内部
+                // Result 上报，或任务异常终止。
+                let msg = match r {
+                    Ok(Ok(())) => "发送循环提前退出".to_owned(),
+                    Ok(Err(e)) => format!("发送循环错误退出: {e}"),
+                    Err(e) => format!("发送循环任务异常退出: {e:?}"),
+                };
                 error!(component = "collector", "{msg}");
                 self.stopping.send(true).ok();
-                return Err(CollectorError::Task(msg));
+                // 发送循环结果已在此取出（JoinHandle 输出只能取一次，
+                // 评审 P1）：置位后 shutdown 跳过再次 join。仍执行完整
+                // 有序停机（清理轮询/管道/MQTT/缓冲后台任务并收尾，
+                // 否则遗留任务、尚未进入 WAL 的管道数据可能丢失）。
+                // 原始错误优先，停机自身的失败并入错误返回。
+                self.forward_done = true;
+                return Err(match self.shutdown().await {
+                    Ok(()) => CollectorError::Task(msg),
+                    Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+                });
             }
         }
         info!(component = "collector", "收到停机信号，开始有序停机");
@@ -355,21 +398,92 @@ impl CollectorRuntime {
         );
 
         // 3) 发送循环有限排空：输出端收完 + WAL 能发的发完（期限内；
-        //    超时或发布失败的记录保留，下次启动补传）。
-        let forward_result = tokio::time::timeout(Duration::from_secs(30), &mut self.forward)
-            .await
-            .map_err(|_| CollectorError::ShutdownTimeout { stage: "forward" })?;
-        if let Err(e) = forward_result {
-            warn!(component = "collector", error = %e, "发送循环异常结束");
+        //    超时或发布失败的记录保留，下次启动补传）。join 超时随
+        //    配置的排空期限并留编排余量（评审 P2：固定 30s 会把更长
+        //    的排空配置截断成 ShutdownTimeout）。结果已被
+        //    `run_until_shutdown` 消费时（forward_done）跳过再次 join
+        //    ——JoinHandle 输出只能取一次（评审 P1）。
+        let forward_result = if self.forward_done {
+            None
+        } else {
+            let forward_drain = Duration::from_secs(self.config.buffer.drain_timeout_secs);
+            Some(
+                tokio::time::timeout(forward_drain + Duration::from_secs(30), &mut self.forward)
+                    .await
+                    .map_err(|_| CollectorError::ShutdownTimeout { stage: "forward" })?,
+            )
+        };
+        match forward_result {
+            None => {}
+            Some(Ok(Ok(()))) => {}
+            Some(Ok(Err(e))) => {
+                warn!(component = "collector", error = %e, "发送循环错误退出（记录保留补传）")
+            }
+            Some(Err(e)) => warn!(component = "collector", error = %e, "发送循环任务异常结束"),
         }
 
         // 4) MQTT 结算：DISCONNECT（不触发 LWT）+ 未确认发布以 Closed
         //    结算——WAL 记录不删除（保留补传，§31.3）。forward 已退出，
-        //    引用可收回。
+        //    引用可收回。结算失败**不短路**（评审 P1：失败批次的收尾
+        //    落盘与缓冲关闭必须执行，否则未落盘批次永久丢失）——错误
+        //    记录并合并到最终返回。
+        let mut settle_error: Option<CollectorError> = None;
         if let Some(mqtt) = self.mqtt.take() {
             let mqtt = Arc::try_unwrap(mqtt)
                 .map_err(|_| CollectorError::Task("mqtt 引用未释放".to_owned()))?;
-            mqtt.shutdown().await?;
+            if let Err(e) = mqtt.shutdown().await {
+                error!(
+                    component = "collector",
+                    error = %e,
+                    "MQTT 停机结算失败（继续收尾：失败批次落盘与缓冲关闭仍执行）"
+                );
+                settle_error = Some(CollectorError::Mqtt(e));
+            }
+        }
+
+        // 4.5) 落盘失败批次收尾（评审 P1）：push 永久失败或容量等待
+        //     超时的批次进入收尾队列，不静默丢弃。这里限时重试落盘
+        //     ——成功则随下次启动按序补传（replayed）；失败明确结算
+        //     （告警丢弃）。限时必要：Backpressure 容量不足时 push
+        //     等待 ACK 释放，但发布已停止，等待无望。逐批小限时 +
+        //     总预算：容量持续满时不得逐批拖长停机。
+        let lost_budget = Duration::from_secs(5);
+        let lost_deadline = tokio::time::Instant::now() + lost_budget;
+        while let Ok(batch) = self.lost_rx.try_recv() {
+            let remaining = lost_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                error!(
+                    component = "collector",
+                    message_id = %batch.message_id,
+                    "落盘失败批次收尾预算耗尽，明确结算丢弃"
+                );
+                continue;
+            }
+            let attempt = remaining.min(Duration::from_millis(200));
+            match tokio::time::timeout(attempt, self.buffer.push(batch.clone())).await {
+                Ok(Ok(())) => {
+                    info!(
+                        component = "collector",
+                        message_id = %batch.message_id,
+                        "落盘失败批次收尾重试成功（下次启动补传）"
+                    );
+                }
+                Ok(Err(e)) => {
+                    error!(
+                        component = "collector",
+                        message_id = %batch.message_id,
+                        error = %e,
+                        "落盘失败批次无法入 WAL，明确结算丢弃"
+                    );
+                }
+                Err(_) => {
+                    error!(
+                        component = "collector",
+                        message_id = %batch.message_id,
+                        "落盘失败批次等待容量超时，明确结算丢弃"
+                    );
+                }
+            }
         }
 
         // 5) 缓冲关闭：未确认记录保留（§103 停机语义）。
@@ -386,6 +500,9 @@ impl CollectorRuntime {
             health = %final_health,
             "Collector 有序停机完成"
         );
+        if let Some(e) = settle_error {
+            return Err(e);
+        }
         Ok(())
     }
 }
