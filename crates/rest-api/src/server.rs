@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::Request;
 use axum::middleware::{self, Next};
@@ -26,7 +27,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::HEALTH_PATH;
 use crate::error::{ApiError, ErrorCode, RequestId, to_response};
@@ -173,6 +174,9 @@ impl RestApiServer {
             .is_err()
         {
             warn!(component = "rest-api", "REST 停机排空超时，强制取消");
+            // 强制 abort 不经过 serve 任务内部的 alive=false 置位
+            // （评审 P2），此处显式清除存活标记，调用方不得继续误报。
+            self.alive.store(false, Ordering::SeqCst);
             self.join.abort();
             let _ = (&mut self.join).await;
         }
@@ -279,38 +283,48 @@ fn snapshot_or_error(
     })
 }
 
-/// 设备 ID 路径参数校验：与配置校验（§31.1 主题规则，`mqtt-client`
-/// 的 `telemetry_topic`/`status_topic`）保持同一允许集合——配置允许
-/// 空格、反斜杠等字符，REST 不得比配置更严，否则设备出现在列表中
-/// 却无法通过详情/资源/属性接口访问（评审 P2）。
+/// 设备 ID 路径参数校验：与 Collector 配置校验（§31.1 主题规则）共用
+/// 同一实现——`mqtt-client` 的 `telemetry_topic` 按**完整 MQTT Topic**
+/// （`forgelink/v1/telemetry/{site_id}/{device_id}`）校验长度与字符集
+/// （评审 P2：REST 此前只限设备 ID 自身 ≤65535 字节，而配置校验完整
+/// 主题长度，接近上限的设备 ID 通过 REST 却无法启动配置，二者必须
+/// 同集合）。`site_id` 取当前快照，与配置启动校验同源。
 ///
-/// 拒绝：空、`/`（路径层级分隔符）、通配符（`#`/`+`）、控制字符与
-/// 超长（MQTT 3.1.1 §4.7.3，与发布主题校验一致）。空格/反斜杠在
-/// URL 中由客户端百分号编码（`%20`/`%5C`），axum 解码后原样匹配。
-fn validate_device_id(device_id: &str, id: &RequestId) -> Result<(), ApiErrorResponse> {
-    let reason = if device_id.is_empty() {
-        Some("设备标识不能为空")
-    } else if device_id.len() > 65535 {
-        Some("设备标识超过 65535 字节上限")
-    } else if device_id.contains('/') {
-        Some("设备标识不能包含 '/'（主题路径分隔符，§31.1）")
-    } else if device_id.contains(['#', '+']) {
-        Some("设备标识不能包含通配符（# / +）")
-    } else if device_id
-        .chars()
-        .any(|c| (c as u32) <= 0x1F || (c as u32) == 0x7F)
-    {
-        Some("设备标识不能包含控制字符")
-    } else {
-        None
+/// 允许集合与配置一致（空格、反斜杠等字符由 URL 百分号编码后匹配），
+/// 拒绝：空段、`/`、通配符（`#`/`+`）、控制字符与完整主题超长。
+fn validate_device_id(
+    device_id: &str,
+    site_id: &str,
+    id: &RequestId,
+) -> Result<(), ApiErrorResponse> {
+    let reason = match mqtt_client::telemetry_topic(site_id, device_id) {
+        Ok(_) => return Ok(()),
+        // 只回显原因，不回显完整主题（§90.1 响应不泄漏不必要细节）。
+        Err(mqtt_client::MqttClientError::InvalidTopic { reason, .. }) => reason,
+        Err(other) => other.to_string(),
     };
-    if let Some(reason) = reason {
-        return Err(ApiErrorResponse(
-            id.clone(),
-            ApiError::bad_request(format!("非法设备标识 {device_id:?}: {reason}")),
-        ));
-    }
-    Ok(())
+    Err(ApiErrorResponse(
+        id.clone(),
+        ApiError::bad_request(format!("非法设备标识 {device_id:?}: {reason}")),
+    ))
+}
+
+/// `Path<String>` 提取失败统一映射为 §31.6 400 错误载荷（评审 P2）：
+/// 非法 URL 编码（如 `%FF` 解码为非法 UTF-8）会在 handler 之前被
+/// axum 拒绝，此前返回默认纯文本 400，不含 `forgelink.error.v1` 与
+/// `request_id`。这里把拒绝交给 handler 处理，固定安全文案、原始
+/// 拒绝原因只进日志。
+fn path_rejection_error(rejection: &PathRejection, id: &RequestId) -> ApiErrorResponse {
+    debug!(
+        component = "rest-api",
+        request_id = %id,
+        rejection = %rejection,
+        "设备标识路径参数解码失败"
+    );
+    ApiErrorResponse(
+        id.clone(),
+        ApiError::bad_request("设备标识路径参数非法（URL 编码错误）"),
+    )
 }
 
 async fn devices(
@@ -326,13 +340,14 @@ async fn devices(
 }
 
 async fn device(
-    Path(device_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     State(state): State<AppState>,
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<DeviceResponse>> {
+    let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
     let _permit = acquire(&state, &id).await?;
-    validate_device_id(&device_id, &id)?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
+    validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
         Some(d) => Ok(Json(DeviceResponse {
             schema: DeviceResponse::SCHEMA,
@@ -343,13 +358,14 @@ async fn device(
 }
 
 async fn resources(
-    Path(device_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     State(state): State<AppState>,
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<ResourcesResponse>> {
+    let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
     let _permit = acquire(&state, &id).await?;
-    validate_device_id(&device_id, &id)?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
+    validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
         Some(d) => Ok(Json(ResourcesResponse {
             schema: ResourcesResponse::SCHEMA,
@@ -360,13 +376,14 @@ async fn resources(
 }
 
 async fn properties(
-    Path(device_id): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     State(state): State<AppState>,
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<PropertiesResponse>> {
+    let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
     let _permit = acquire(&state, &id).await?;
-    validate_device_id(&device_id, &id)?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
+    validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
         Some(d) => Ok(Json(PropertiesResponse {
             schema: PropertiesResponse::SCHEMA,
@@ -805,6 +822,95 @@ mod tests {
         assert!(
             !alive.load(Ordering::SeqCst),
             "serve 任务退出后 alive 必须为 false"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_url_encoding_returns_unified_error() {
+        // 评审 P2：`%FF` 等非法 UTF-8 编码在 handler 之前被 axum 拒绝
+        // （PathRejection），必须统一映射为 §31.6 400 错误载荷（含
+        // request_id），而不是 axum 默认的纯文本 400。
+        let router = app(Arc::new(StaticState(snapshot())));
+        for path in [
+            "/api/v1/devices/%FF",
+            "/api/v1/devices/a%FFb",
+            "/api/v1/devices/%FF/resources",
+            "/api/v1/devices/%FF/properties",
+        ] {
+            let (status, body) = get(router.clone(), path).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert_eq!(body["schema"], "forgelink.error.v1", "{path}");
+            assert_eq!(body["code"], "BAD_REQUEST", "{path}");
+            assert!(
+                body["request_id"].as_str().unwrap().starts_with("req-"),
+                "{path} 必须携带 request_id"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn device_id_length_validated_on_full_topic() {
+        // 评审 P2：配置校验的是完整 MQTT 主题长度（§31.1，
+        // `forgelink/v1/telemetry/{site_id}/{device_id}` ≤ 65535 字节），
+        // REST 不得只校验设备 ID 自身——接近上限的 ID 通过 REST 却
+        // 无法启动配置，二者必须同集合（共用 `telemetry_topic`）。
+        let router = app(Arc::new(StaticState(snapshot())));
+        // site_id "plant-a"（7 字节）+ 前缀 "forgelink/v1/telemetry/"
+        // （23 字节）+ '/'（1 字节）：设备 ID 上限 = 65535 - 31 = 65504。
+        let at_limit = "x".repeat(65504);
+        let (status, body) = get(router.clone(), &format!("/api/v1/devices/{at_limit}")).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "65504 字节设备 ID 完整主题恰好 65535，应通过校验（仅 404）"
+        );
+        assert_eq!(body["code"], "DEVICE_NOT_FOUND");
+
+        let over_limit = "x".repeat(65505);
+        let (status, body) = get(router, &format!("/api/v1/devices/{over_limit}")).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "65505 字节设备 ID 完整主题超长，配置层同样拒绝"
+        );
+        assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forced_abort_clears_alive_flag() {
+        // 评审 P2：排空超时强制 abort 时，serve 任务内部的 alive=false
+        // 置位不会执行，abort 分支必须显式清除存活标记。
+        use tokio::io::AsyncWriteExt;
+
+        let server = RestApiServer::spawn(
+            Arc::new(StaticState(snapshot())),
+            RestConfig {
+                listen: "127.0.0.1:0".parse().expect("静态地址合法"),
+                max_concurrency: 4,
+            },
+        )
+        .await
+        .expect("绑定成功");
+        // 半截 HTTP 请求让连接停在"在途请求"状态：优雅停机等待它
+        // 完成，2s 排空超时后触发强制 abort 分支。
+        let mut stream = tokio::net::TcpStream::connect(server.addr)
+            .await
+            .expect("连接成功");
+        stream
+            .write_all(b"GET /api/v1/devices HTTP/1.1\r\nHost: test\r\n")
+            .await
+            .expect("写入半截请求");
+
+        let alive = server.alive.clone();
+        let started = std::time::Instant::now();
+        server.shutdown().await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "应等待排空超时（约 2s），未走到 abort 分支"
+        );
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "强制 abort 后 alive 必须显式清除为 false"
         );
     }
 }

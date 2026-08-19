@@ -73,23 +73,38 @@ impl PollScheduler {
         }
     }
 
-    /// 取消全部任务并等待它们结束；每个任务等待上限为 `grace`，超时
-    /// 强制 `abort`——阻塞 Driver（如卡死的 Native Plugin 调用）无法
-    /// 自然结束时，停机不得无限等待（评审 P1：REST 绑定失败清理等
-    /// 失败路径必须能按时返回）。
+    /// 取消全部任务并等待它们结束；所有任务共享**统一截止时间** `grace`
+    /// （评审 P1：按任务分别等待会使总耗时随任务数线性放大——任务数 ×
+    /// grace，失败路径清理仍可能长时间阻塞）。截止时间前并发等待全部
+    /// 任务自然结束，超时则一次性 `abort` 剩余全部任务，总等待 ≈ grace。
     pub async fn shutdown_with_timeout(&mut self, grace: Duration) {
         if let Some(cancel) = &self.cancel {
             cancel.cancel();
-            for mut task in self.tasks.drain(..) {
-                if tokio::time::timeout(grace, &mut task).await.is_err() {
-                    warn!(
-                        component = "poll-engine",
-                        error_code = "poll_task_shutdown_timeout",
-                        "轮询任务停机等待超时，强制取消"
-                    );
-                    task.abort();
-                    let _ = (&mut task).await;
-                }
+            let deadline = tokio::time::Instant::now() + grace;
+            let mut set = tokio::task::JoinSet::new();
+            for task in self.tasks.drain(..) {
+                set.spawn(async move {
+                    if let Err(error) = task.await {
+                        warn!(
+                            component = "poll-engine",
+                            error_code = "poll_task_panicked",
+                            error = %error,
+                            "轮询任务异常退出"
+                        );
+                    }
+                });
+            }
+            if tokio::time::timeout_at(deadline, async { while set.join_next().await.is_some() {} })
+                .await
+                .is_err()
+            {
+                warn!(
+                    component = "poll-engine",
+                    error_code = "poll_task_shutdown_timeout",
+                    "轮询任务停机等待超时，强制取消全部剩余任务"
+                );
+                set.abort_all();
+                while set.join_next().await.is_some() {}
             }
             self.cancel = None;
         }
