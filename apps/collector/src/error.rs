@@ -53,6 +53,8 @@ pub enum CollectorError {
     Buffer(local_buffer::LocalBufferError),
     /// MQTT 客户端启动失败（§31）。
     Mqtt(mqtt_client::MqttClientError),
+    /// REST v1 只读接口启动失败（§31.5：监听绑定失败等）。
+    Rest(String),
     /// 运行期任务异常终止。
     Task(String),
     /// 停机超时（有限排空期限内未完成）。
@@ -106,6 +108,7 @@ impl fmt::Display for CollectorError {
             Self::Pipeline(e) => write!(f, "数据管道失败: {e}"),
             Self::Buffer(e) => write!(f, "Local Buffer 失败: {e}"),
             Self::Mqtt(e) => write!(f, "MQTT 客户端失败: {e}"),
+            Self::Rest(e) => write!(f, "REST 接口启动失败: {e}"),
             Self::Task(e) => write!(f, "运行时任务异常: {e}"),
             Self::ShutdownTimeout { stage } => write!(f, "停机超时（{stage} 未在期限内完成）"),
             Self::Io { context, reason } => write!(f, "{context} 失败: {reason}"),

@@ -19,11 +19,12 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 - `mqtt-client`：QoS 1 北向发布（rumqttc）、Topic 命名空间与 Status Envelope、断线重发与指数退避重连、LWT、TLS/mTLS、优雅停机排空
 - `local-buffer`：Local Buffer/WAL（SQLite Embedded DB）——以完整 ObservationBatch 为持久化单位、本地序号按序补传、message_id 幂等、PUBACK 后删除、容量背压/拒绝、崩溃恢复
 - `modbus-mock`：测试共用 Mock Modbus TCP server（非生产）
+- `rest-api`：REST v1 只读管理接口（§31.5/§31.6/§104）——设备/资源/属性查询、健康检查、`forgelink.error.v1` 错误模型、有界并发与优雅停机；已接入 `collector` 运行时
 
 仍在建设中的能力：
 
-- `collector`、`edge-server`、`manager` 尚未完成运行时组装
-- REST API、Control Engine 仍为占位
+- `edge-server`、`manager` 尚未开始运行时组装
+- REST 控制链路（Property Write / Command Execute / 认证授权）与 Control Engine 仍为占位
 - 尚未完成三平台真实部署、性能基准和长时间稳定性验收
 
 架构依据见：
@@ -94,6 +95,38 @@ RTU 配置示例：
 
 驱动测试会按需构建并加载本地 `cdylib` 产物；真实设备冒烟测试默认 `ignored`，需要
 本机 `127.0.0.1:502` 提供 Modbus 服务后再显式运行。
+
+## REST v1 只读管理接口
+
+Collector 提供 REST v1 只读管理接口（§31.5/§31.6/§104）。**默认禁用**，需显式配置：
+
+```yaml
+# collector.yaml（片段）
+rest:
+  listen: "127.0.0.1:8080"   # 缺省禁用；端口 0 = 操作系统分配（开发/测试）
+  max_concurrency: 64        # 有界并发（缺省 64），超限请求排队，超时返回 503
+```
+
+端点（响应体均含 `schema` 字段标识契约版本）：
+
+| 端点 | 响应 schema |
+| --- | --- |
+| `GET /api/v1/devices` | `forgelink.devices.v1` |
+| `GET /api/v1/devices/{id}` | `forgelink.device.v1` |
+| `GET /api/v1/devices/{id}/resources` | `forgelink.resources.v1` |
+| `GET /api/v1/devices/{id}/properties` | `forgelink.properties.v1` |
+| `GET /api/v1/health` | `forgelink.health.v1` |
+
+错误响应统一为 `forgelink.error.v1`，含 `code`/`message`/`request_id`；404 区分
+`DEVICE_NOT_FOUND`/`RESOURCE_NOT_FOUND`，405 为 `METHOD_NOT_ALLOWED`，非法请求
+400，并发超限 503，内部错误 500（401/403/409/422 留给控制链路）。
+
+安全边界（§90.1）：
+
+- 默认只允许 loopback 地址；监听非 loopback 必须显式配置。
+- 响应不包含 Driver 地址、连接配置、凭据（密码/证书/私钥）与缓冲路径。
+- 只读接口不暴露控制路由（`controls`/`control-requests` 一律 404/405）。
+- 停机时 REST 最先关闭，拒绝新连接后再排空采集链路。
 
 ## 验证
 

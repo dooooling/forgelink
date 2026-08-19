@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use crate::config::CollectorConfig;
 use crate::error::CollectorError;
 use crate::health::CollectorHealth;
+use crate::rest::CollectorApiState;
 use crate::tasks::{HealthState, run_forward, run_heartbeat, run_pump};
 
 /// 心跳日志周期（§104 长期稳定性观测）。
@@ -53,6 +54,8 @@ pub struct CollectorRuntime {
     pipeline: Arc<data_pipeline::Pipeline>,
     buffer: Arc<local_buffer::LocalBuffer>,
     mqtt: Option<Arc<mqtt_client::MqttClient>>,
+    /// REST v1 只读接口（§31.5；配置未启用时为 `None`）。
+    rest: Option<rest_api::RestApiServer>,
     pump: tokio::task::JoinHandle<()>,
     // 内部 Result 上报永久性落盘错误等（评审 P1）。
     forward: tokio::task::JoinHandle<Result<(), CollectorError>>,
@@ -257,6 +260,42 @@ impl CollectorRuntime {
         let (lost_tx, lost_rx) = mpsc::channel(128);
         let health = Arc::new(HealthState::default());
         health.started_at_ns.store(started_at_ns, Ordering::Relaxed);
+
+        // 8) REST v1 只读管理接口（§31.5/§104）：默认禁用，显式配置
+        //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
+        //    fail-fast（用户显式配置了端口而不可用，不静默降级）。
+        //    设备元数据在 `manager` 移入 `manager_arc` 之前提取（注册后
+        //    静态不变，REST 快照的静态部分）。
+        let rest = if let Some(listen) = &config.rest.listen {
+            let listen = listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| CollectorError::Rest(format!("监听地址 {listen:?} 非法: {e}")))?;
+            let meta = crate::rest::extract_device_meta(&manager);
+            let state = Arc::new(CollectorApiState::new(
+                Arc::clone(&health),
+                config.site_id.clone(),
+                session_id.clone(),
+                meta,
+            ));
+            let server = rest_api::RestApiServer::spawn(
+                state,
+                rest_api::RestConfig {
+                    listen,
+                    max_concurrency: config.rest.max_concurrency,
+                },
+            )
+            .await
+            .map_err(|e| CollectorError::Rest(format!("监听 {listen} 失败: {e}")))?;
+            info!(
+                component = "collector",
+                addr = %server.addr,
+                "REST v1 只读管理接口已启用"
+            );
+            Some(server)
+        } else {
+            None
+        };
+
         let manager_arc = Arc::new(manager);
         let pump = tokio::spawn(run_pump(
             events_rx,
@@ -290,6 +329,7 @@ impl CollectorRuntime {
             pipeline: pipeline_arc,
             buffer,
             mqtt: Some(mqtt_arc),
+            rest,
             pump,
             forward,
             forward_done: false,
@@ -319,6 +359,11 @@ impl CollectorRuntime {
         h.session_id = self.session_id.clone();
         h.buffer.db_path = self.config.buffer.db_path.display().to_string();
         h
+    }
+
+    /// REST 接口实际监听地址（未启用时为 `None`）。
+    pub fn rest_addr(&self) -> Option<std::net::SocketAddr> {
+        self.rest.as_ref().map(|s| s.addr)
     }
 
     async fn log_health(&self, stage: &str) {
@@ -374,6 +419,12 @@ impl CollectorRuntime {
         self.stopping.send(true).ok();
         // 停机全程的健康快照：字段级取出，避免后续部分 move 的借用冲突。
         let final_health = self.health();
+
+        // 0) REST 接口最先停止（独立任务、有界排空）：拒绝新连接后
+        //    API 不可达，采集/WAL/MQTT 不受影响（§31.5 运行时接入）。
+        if let Some(rest) = self.rest.take() {
+            rest.shutdown().await;
+        }
 
         // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。
         self.scheduler.shutdown().await;

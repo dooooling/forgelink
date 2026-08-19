@@ -11,6 +11,7 @@
 pub mod config;
 pub mod error;
 pub mod health;
+pub mod rest;
 mod runtime;
 mod tasks;
 
@@ -21,7 +22,7 @@ pub use runtime::CollectorRuntime;
 pub use data_pipeline::PipelineConfig;
 pub use local_buffer::{CapacityPolicy, LocalBufferConfig};
 pub use mqtt_client::{MqttClientConfig, TlsMode};
-pub use observation_model::DomainKind;
+pub use observation_model::{DataType, DomainKind, Value};
 pub use poll_engine::PollConfig;
 
 /// 单条 MQTT 发布的最小报文尺寸下限（§31.1 主题 + Envelope 头）。

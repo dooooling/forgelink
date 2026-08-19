@@ -60,7 +60,7 @@ const PUSH_CAPACITY_WAIT: Duration = Duration::from_millis(500);
 
 /// 共享健康状态（原子计数 + 短锁小字段，供 `health()` 快照）。
 #[derive(Default)]
-pub(super) struct HealthState {
+pub(crate) struct HealthState {
     pub(super) started_at_ns: AtomicI64,
     mqtt_acked: AtomicU64,
     mqtt_failed: AtomicU64,
@@ -110,7 +110,7 @@ impl HealthState {
     }
 
     /// 收集健康快照（设备元数据由调用方传入：id/enabled/读取项数/组数）。
-    pub(super) fn snapshot(&self, devices: &[(String, bool, usize, usize)]) -> CollectorHealth {
+    pub(crate) fn snapshot(&self, devices: &[(String, bool, usize, usize)]) -> CollectorHealth {
         let last_batch = self
             .device_last_batch
             .lock()

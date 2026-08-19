@@ -181,6 +181,7 @@ impl Harness {
                 ..Default::default()
             },
             forward_poll_ms: 50,
+            rest: Default::default(),
         };
         Self {
             server,
@@ -191,6 +192,7 @@ impl Harness {
 }
 
 /// 解析 Telemetry Batch 载荷。
+#[allow(dead_code)] // e2e/resilience/rest 各测试按需使用
 pub fn parse_batch(payload: &[u8]) -> serde_json::Value {
     serde_json::from_slice(payload).expect("Telemetry Batch 应可解析")
 }

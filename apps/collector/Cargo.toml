@@ -17,6 +17,7 @@ collector = [
     "driver-read",
     "mqtt",
     "local-cache",
+    "rest-api",
 ]
 
 # 启用控制链路（driver-write、control-engine）。当前阶段保持空占位：
@@ -43,6 +44,8 @@ driver-read = [
     "dep:serde_yaml",
     "dep:tokio",
 ]
+# REST v1 只读管理接口（§31.5/§31.6/§90.1）：只读适配层与 HTTP 服务器。
+rest-api = ["dep:rest-api"]
 mqtt = ["dep:mqtt-client"]
 local-cache = ["dep:local-buffer"]
 driver-write = []
@@ -69,6 +72,9 @@ mqtt-client = { path = "../../crates/mqtt-client", optional = true }
 
 # Local Buffer/WAL（local-cache）
 local-buffer = { path = "../../crates/local-buffer", optional = true }
+
+# REST v1 只读管理接口（rest-api feature）。
+rest-api = { path = "../../crates/rest-api", optional = true }
 
 tracing = "0.1"
 

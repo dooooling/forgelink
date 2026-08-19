@@ -53,6 +53,10 @@ pub struct CollectorConfig {
     /// 发送循环空闲轮询间隔（WAL 为空时的唤醒间隔，毫秒）。
     #[serde(default = "default_forward_poll_ms")]
     pub forward_poll_ms: u64,
+    /// REST v1 只读管理接口（§31.5/§90.1）：默认禁用；启用必须显式
+    /// 配置 `listen`（默认只监听 loopback，非 loopback 绑定需显式写明）。
+    #[serde(default)]
+    pub rest: RestOptions,
 }
 
 fn default_profiles_dir() -> PathBuf {
@@ -414,6 +418,51 @@ pub enum BufferCapacityPolicy {
     Reject,
 }
 
+/// REST v1 只读管理接口配置（§31.5/§90.1 安全基线）。
+///
+/// 默认**禁用**：`listen = None` 时不启动服务器。启用必须显式配置
+/// 监听地址；`0.0.0.0`/`::`/非 loopback 地址属于显式配置（默认值
+/// 只允许 loopback，§90.1）。端口 `0` 表示由操作系统分配（开发/测试）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestOptions {
+    /// 监听地址（`host:port`）；`None` 禁用（缺省）。
+    pub listen: Option<String>,
+    /// 最大并发请求数（有界并发，§5），默认 64。
+    #[serde(default = "default_rest_concurrency")]
+    pub max_concurrency: usize,
+}
+
+impl Default for RestOptions {
+    fn default() -> Self {
+        Self {
+            listen: None,
+            max_concurrency: default_rest_concurrency(),
+        }
+    }
+}
+
+fn default_rest_concurrency() -> usize {
+    64
+}
+
+impl RestOptions {
+    fn validate(&self) -> Result<(), CollectorError> {
+        if let Some(listen) = &self.listen {
+            let addr = listen.parse::<std::net::SocketAddr>().map_err(|e| {
+                ConfigError::invalid("rest.listen", format!("监听地址 {listen:?} 无法解析: {e}"))
+            })?;
+            // 端口 0 = 操作系统分配（开发/测试用，实际地址经
+            // `CollectorRuntime::rest_addr()` 获取）。
+            let _ = addr;
+        }
+        if self.max_concurrency == 0 {
+            return Err(ConfigError::invalid("rest.max_concurrency", "必须大于 0").into());
+        }
+        Ok(())
+    }
+}
+
 impl CollectorConfig {
     /// 从文件加载配置（YAML 或 JSON，按扩展名/内容自动识别）。
     pub fn load_path(path: &Path) -> Result<Self, CollectorError> {
@@ -520,6 +569,7 @@ impl CollectorConfig {
         self.poll.validate()?;
         self.pipeline.validate()?;
         self.buffer.validate()?;
+        self.rest.validate()?;
         Ok(())
     }
 
