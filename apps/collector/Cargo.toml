@@ -81,6 +81,7 @@ tracing = "0.1"
 [dev-dependencies]
 modbus-mock = { path = "../../crates/modbus-mock" }
 mqtt-client = { path = "../../crates/mqtt-client", features = ["test-utils"] }
+rest-api = { path = "../../crates/rest-api", features = ["test-utils"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }

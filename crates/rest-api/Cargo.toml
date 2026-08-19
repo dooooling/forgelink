@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# 测试辅助：模拟 serve 任务异常退出（真实 listener 错误难以在测试中
+# 复现）。仅集成测试启用，不影响生产构建。
+test-utils = []
+
 [dependencies]
 axum = "0.8"
 mqtt-client = { path = "../mqtt-client" }

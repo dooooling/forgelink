@@ -86,6 +86,11 @@ pub struct RestApiServer {
     /// serve 任务持有，正常停机不触发）。调用方订阅后据此错误上报
     /// 或触发停机，不得静默继续运行（评审 P2）。
     exit_rx: watch::Receiver<bool>,
+    /// 异常退出通知发送端（测试钩子共用；正常路径由 serve 任务持有
+    /// 克隆，此处保留一份便于测试模拟异常退出；非 test-utils 构建仅
+    /// 持有不读）。
+    #[cfg_attr(not(feature = "test-utils"), allow(dead_code))]
+    exit_tx: watch::Sender<bool>,
     /// 实际监听地址（配置 `:0` 随机端口时用于查询）。
     pub addr: SocketAddr,
 }
@@ -143,6 +148,7 @@ impl RestApiServer {
             join,
             alive,
             exit_rx,
+            exit_tx,
             addr,
         })
     }
@@ -161,6 +167,18 @@ impl RestApiServer {
     /// 静默故障，必须显式反应）。
     pub fn exit_notified(&self) -> watch::Receiver<bool> {
         self.exit_rx.clone()
+    }
+
+    /// 测试钩子：模拟 `serve` 任务异常退出——中止任务、标记服务不可用
+    /// 并置位异常退出通知。正常路径由 serve 任务在 listener 错误退出时
+    /// 自行完成这三件事（评审 P2）；真实 listener 错误难以在测试中
+    /// 复现，此钩子供集成测试验证调用方（Collector 运行时）的监督反应
+    /// （评审 P1：REST 异常退出从启动后即被监视）。
+    #[cfg(feature = "test-utils")]
+    pub fn force_abnormal_exit(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.join.abort();
+        let _ = self.exit_tx.send(true);
     }
 
     /// 优雅停机：拒绝新连接 → 在途请求限时排空 → 任务结束。

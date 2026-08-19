@@ -24,7 +24,10 @@ use diagnostics::{LoggingConfig, init_logging, redact, shutdown_logging};
 #[cfg(feature = "collector")]
 use tokio::sync::watch;
 #[cfg(feature = "collector")]
-use tracing::{error, info};
+use tracing::error;
+// SIGTERM 日志仅在 UNIX 挂接（Windows 不支持 SIGTERM）。
+#[cfg(all(feature = "collector", unix))]
+use tracing::info;
 
 fn main() -> ExitCode {
     #[cfg(feature = "collector")]
@@ -89,21 +92,15 @@ fn main() -> ExitCode {
                     }
                 };
 
-                // 等待任一停机信号：SIGINT（ctrl_c）或 SIGTERM 任务置位
-                // 的 watch。此前仅等待 ctrl_c，SIGTERM 置位 watch 后 main
-                // 仍阻塞在 ctrl_c，不会触发停机（评审 P1）。
-                let mut signal_wait = sig_rx.clone();
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        info!(component = "collector", "收到 SIGINT（Ctrl+C）");
-                    }
-                    r = signal_wait.changed() => {
-                        if r.is_err() {
-                            info!(component = "collector", "停机信号通道关闭，按停机处理");
-                        }
-                    }
-                }
-                sig_tx.send(true).ok();
+                // 监督立即生效（评审 P1）：REST serve 异常退出与发送循环
+                // 异常退出从启动后即刻被并行监视，无需等待外部停机信号；
+                // SIGINT/SIGTERM 在 `run_until_shutdown` 内部与上述监视
+                // 并行监听（§104）。
+                // 保持停机信号通道的 sender 存活至函数结束：若提前 drop
+                // （Windows 下没有 SIGTERM 任务持有克隆），通道关闭会让
+                // `run_until_shutdown` 的 `signal.changed()` 立即返回 Err，
+                // 被误判为停机信号。
+                let _keep_alive = sig_tx;
                 let code = match runtime.run_until_shutdown(sig_rx).await {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {

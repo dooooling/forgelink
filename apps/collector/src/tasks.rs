@@ -58,6 +58,52 @@ const PUBLISH_FAIL_BACKOFF: Duration = Duration::from_millis(200);
 /// 队列，发送循环继续，不阻塞）。
 const PUSH_CAPACITY_WAIT: Duration = Duration::from_millis(500);
 
+/// Driver 错误码白名单（§90.1 信息隔离，评审 P1）：`DriverErrorInfo.code`
+/// 由 Native Plugin 返回——§17.6 `get_last_error_json` 的 `code` 字段是
+/// 任意字符串，可能携带路径、地址、设备细节等敏感内容，不得直接进入
+/// 健康状态与 REST 视图。只有固定集合的稳定码（Core/加载器/轮询引擎
+/// 自身产生 + 已交付 Driver 的稳定码）可以透传；无法识别的统一映射为
+/// `driver_error`（原始码只进脱敏日志）。
+const DRIVER_CODE_WHITELIST: &[&str] = &[
+    // 加载器/ABI/调用类稳定码（driver-loader `LoaderError::code`）。
+    "driver_load_failed",
+    "driver_entry_not_found",
+    "driver_manifest_entry_invalid",
+    "driver_entry_null",
+    "driver_struct_too_small",
+    "driver_abi_incompatible",
+    "driver_manifest_abi_mismatch",
+    "driver_missing_function",
+    "driver_create_failed",
+    "driver_call_failed",
+    "driver_empty_response",
+    "driver_invalid_response",
+    "driver_invalid_handle",
+    "driver_encoding_error",
+    // 轮询引擎生成的稳定码（poll-engine：超时/panic 防御）。
+    "driver_request_timeout",
+    "driver_read_panicked",
+    // 已交付 Driver（modbus）的稳定码（§17.6 错误详情）。
+    "connection_failed",
+    "connection_lost",
+    "timeout",
+    "modbus_exception",
+    "invalid_response",
+    "invalid_address",
+    "config_error",
+    "decode_error",
+];
+
+/// 白名单归一：命中 `DRIVER_CODE_WHITELIST` 原样透传，否则 `driver_error`。
+fn whitelist_driver_code(code: &str) -> &'static str {
+    for known in DRIVER_CODE_WHITELIST {
+        if *known == code {
+            return known;
+        }
+    }
+    "driver_error"
+}
+
 /// 共享健康状态（原子计数 + 短锁小字段，供 `health()` 快照）。
 #[derive(Default)]
 pub(crate) struct HealthState {
@@ -239,8 +285,12 @@ async fn pump_event(
                 return;
             };
             // 稳定错误码（§90.1：DriverErrorInfo.message 可能含地址等
-            // 内部细节，只进日志；`code` 为 §17.6 稳定类别）。
-            health.record_device_error(device_id, Some(error.code.clone()));
+            // 内部细节，只进日志；`code` 经白名单归一——Plugin 可返回
+            // 任意字符串，无法识别的映射为 driver_error，评审 P1）。
+            health.record_device_error(
+                device_id,
+                Some(whitelist_driver_code(&error.code).to_owned()),
+            );
             match device_manager::map_failure(instance, items, error, &ctx, sequences) {
                 Ok(observations) => ingest_all(pipeline, observations).await,
                 Err(e) => {
@@ -776,5 +826,56 @@ pub(super) async fn run_heartbeat(
             replayed = h.buffer.replayed_batches,
             "Collector 心跳"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whitelist_driver_code;
+
+    /// 白名单内的稳定码必须原样透传（§90.1：Core/加载器/轮询引擎与
+    /// 已交付 Driver 的码是可信集合）。
+    #[test]
+    fn whitelist_passes_known_stable_codes() {
+        for code in [
+            // 加载器/调用类。
+            "driver_load_failed",
+            "driver_call_failed",
+            "driver_invalid_response",
+            "driver_encoding_error",
+            // 轮询引擎。
+            "driver_request_timeout",
+            "driver_read_panicked",
+            // modbus Driver。
+            "connection_failed",
+            "connection_lost",
+            "timeout",
+            "modbus_exception",
+            "config_error",
+            "decode_error",
+        ] {
+            assert_eq!(whitelist_driver_code(code), code, "{code} 应透传");
+        }
+    }
+
+    /// Plugin 可返回任意字符串（§17.6）：路径、地址、自由文本、非
+    /// 白名单格式的码（含文档示例的大写风格）一律归一为 driver_error，
+    /// 不得原样进入 REST 视图（评审 P1）。
+    #[test]
+    fn whitelist_maps_unknown_plugin_codes_to_driver_error() {
+        for code in [
+            "CONNECT_REFUSED",
+            "MODBUS_EXCEPTION",
+            "C:\\secret\\driver\\path",
+            "127.0.0.1:502 read failed",
+            "connection refused: tcp 10.0.0.1:502",
+            "",
+        ] {
+            assert_eq!(
+                whitelist_driver_code(code),
+                "driver_error",
+                "{code:?} 应归一"
+            );
+        }
     }
 }

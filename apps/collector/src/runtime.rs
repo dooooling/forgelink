@@ -54,8 +54,9 @@ pub struct CollectorRuntime {
     pipeline: Arc<data_pipeline::Pipeline>,
     buffer: Arc<local_buffer::LocalBuffer>,
     mqtt: Option<Arc<mqtt_client::MqttClient>>,
-    /// REST v1 只读接口（§31.5；配置未启用时为 `None`）。
-    rest: Option<rest_api::RestApiServer>,
+    /// REST v1 只读接口（§31.5；配置未启用时为 `None`）。`Arc` 允许
+    /// 外部监督方持有句柄副本订阅异常退出通知（`exit_notified`）。
+    rest: Option<Arc<rest_api::RestApiServer>>,
     pump: tokio::task::JoinHandle<()>,
     // 内部 Result 上报永久性落盘错误等（评审 P1）。
     forward: tokio::task::JoinHandle<Result<(), CollectorError>>,
@@ -332,7 +333,7 @@ impl CollectorRuntime {
                 addr = %server.addr,
                 "REST v1 只读管理接口已启用"
             );
-            Some(server)
+            Some(Arc::new(server))
         } else {
             None
         };
@@ -414,6 +415,14 @@ impl CollectorRuntime {
         self.rest.as_ref().is_some_and(|s| s.is_alive())
     }
 
+    /// REST 服务句柄副本（未启用时为 `None`）。外部监督方（如未来的
+    /// manager/运维工具）可据此订阅异常退出通知（`exit_notified`）或
+    /// 探测存活；运行时自身通过 `run_until_shutdown` 在启动后即刻监督
+    /// （评审 P1：REST 异常退出不得静默继续采集）。
+    pub fn rest_server(&self) -> Option<Arc<rest_api::RestApiServer>> {
+        self.rest.clone()
+    }
+
     async fn log_health(&self, stage: &str) {
         let h = self.health();
         if h.has_device_errors() {
@@ -423,10 +432,20 @@ impl CollectorRuntime {
         }
     }
 
-    /// 等待停机信号并执行有序停机（§104：Service Restart 语义下的优雅
-    /// 退出）。停机信号来自 `watch::Receiver<bool>`（由 main 挂接系统
-    /// 信号）；发送循环异常终止或 REST 服务异常退出也会触发停机并
-    /// 返回错误（评审 P2：REST 已不可用时不得继续静默运行）。
+    /// 并行监督运行并在任一终止条件满足时执行有序停机（§104）。
+    ///
+    /// **必须紧跟 `start` 调用**：forward 异常退出与 REST 服务异常
+    /// 退出从启动后立即被监视，不得等到外部停机信号才感知——否则
+    /// REST 已不可用/发送循环已终止时采集仍静默运行（评审 P1）。
+    /// 系统信号（SIGINT/SIGTERM）在本函数内与 forward/REST 监视并行
+    /// 监听。
+    ///
+    /// 终止条件：
+    /// - 系统信号：`ctrl_c`（SIGINT）；SIGTERM 由 main 挂接任务置位
+    ///   `signal`（§104 Service Restart 语义，Windows 不可用时跳过）。
+    /// - 发送循环异常退出（永久性落盘错误等，内部 Result 上报）。
+    /// - REST serve 任务错误退出（API 不可用但采集继续属于静默故障，
+    ///   评审 P2）。正常停机路径（`shutdown` 先发 stop 信号）不触发。
     pub async fn run_until_shutdown(
         mut self,
         mut signal: watch::Receiver<bool>,
@@ -436,6 +455,12 @@ impl CollectorRuntime {
         // 静默故障。正常停机路径（shutdown 先发 stop 信号）不触发。
         let mut rest_exit = self.rest.as_ref().map(|s| s.exit_notified());
         tokio::select! {
+            // 系统信号：SIGINT（Ctrl+C）直接监听；SIGTERM 由 main 挂接
+            // 任务置位 `signal`（Windows 不支持 SIGTERM，main 仅在
+            // UNIX 挂接）。停机信号通道关闭也按停机处理。
+            _ = tokio::signal::ctrl_c() => {
+                info!(component = "collector", "收到 SIGINT（Ctrl+C）");
+            }
             r = signal.changed() => {
                 if r.is_err() {
                     warn!(component = "collector", "停机信号通道关闭，按停机处理");
@@ -498,7 +523,16 @@ impl CollectorRuntime {
         // 0) REST 接口最先停止（独立任务、有界排空）：拒绝新连接后
         //    API 不可达，采集/WAL/MQTT 不受影响（§31.5 运行时接入）。
         if let Some(rest) = self.rest.take() {
-            rest.shutdown().await;
+            match Arc::try_unwrap(rest) {
+                Ok(server) => server.shutdown().await,
+                // 外部持有句柄副本（监督方/测试）：不消费句柄，服务由
+                // 持有方接管。正常生产路径运行时是唯一持有者，可安全
+                // 消费（评审 P1：监督从启动后立即生效）。
+                Err(_) => warn!(
+                    component = "collector",
+                    "REST 服务句柄仍被外部持有，跳过停机消费（由持有方接管）"
+                ),
+            }
         }
 
         // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。

@@ -324,6 +324,55 @@ fn assert_stable_code(code: &str, what: &str) {
     }
 }
 
+/// 启动后监督立即生效（评审 P1）：不发送任何停机信号，仅 REST serve
+/// 任务异常退出，`run_until_shutdown` 即返回错误并完成有序停机——REST
+/// 已不可用时不得静默继续采集（此前监督只在收到外部停机信号后才开始）。
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_abnormal_exit_immediately_triggers_shutdown() {
+    let broker = MockBroker::start().await;
+    let harness = harness_rest(broker.addr().port());
+    let runtime = collector::CollectorRuntime::start(harness.config.clone())
+        .await
+        .expect("运行时启动");
+    let rest = runtime.rest_server().expect("REST 已启用");
+    // 注意：sender 必须存活（下划线前缀绑定不立即 drop），否则停机
+    // 信号通道立即关闭被当作停机信号（与 forward_fatal_error 测试同
+    // 语义）。此处不发送任何停机信号。
+    let (_sig_tx, sig_rx) = tokio::sync::watch::channel(false);
+
+    // 监督任务启动后立即生效：等待 REST serve 就绪，再强制异常退出。
+    let supervisor = tokio::spawn(runtime.run_until_shutdown(sig_rx));
+    // 等待 serve 任务已接受连接（监督已订阅 exit_notified 后）再强制
+    // 异常退出，避免竞态（退出通知可能在订阅前发出被丢失——正常路径
+    // 中 serve 任务退出时通知通道持久保存最新值，订阅后 change 仍可
+    // 读到，此处等待是保守的时序保障）。
+    let mut stream = tokio::net::TcpStream::connect(rest.addr)
+        .await
+        .expect("连接 REST 服务器");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let _ = stream
+        .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await;
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf).await;
+    rest.force_abnormal_exit();
+    drop(rest);
+
+    let result = tokio::time::timeout(Duration::from_secs(20), supervisor)
+        .await
+        .expect("监督应在期限内返回（REST 异常退出触发有序停机）")
+        .expect("监督任务正常结束");
+    assert!(
+        result.is_err(),
+        "REST 异常退出必须上报错误（实际 {result:?}）"
+    );
+    assert!(
+        result.err().unwrap().to_string().contains("REST"),
+        "错误应包含 REST 原因"
+    );
+    broker.stop().await;
+}
+
 /// 无 REST 配置时默认不监听（§90.1：REST 默认禁用）。
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_disabled_by_default() {
