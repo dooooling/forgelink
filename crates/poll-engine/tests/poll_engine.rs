@@ -837,3 +837,56 @@ async fn shutdown_with_timeout_uses_shared_deadline_across_tasks() {
         "统一截止时间应 ≈ 300ms，实际 {elapsed:?}（按任务分别等待则 ≈ 900ms）"
     );
 }
+
+/// `shutdown_with_timeout` 必须真正取消底层轮询任务，而不是只取消包装层
+/// （评审 P1：`JoinSet` 包装任务被 `abort_all` 时只会丢弃内部 `JoinHandle`，
+/// 丢弃句柄不取消 Tokio 任务，底层轮询任务会脱管继续运行并遗留后台线程）。
+///
+/// 可观测点：`poll_loop` 持有事件通道发送端，任务被真正取消（Drop）后发送端
+/// 释放、通道立即关闭；若任务脱管继续运行，通道会保持打开直至驱动阻塞自然
+/// 结束（测试中为 2s）。
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_with_timeout_aborts_underlying_task() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let target = PollTarget {
+        device_id: "dev-stuck-solo".to_owned(),
+        interval_ms: 10,
+        items: items(1),
+    };
+    let config = PollConfig {
+        request_timeout: Duration::from_millis(50),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        // 收尾上限很长：专门证明 shutdown_with_timeout 自身的 grace 生效。
+        shutdown_drain_timeout: Duration::from_secs(60),
+    };
+    let mut scheduler = PollScheduler::new();
+    // 驱动阻塞 2s（远超 grace 100ms，视为永久阻塞）。
+    let (driver, _, _) =
+        mock_driver_with_counters(Duration::from_secs(2), 0, true, vec![ok_result(0)]);
+    scheduler.spawn(target, driver, config, tx).unwrap();
+
+    // 等到第一次超时失败（在途 worker 遗留，任务阻塞在收尾阶段）。
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("应收到首次失败事件");
+    assert!(matches!(first, Some(PollEvent::Failed { .. })));
+
+    let started = Instant::now();
+    scheduler
+        .shutdown_with_timeout(Duration::from_millis(100))
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "停机必须按时返回"
+    );
+
+    // 任务必须被真正取消：通道应立即关闭（500ms 内），而非等 2s 驱动阻塞
+    // 自然结束后才释放发送端。
+    let after = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    assert!(
+        matches!(after, Ok(None)),
+        "底层轮询任务必须已被真正取消：事件通道应即时关闭（脱管任务会让通道保持打开）"
+    );
+}
