@@ -57,7 +57,8 @@ impl PropertiesResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct HealthResponse {
     pub schema: &'static str,
-    /// 汇总状态：`ok`（全部正常）/ `degraded`（存在设备采集异常）。
+    /// 汇总状态：`ok`（全部正常）/ `degraded`（设备采集、北向发布或
+    /// WAL 在途存在异常）。
     pub status: HealthStatus,
     pub site_id: String,
     pub session_id: String,
@@ -132,8 +133,8 @@ pub struct PropertyView {
     /// 语义值范围（写入校验依据，§37.1）。
     pub min: Option<serde_json::Value>,
     pub max: Option<serde_json::Value>,
-    /// 推荐采集间隔（毫秒；Profile 未声明时由设备默认间隔决定）。
-    pub interval_ms: u64,
+    /// 推荐采集间隔（毫秒）；仅可写属性（无采集）为 `null`。
+    pub interval_ms: Option<u64>,
 }
 
 /// 资源节点视图（§5 Resource 最小实现：由属性路径派生）。
@@ -188,8 +189,15 @@ pub struct ApiSnapshot {
 }
 
 impl ApiSnapshot {
-    /// 是否存在设备采集异常（health 汇总降级判定）。
-    pub fn has_device_errors(&self) -> bool {
+    /// 是否存在需要关注的状态（health 汇总降级判定，评审 P2）：
+    ///
+    /// - 任一设备最近采集失败；
+    /// - 北向发布异常（`last_error` 存在，或累计失败 > 0）；
+    /// - WAL 在途异常（在途记录滞留——存在未确认在途且北向最近失败）。
+    pub fn has_anomalies(&self) -> bool {
         self.devices.iter().any(|d| d.last_error.is_some())
+            || self.mqtt.last_error.is_some()
+            || self.mqtt.publishes_failed > 0
+            || (self.buffer.inflight > 0 && self.mqtt.last_failed_at_ns.is_some())
     }
 }

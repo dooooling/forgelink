@@ -15,7 +15,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -78,6 +78,9 @@ impl Default for RestConfig {
 pub struct RestApiServer {
     stop: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    /// 服务存活标记：`serve` 任务退出（正常停机或异常）后置 false，
+    /// 供调用方（Collector 运行时）感知异常退出（评审 P2）。
+    alive: Arc<AtomicBool>,
     /// 实际监听地址（配置 `:0` 随机端口时用于查询）。
     pub addr: SocketAddr,
 }
@@ -98,6 +101,8 @@ impl RestApiServer {
         let (stop_tx, stop_rx) = watch::channel(false);
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency.max(1)));
         let app = router(state, concurrency);
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_task = Arc::clone(&alive);
 
         let join = tokio::spawn(async move {
             let shutdown = async move {
@@ -105,10 +110,13 @@ impl RestApiServer {
                 // 服务器任务与停机信号同生命周期：信号通道关闭即停止。
                 let _ = rx.changed().await;
             };
-            if let Err(e) = axum::serve(listener, app)
+            let result = axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown)
-                .await
-            {
+                .await;
+            // 任务退出（无论异常还是停机）：标记服务不可用。停机路径由
+            // `shutdown()` 消费句柄，正常路径由 `is_alive()` 感知（评审 P2）。
+            alive_task.store(false, Ordering::SeqCst);
+            if let Err(e) = result {
                 error!(component = "rest-api", error = %e, "REST 服务器异常退出");
             }
         });
@@ -121,8 +129,17 @@ impl RestApiServer {
         Ok(Self {
             stop: stop_tx,
             join,
+            alive,
             addr,
         })
+    }
+
+    /// 服务是否仍在运行（`serve` 任务正常退出或异常退出后为 `false`）。
+    ///
+    /// 调用方（Collector 运行时）据此感知 REST 已不可用（评审 P2：
+    /// 异常退出不能只记日志，地址必须失效）。
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::SeqCst)
     }
 
     /// 优雅停机：拒绝新连接 → 在途请求限时排空 → 任务结束。
@@ -326,7 +343,7 @@ async fn health(
 ) -> ApiResult<Json<HealthResponse>> {
     let _permit = acquire(&state, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
-    let status = if snapshot.has_device_errors() {
+    let status = if snapshot.has_anomalies() {
         HealthStatus::Degraded
     } else {
         HealthStatus::Ok
@@ -477,7 +494,7 @@ mod tests {
             writable: true,
             min: None,
             max: None,
-            interval_ms: 50,
+            interval_ms: Some(50),
         }];
         let app = app(Arc::new(StaticState(s)));
 
@@ -527,6 +544,45 @@ mod tests {
         let app = app(Arc::new(StaticState(s)));
         let (_, body) = get(app, "/api/v1/health").await;
         assert_eq!(body["status"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn health_degraded_when_mqtt_error() {
+        let mut s = snapshot();
+        s.mqtt.last_error = Some("连接重置".to_owned());
+        let app = app(Arc::new(StaticState(s)));
+        let (_, body) = get(app, "/api/v1/health").await;
+        assert_eq!(body["status"], "degraded", "MQTT last_error 应降级");
+    }
+
+    #[tokio::test]
+    async fn health_degraded_when_publish_failed() {
+        let mut s = snapshot();
+        s.mqtt.publishes_failed = 3;
+        let app = app(Arc::new(StaticState(s)));
+        let (_, body) = get(app, "/api/v1/health").await;
+        assert_eq!(body["status"], "degraded", "累计发布失败应降级");
+    }
+
+    #[tokio::test]
+    async fn health_degraded_when_wal_inflight_stuck() {
+        let mut s = snapshot();
+        // 在途记录滞留且北向最近失败：WAL 侧异常（评审 P2）。
+        s.buffer.inflight = 2;
+        s.mqtt.last_failed_at_ns = Some(4);
+        let app = app(Arc::new(StaticState(s)));
+        let (_, body) = get(app, "/api/v1/health").await;
+        assert_eq!(body["status"], "degraded", "WAL 在途滞留应降级");
+    }
+
+    #[tokio::test]
+    async fn health_ok_with_inflight_but_no_mqtt_failure() {
+        let mut s = snapshot();
+        // 在途记录属正常 ACK 窗口：无北向失败时不得误判降级。
+        s.buffer.inflight = 2;
+        let app = app(Arc::new(StaticState(s)));
+        let (_, body) = get(app, "/api/v1/health").await;
+        assert_eq!(body["status"], "ok");
     }
 
     #[tokio::test]
@@ -618,5 +674,30 @@ mod tests {
         let (status, body) = get(app, "/api/v1/devices/a%2Fb").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "BAD_REQUEST");
+    }
+
+    #[tokio::test]
+    async fn is_alive_true_while_serving_and_false_after_task_exit() {
+        let server = RestApiServer::spawn(
+            Arc::new(StaticState(snapshot())),
+            RestConfig {
+                listen: "127.0.0.1:0".parse().expect("静态地址合法"),
+                max_concurrency: 4,
+            },
+        )
+        .await
+        .expect("绑定成功");
+        assert!(server.is_alive(), "serve 任务运行中 alive 必须为 true");
+
+        // 触发停机信号并等待任务退出（异常退出走同一置位路径，
+        // 评审 P2：`serve` 任务结束即标记不可用）。
+        let alive = server.alive.clone();
+        let _ = server.stop.send(true);
+        drop(server.stop);
+        let _ = server.join.await;
+        assert!(
+            !alive.load(Ordering::SeqCst),
+            "serve 任务退出后 alive 必须为 false"
+        );
     }
 }

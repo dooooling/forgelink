@@ -70,7 +70,7 @@ impl CollectorApiState {
                 (
                     d.device_id.clone(),
                     d.enabled,
-                    d.properties.len(),
+                    d.properties.iter().filter(|p| p.readable).count(),
                     d.groups.len(),
                 )
             })
@@ -99,7 +99,7 @@ impl ApiState for CollectorApiState {
                 profile_id: meta.profile_id.clone(),
                 enabled: meta.enabled,
                 labels: meta.labels.clone(),
-                read_items: meta.properties.len(),
+                read_items: meta.properties.iter().filter(|p| p.readable).count(),
                 groups: meta
                     .groups
                     .iter()
@@ -140,6 +140,11 @@ impl ApiState for CollectorApiState {
 /// 只读取 Profile/读取项/分组的**语义**视图：属性路径、类型、单位、
 /// 读写标志、范围与间隔；**不**包含 `driver_address`（Driver 私有
 /// 数据）与连接配置。
+///
+/// 属性清单取 Profile 声明的**全部**属性（含 `readable=false,
+/// writable=true` 的仅可写属性，评审 P2）：只读采集分组只含可读属性，
+/// 但属性视图与资源树必须完整，仅可写属性不得消失；其 `interval_ms`
+/// 为 `None`（无采集间隔）。
 pub fn extract_device_meta(manager: &device_manager::DeviceManager) -> Vec<DeviceMeta> {
     let mut out = Vec::new();
     for device_id in manager.device_ids() {
@@ -148,7 +153,7 @@ pub fn extract_device_meta(manager: &device_manager::DeviceManager) -> Vec<Devic
         };
         let mut properties: Vec<PropertyView> = Vec::new();
         let mut groups: Vec<GroupMeta> = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
+        let mut interval_by_path: BTreeMap<String, u64> = BTreeMap::new();
         for group in &instance.groups {
             let paths: Vec<String> = group
                 .read_items
@@ -160,22 +165,27 @@ pub fn extract_device_meta(manager: &device_manager::DeviceManager) -> Vec<Devic
                 paths: paths.clone(),
             });
             for item in &group.read_items {
-                if !seen.insert(item.path.clone()) {
-                    continue;
-                }
-                let p = &item.property;
-                properties.push(PropertyView {
-                    path: p.path.clone(),
-                    display_name: p.path.clone(),
-                    value_type: data_type_str(&p.value_type),
-                    unit: p.unit.clone(),
-                    readable: p.readable,
-                    writable: p.writable,
-                    min: p.min.as_ref().and_then(value_to_json),
-                    max: p.max.as_ref().and_then(value_to_json),
-                    interval_ms: item.interval_ms,
-                });
+                interval_by_path.insert(item.path.clone(), item.interval_ms);
             }
+        }
+        // 全部属性（含仅可写）：可读属性带采集间隔，仅可写属性为 None。
+        // 按 Profile 声明序输出，去重保底（Profile 校验保证路径唯一）。
+        let mut seen = std::collections::BTreeSet::new();
+        for p in &instance.profile.properties {
+            if !seen.insert(p.path.clone()) {
+                continue;
+            }
+            properties.push(PropertyView {
+                path: p.path.clone(),
+                display_name: p.path.clone(),
+                value_type: data_type_str(&p.value_type),
+                unit: p.unit.clone(),
+                readable: p.readable,
+                writable: p.writable,
+                min: p.min.as_ref().and_then(value_to_json),
+                max: p.max.as_ref().and_then(value_to_json),
+                interval_ms: interval_by_path.get(&p.path).copied(),
+            });
         }
         let paths: Vec<String> = properties.iter().map(|p| p.path.clone()).collect();
         let resources = rest_api::resource::derive_resources(&paths);

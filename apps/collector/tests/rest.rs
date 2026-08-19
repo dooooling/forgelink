@@ -112,16 +112,39 @@ async fn rest_readonly_endpoints_full_chain() {
             .any(|r| r["path"] == "drive.output" && r["kind"] == "drive"),
         "资源 drive.output（kind=drive）"
     );
+    // 仅可写属性也必须进入资源树（评审 P2：只读采集过滤不得丢失属性）。
+    assert!(
+        resources
+            .iter()
+            .any(|r| r["path"] == "drive.control" && r["kind"] == "drive"),
+        "仅可写属性 drive.control.target_freq 派生的资源 drive.control"
+    );
 
     let (status, body) = http_get(addr, "/api/v1/devices/vfd-01/properties");
     assert_eq!(status, 200);
     assert_eq!(body["schema"], "forgelink.properties.v1");
     let properties = body["properties"].as_array().expect("properties 数组");
-    assert!(properties.len() >= 3);
+    assert!(properties.len() >= 4);
     assert!(
         properties
             .iter()
             .any(|p| p["path"] == "drive.output.frequency" && p["unit"] == "Hz")
+    );
+    // 仅可写属性：readable=false、writable=true、无采集间隔（null，
+    // 评审 P2：属性清单不得因只读采集而缺失）。
+    let write_only = properties
+        .iter()
+        .find(|p| p["path"] == "drive.control.target_freq")
+        .expect("仅可写属性在属性清单中");
+    assert_eq!(write_only["readable"], false);
+    assert_eq!(write_only["writable"], true);
+    assert!(write_only["interval_ms"].is_null(), "仅可写属性无采集间隔");
+    assert_eq!(write_only["min"]["f64"], 0.0, "语义范围 min");
+    // read_items 仍是可读属性数（§22 Tag 数），不含仅可写属性。
+    assert_eq!(
+        properties.iter().filter(|p| p["readable"] == true).count(),
+        properties.len() - 1,
+        "仅一个仅可写属性"
     );
     // 敏感字段不泄漏：Driver 地址、连接配置、凭据（§90.1）。
     let text = serde_json::to_string(&body).expect("序列化");
@@ -227,5 +250,35 @@ async fn rest_disabled_by_default() {
         .await
         .expect("运行时启动");
     assert!(runtime.rest_addr().is_none(), "默认不启用 REST");
+    runtime.shutdown().await.expect("优雅停机");
+}
+
+/// REST 绑定失败：fail-fast 且已启动组件（轮询任务等）被回收
+/// （评审 P2：不得遗留后台任务与阻塞 Driver 调用）。
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_bind_failure_fails_start_and_cleans_up() {
+    let broker = MockBroker::start().await;
+    // 先占用一个端口，让 REST 绑定必然失败。
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0").expect("占用端口");
+    let port = blocker.local_addr().expect("获取端口").port();
+    let mut harness = Harness::new(MockBehavior::new(), broker.addr().port());
+    harness.config.rest.listen = Some(format!("127.0.0.1:{port}"));
+    harness.config.rest.max_concurrency = 4;
+
+    let err = match collector::CollectorRuntime::start(harness.config.clone()).await {
+        Ok(_) => panic!("端口占用必须启动失败"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(&err, collector::error::CollectorError::Rest(_)),
+        "应为 REST 绑定错误: {err}"
+    );
+    // start() 返回即清理完成：轮询任务被取消并等待退出（scheduler
+    // shutdown 为异步等待，start 内部完成）。这里再正常启动一次验证
+    // 系统未被遗留任务污染（端口释放后）。
+    drop(blocker);
+    let runtime = collector::CollectorRuntime::start(harness.config.clone())
+        .await
+        .expect("端口释放后重新启动成功");
     runtime.shutdown().await.expect("优雅停机");
 }

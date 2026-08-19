@@ -263,7 +263,9 @@ impl CollectorRuntime {
 
         // 8) REST v1 只读管理接口（§31.5/§104）：默认禁用，显式配置
         //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
-        //    fail-fast（用户显式配置了端口而不可用，不静默降级）。
+        //    fail-fast（用户显式配置了端口而不可用，不静默降级），且
+        //    必须先回收已启动组件——轮询任务/MQTT 客户端/管道/缓冲，
+        //    不得遗留后台任务与阻塞 Driver 调用（评审 P2）。
         //    设备元数据在 `manager` 移入 `manager_arc` 之前提取（注册后
         //    静态不变，REST 快照的静态部分）。
         let rest = if let Some(listen) = &config.rest.listen {
@@ -277,7 +279,7 @@ impl CollectorRuntime {
                 session_id.clone(),
                 meta,
             ));
-            let server = rest_api::RestApiServer::spawn(
+            let server = match rest_api::RestApiServer::spawn(
                 state,
                 rest_api::RestConfig {
                     listen,
@@ -285,7 +287,42 @@ impl CollectorRuntime {
                 },
             )
             .await
-            .map_err(|e| CollectorError::Rest(format!("监听 {listen} 失败: {e}")))?;
+            {
+                Ok(server) => server,
+                Err(e) => {
+                    // 启动失败收尾（评审 P2）：轮询任务可能正持有阻塞
+                    // 的 Driver 调用，必须先取消再释放各组件；清理失败
+                    // 只告警，原始 REST 错误优先返回。
+                    let error = CollectorError::Rest(format!("监听 {listen} 失败: {e}"));
+                    scheduler.shutdown().await;
+                    if let Ok(mqtt) = Arc::try_unwrap(mqtt_arc)
+                        && let Err(e) = mqtt.shutdown().await
+                    {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：MQTT 结算失败"
+                        );
+                    }
+                    if let Ok(pipeline) = Arc::try_unwrap(pipeline_arc)
+                        && let Err(e) = pipeline.shutdown().await
+                    {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：管道关闭失败"
+                        );
+                    }
+                    if let Err(e) = buffer.shutdown().await {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：缓冲关闭失败"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             info!(
                 component = "collector",
                 addr = %server.addr,
@@ -361,9 +398,16 @@ impl CollectorRuntime {
         h
     }
 
-    /// REST 接口实际监听地址（未启用时为 `None`）。
+    /// REST 接口实际监听地址（未启用或服务已退出时为 `None`；评审 P2：
+    /// `serve` 任务异常退出后地址失效，避免向已死端口发起请求）。
     pub fn rest_addr(&self) -> Option<std::net::SocketAddr> {
-        self.rest.as_ref().map(|s| s.addr)
+        let rest = self.rest.as_ref()?;
+        rest.is_alive().then_some(rest.addr)
+    }
+
+    /// REST 服务是否存活（未启用时为 `false`）。
+    pub fn rest_alive(&self) -> bool {
+        self.rest.as_ref().is_some_and(|s| s.is_alive())
     }
 
     async fn log_health(&self, stage: &str) {

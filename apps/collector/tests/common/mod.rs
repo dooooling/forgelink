@@ -96,6 +96,21 @@ fn profile_json() -> &'static str {
                 "default_interval_ms": 100,
                 "min": null,
                 "max": null
+            },
+            {
+                "path": "drive.control.target_freq",
+                "driver_address": "1!40100",
+                "raw_type": "u16",
+                "value_type": "f64",
+                "unit": "Hz",
+                "scale": 0.01,
+                "offset": 0.0,
+                "write_rounding": "nearest",
+                "readable": false,
+                "writable": true,
+                "default_interval_ms": null,
+                "min": {"f64": 0.0},
+                "max": {"f64": 50.0}
             }
         ],
         "commands": [],
@@ -103,7 +118,8 @@ fn profile_json() -> &'static str {
             "supported_properties": [
                 "drive.output.frequency",
                 "drive.output.current",
-                "drive.run.status"
+                "drive.run.status",
+                "drive.control.target_freq"
             ],
             "supported_commands": [],
             "acquisition": {},
