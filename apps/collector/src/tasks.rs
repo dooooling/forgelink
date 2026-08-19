@@ -80,9 +80,11 @@ impl HealthState {
         }
     }
 
-    pub(super) fn record_device_error(&self, device_id: &str, err: Option<String>) {
+    /// 记录设备最近失败**稳定错误码**（§90.1：原始错误文本只进脱敏
+    /// 日志，健康状态与 REST 视图不得携带驱动/MQTT 内部细节）。
+    pub(super) fn record_device_error(&self, device_id: &str, code: Option<String>) {
         if let Ok(mut m) = self.device_error.lock() {
-            m.insert(device_id.to_owned(), err);
+            m.insert(device_id.to_owned(), code);
         }
     }
 
@@ -92,12 +94,14 @@ impl HealthState {
         self.inflight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn record_failed(&self, at_ns: i64, err: &str) {
+    /// 记录发布失败**稳定错误码**（§90.1：同 `record_device_error`，
+    /// 不保存 `MqttClientError` 原文——可能含 broker 地址/主题等细节）。
+    fn record_failed(&self, at_ns: i64, code: &str) {
         self.mqtt_failed.fetch_add(1, Ordering::Relaxed);
         self.last_failed_at_ns.store(at_ns, Ordering::Relaxed);
         self.inflight.fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut m) = self.last_error.lock() {
-            *m = Some(err.to_owned());
+            *m = Some(code.to_owned());
         }
     }
 
@@ -220,7 +224,8 @@ async fn pump_event(
                         error = %e,
                         "轮询批次映射失败"
                     );
-                    health.record_device_error(&batch.device_id, Some(format!("映射失败: {e}")));
+                    // 稳定错误码（§90.1：详情只进日志）。
+                    health.record_device_error(&batch.device_id, Some("map_failed".to_owned()));
                 }
             }
         }
@@ -233,7 +238,9 @@ async fn pump_event(
             let Some(instance) = manager.get(device_id) else {
                 return;
             };
-            health.record_device_error(device_id, Some(error.message.clone()));
+            // 稳定错误码（§90.1：DriverErrorInfo.message 可能含地址等
+            // 内部细节，只进日志；`code` 为 §17.6 稳定类别）。
+            health.record_device_error(device_id, Some(error.code.clone()));
             match device_manager::map_failure(instance, items, error, &ctx, sequences) {
                 Ok(observations) => ingest_all(pipeline, observations).await,
                 Err(e) => {
@@ -687,14 +694,14 @@ async fn forward_batch(
                 Some(deadline) => tokio::select! {
                     biased;
                     _ = stopping_rx.changed() => {
-                        health.record_failed(at_ns, "停机中断在途发布等待");
+                        health.record_failed(at_ns, "shutdown_interrupted_publish");
                         return Err(CollectorError::Task(
                             "停机中断在途发布等待，记录保留待下次启动补传".to_owned(),
                         ));
                     }
                     r = tokio::time::timeout_at(deadline, receipt.acked()) => match r {
                         Err(_) => {
-                            health.record_failed(at_ns, "排空期限内未收到 PUBACK");
+                            health.record_failed(at_ns, "drain_puback_timeout");
                             return Err(CollectorError::Task(
                                 "排空期限内未收到 PUBACK，记录保留待下次启动补传".to_owned(),
                             ));
@@ -705,7 +712,7 @@ async fn forward_batch(
                 None => tokio::select! {
                     biased;
                     _ = stopping_rx.changed() => {
-                        health.record_failed(at_ns, "停机中断在途发布等待");
+                        health.record_failed(at_ns, "shutdown_interrupted_publish");
                         return Err(CollectorError::Task(
                             "停机中断在途发布等待，记录保留待下次启动补传".to_owned(),
                         ));
@@ -729,7 +736,9 @@ async fn forward_batch(
                     // Closed（停机）/ Disconnected / CollisionOverwritten：
                     // 不得删除，放回队头按序补传（§31.3）。
                     buffer.requeue(stored.local_seq).await?;
-                    health.record_failed(at_ns, &e.to_string());
+                    // 稳定错误码（§90.1：`e` 的 Display 可能含 broker
+                    // 地址/主题等细节，只进日志）。
+                    health.record_failed(at_ns, e.code());
                     tokio::time::sleep(PUBLISH_FAIL_BACKOFF).await;
                     Err(CollectorError::Mqtt(e))
                 }
@@ -737,7 +746,7 @@ async fn forward_batch(
         }
         Err(e) => {
             buffer.requeue(stored.local_seq).await?;
-            health.record_failed(at_ns, &e.to_string());
+            health.record_failed(at_ns, e.code());
             tokio::time::sleep(PUBLISH_FAIL_BACKOFF).await;
             Err(CollectorError::Mqtt(e))
         }

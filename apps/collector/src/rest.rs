@@ -112,6 +112,9 @@ impl ApiState for CollectorApiState {
                 properties: meta.properties.clone(),
                 resources: meta.resources.clone(),
                 last_batch_at_ns: health.and_then(|d| d.last_batch_at_ns),
+                // §90.1：`last_error` 为稳定错误码（见 tasks.rs
+                // `record_device_error`），原始驱动/MQTT 错误文本只进
+                // 脱敏日志，不得经 REST 回传（评审 P1）。
                 last_error: health.and_then(|d| d.last_error.clone()),
             });
         }
@@ -123,6 +126,7 @@ impl ApiState for CollectorApiState {
             mqtt: MqttView {
                 last_acked_at_ns: h.mqtt.last_acked_at_ns,
                 last_failed_at_ns: h.mqtt.last_failed_at_ns,
+                // §90.1：稳定错误码（`MqttClientError::code`），原文只进日志。
                 last_error: h.mqtt.last_error,
                 publishes_acked: h.mqtt.publishes_acked,
                 publishes_failed: h.mqtt.publishes_failed,

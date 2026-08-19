@@ -1,6 +1,7 @@
 //! REST v1 只读接口集成测试（§31.5/§31.6/§104）：真实 HTTP 请求验证
 //! Collector 运行时接入——设备查询、健康状态、错误模型、敏感字段、
-//! 并发不阻塞采集、优雅停机与控制路由未暴露。
+//! 错误信息隔离（稳定错误码，§90.1）、并发不阻塞采集、优雅停机与
+//! 控制路由未暴露。
 //!
 //! 使用最简 HTTP/1.1 客户端（std `TcpStream`），避免测试引入重型
 //! HTTP 依赖；请求带 `Connection: close` 使服务端响应后关闭连接。
@@ -239,6 +240,88 @@ async fn rest_readonly_endpoints_full_chain() {
         TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err(),
         "停机后 REST 端口应关闭"
     );
+}
+
+/// §90.1 信息隔离（评审 P1）：设备失败与 MQTT 发布失败时，REST 响应
+/// 的 `last_error` 只含稳定错误码，不得回传驱动/MQTT 原始错误文本
+/// （可能含连接地址、文件路径等内部细节）。
+#[tokio::test(flavor = "multi_thread")]
+async fn health_errors_expose_only_stable_codes() {
+    // 1) 设备采集失败：Mock Modbus 收到请求即断开连接，驱动原始错误
+    //    文本包含目标地址（127.0.0.1:端口）。
+    let broker = MockBroker::start().await;
+    let mut behavior = MockBehavior::new();
+    behavior.drop_connection = true;
+    let mut harness = Harness::new(behavior, broker.addr().port());
+    harness.config.rest = collector::config::RestOptions {
+        listen: Some("127.0.0.1:0".to_owned()),
+        max_concurrency: 16,
+    };
+    // 有限重连次数：broker 断连后客户端立即以 Disconnected 结算在途
+    // 发布（§31.3：断线不得静默挂起），测试无需等待指数退避。
+    harness.config.northbound.mqtt.max_reconnect_retries = Some(1);
+    let runtime = collector::CollectorRuntime::start(harness.config.clone())
+        .await
+        .expect("运行时启动");
+    let addr = runtime.rest_addr().expect("REST 已启用");
+
+    // 设备失败记录（驱动断线重连耗尽后写入稳定错误码）。
+    common::wait_until(|| {
+        runtime
+            .health()
+            .devices
+            .first()
+            .is_some_and(|d| d.last_error.is_some())
+    })
+    .await;
+    let (status, body) = http_get(addr, "/api/v1/health");
+    assert_eq!(status, 200);
+    assert_stable_code(
+        body["devices"][0]["last_error"]
+            .as_str()
+            .expect("健康接口设备错误码"),
+        "/api/v1/health 设备 last_error",
+    );
+    let (status, body) = http_get(addr, "/api/v1/devices");
+    assert_eq!(status, 200);
+    assert_stable_code(
+        body["devices"][0]["last_error"]
+            .as_str()
+            .expect("设备列表错误码"),
+        "/api/v1/devices 设备 last_error",
+    );
+
+    // 2) 北向发布失败：中断全部连接（重连上限为 1，客户端立即退出），
+    //    在途发布以 Disconnected 结算失败并记录稳定错误码。
+    common::wait_until(|| broker.connections() >= 1).await;
+    broker.drop_all_connections();
+    common::wait_until(|| runtime.health().mqtt.last_error.is_some()).await;
+    let (status, body) = http_get(addr, "/api/v1/health");
+    assert_eq!(status, 200);
+    assert_stable_code(
+        body["mqtt"]["last_error"]
+            .as_str()
+            .expect("健康接口 MQTT 错误码"),
+        "/api/v1/health mqtt.last_error",
+    );
+
+    runtime.shutdown().await.expect("优雅停机");
+    broker.stop().await;
+}
+
+/// 稳定错误码校验：小写字母/数字/下划线/连字符，不含地址、路径、
+/// 端口等内部细节（§90.1：错误消息只进脱敏日志）。
+fn assert_stable_code(code: &str, what: &str) {
+    assert!(
+        !code.is_empty()
+            && code
+                .chars()
+                .all(|c| { c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' }),
+        "{what} 应为稳定错误码，实际 {code:?}"
+    );
+    for banned in ["127.0.0.1", ":", "/", "\\"] {
+        assert!(!code.contains(banned), "{what} 不得泄漏内部细节: {code:?}");
+    }
 }
 
 /// 无 REST 配置时默认不监听（§90.1：REST 默认禁用）。

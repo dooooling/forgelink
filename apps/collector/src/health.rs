@@ -26,7 +26,8 @@ pub struct DeviceHealth {
     pub groups: usize,
     /// 最近一次成功批次到达时刻（纳秒）。
     pub last_batch_at_ns: Option<i64>,
-    /// 最近一次失败详情（驱动错误，§9）。
+    /// 最近一次失败的**稳定错误码**（§90.1：驱动原始错误文本可能含
+    /// 地址等内部细节，只进脱敏日志，健康状态与 REST 视图仅暴露码）。
     pub last_error: Option<String>,
 }
 
@@ -37,6 +38,8 @@ pub struct MqttHealth {
     pub last_acked_at_ns: Option<i64>,
     /// 最近一次发布失败时刻（纳秒）。
     pub last_failed_at_ns: Option<i64>,
+    /// 最近一次发布失败的**稳定错误码**（§90.1：`MqttClientError`
+    /// 原文可能含 broker 地址/主题等细节，只进脱敏日志）。
     pub last_error: Option<String>,
     /// 累计 PUBACK 确认（WAL 已删除）的批次。
     pub publishes_acked: u64,
