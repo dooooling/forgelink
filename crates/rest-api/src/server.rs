@@ -900,6 +900,9 @@ mod tests {
             .write_all(b"GET /api/v1/devices HTTP/1.1\r\nHost: test\r\n")
             .await
             .expect("写入半截请求");
+        // 等待 serve 任务接受连接并进入"在途请求"读取状态（否则停机
+        // 信号先于连接注册到达，优雅停机立即完成，测不到 abort 分支）。
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         let alive = server.alive.clone();
         let started = std::time::Instant::now();
