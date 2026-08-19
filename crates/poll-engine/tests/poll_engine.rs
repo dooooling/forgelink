@@ -741,3 +741,48 @@ async fn rejects_zero_drain_timeout() {
     assert_eq!(scheduler.task_count(), 0);
     scheduler.shutdown().await;
 }
+
+/// `shutdown_with_timeout` 有界：驱动永久阻塞且收尾上限内无法自然结束时，
+/// 等待超时后强制 abort 轮询任务并返回，不得无限等待（评审 P1：REST
+/// 绑定失败清理等失败路径必须能按时返回）。
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_with_timeout_aborts_stuck_tasks() {
+    let (tx, rx) = mpsc::channel(64);
+    let collected = collector(rx);
+    let target = PollTarget {
+        device_id: "dev-stuck".to_owned(),
+        interval_ms: 10,
+        items: items(1),
+    };
+    let config = PollConfig {
+        request_timeout: Duration::from_millis(50),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        // 收尾上限很长：专门证明 shutdown_with_timeout 自身的 grace 生效。
+        shutdown_drain_timeout: Duration::from_secs(60),
+    };
+
+    let mut scheduler = PollScheduler::new();
+    // 驱动阻塞 2s（远超 grace 100ms，视为永久阻塞）。
+    let (driver, _, _) =
+        mock_driver_with_counters(Duration::from_secs(2), 0, true, vec![ok_result(0)]);
+    scheduler.spawn(target, driver, config, tx).unwrap();
+
+    // 等到第一次超时失败（在途 worker 遗留，任务阻塞在收尾阶段）。
+    let _ = wait_events(&collected, 1, Duration::from_secs(5));
+
+    // grace 100ms：等待超时 → 强制 abort，不得被 30s 阻塞的驱动拖住。
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        scheduler.shutdown_with_timeout(Duration::from_millis(100)),
+    )
+    .await;
+    result.expect("shutdown_with_timeout 必须按时返回");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "超时后应强制 abort 并返回，实际耗时 {elapsed:?}"
+    );
+}

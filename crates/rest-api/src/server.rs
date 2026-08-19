@@ -81,6 +81,10 @@ pub struct RestApiServer {
     /// 服务存活标记：`serve` 任务退出（正常停机或异常）后置 false，
     /// 供调用方（Collector 运行时）感知异常退出（评审 P2）。
     alive: Arc<AtomicBool>,
+    /// 异常退出通知接收端：serve 任务因错误退出时置 true（发送端由
+    /// serve 任务持有，正常停机不触发）。调用方订阅后据此错误上报
+    /// 或触发停机，不得静默继续运行（评审 P2）。
+    exit_rx: watch::Receiver<bool>,
     /// 实际监听地址（配置 `:0` 随机端口时用于查询）。
     pub addr: SocketAddr,
 }
@@ -99,6 +103,10 @@ impl RestApiServer {
         let listener = TcpListener::bind(config.listen).await?;
         let addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = watch::channel(false);
+        // 异常退出通知通道（评审 P2）：serve 任务错误退出时置 true，
+        // 正常停机（stop 信号触发的优雅退出）不触发。
+        let (exit_tx, exit_rx) = watch::channel(false);
+        let exit_tx_task = exit_tx.clone();
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency.max(1)));
         let app = router(state, concurrency);
         let alive = Arc::new(AtomicBool::new(true));
@@ -118,6 +126,9 @@ impl RestApiServer {
             alive_task.store(false, Ordering::SeqCst);
             if let Err(e) = result {
                 error!(component = "rest-api", error = %e, "REST 服务器异常退出");
+                // 异常退出必须通知调用方（评审 P2）：API 已不可用，调用方
+                // 据此错误上报或触发停机，不得继续静默运行。
+                let _ = exit_tx_task.send(true);
             }
         });
         info!(
@@ -130,6 +141,7 @@ impl RestApiServer {
             stop: stop_tx,
             join,
             alive,
+            exit_rx,
             addr,
         })
     }
@@ -140,6 +152,14 @@ impl RestApiServer {
     /// 异常退出不能只记日志，地址必须失效）。
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
+    }
+
+    /// 订阅异常退出通知：`serve` 任务因错误退出后该通道值为 `true`
+    /// （正常停机不触发）。调用方（Collector 运行时）据此错误上报
+    /// 或触发停机（评审 P2：API 已不可用但采集进程继续运行属于
+    /// 静默故障，必须显式反应）。
+    pub fn exit_notified(&self) -> watch::Receiver<bool> {
+        self.exit_rx.clone()
     }
 
     /// 优雅停机：拒绝新连接 → 在途请求限时排空 → 任务结束。
@@ -259,16 +279,35 @@ fn snapshot_or_error(
     })
 }
 
-/// 设备 ID 路径参数校验（§31.1 主题层级规则：非法字符直接 400）。
+/// 设备 ID 路径参数校验：与配置校验（§31.1 主题规则，`mqtt-client`
+/// 的 `telemetry_topic`/`status_topic`）保持同一允许集合——配置允许
+/// 空格、反斜杠等字符，REST 不得比配置更严，否则设备出现在列表中
+/// 却无法通过详情/资源/属性接口访问（评审 P2）。
+///
+/// 拒绝：空、`/`（路径层级分隔符）、通配符（`#`/`+`）、控制字符与
+/// 超长（MQTT 3.1.1 §4.7.3，与发布主题校验一致）。空格/反斜杠在
+/// URL 中由客户端百分号编码（`%20`/`%5C`），axum 解码后原样匹配。
 fn validate_device_id(device_id: &str, id: &RequestId) -> Result<(), ApiErrorResponse> {
-    if device_id.is_empty()
-        || device_id.contains('/')
-        || device_id.contains('\\')
-        || device_id.contains(' ')
+    let reason = if device_id.is_empty() {
+        Some("设备标识不能为空")
+    } else if device_id.len() > 65535 {
+        Some("设备标识超过 65535 字节上限")
+    } else if device_id.contains('/') {
+        Some("设备标识不能包含 '/'（主题路径分隔符，§31.1）")
+    } else if device_id.contains(['#', '+']) {
+        Some("设备标识不能包含通配符（# / +）")
+    } else if device_id
+        .chars()
+        .any(|c| (c as u32) <= 0x1F || (c as u32) == 0x7F)
     {
+        Some("设备标识不能包含控制字符")
+    } else {
+        None
+    };
+    if let Some(reason) = reason {
         return Err(ApiErrorResponse(
             id.clone(),
-            ApiError::bad_request(format!("非法设备标识 {device_id:?}")),
+            ApiError::bad_request(format!("非法设备标识 {device_id:?}: {reason}")),
         ));
     }
     Ok(())
@@ -670,10 +709,78 @@ mod tests {
 
     #[tokio::test]
     async fn bad_device_id_rejected_with_400() {
-        let app = app(Arc::new(StaticState(snapshot())));
-        let (status, body) = get(app, "/api/v1/devices/a%2Fb").await;
+        // %2F 解码为 `/`：破坏主题层级，配置层同样拒绝（§31.1）。
+        let router = app(Arc::new(StaticState(snapshot())));
+        let (status, body) = get(router, "/api/v1/devices/a%2Fb").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["code"], "BAD_REQUEST");
+
+        // 通配符与空标识同样非法（与配置校验集合一致，评审 P2）。
+        let router = app(Arc::new(StaticState(snapshot())));
+        let (status, _) = get(router, "/api/v1/devices/ab%2Bcd").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "通配符 + 解码后拒绝");
+        let router = app(Arc::new(StaticState(snapshot())));
+        let (status, _) = get(router, "/api/v1/devices/%00").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "控制字符拒绝");
+    }
+
+    #[tokio::test]
+    async fn device_id_with_space_or_backslash_is_queryable() {
+        // 评审 P2：配置校验允许空格/反斜杠（§31.1 主题规则仅拒绝
+        // 空、`/`、通配符、控制字符与超长），REST 不得比配置更严——
+        // 设备出现在列表中就必须可通过详情接口访问。
+        let mut s = snapshot();
+        s.devices[0].device_id = "cnc 01".to_owned();
+        let router = app(Arc::new(StaticState(s)));
+        let (status, body) = get(router, "/api/v1/devices/cnc%2001").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["device"]["device_id"], "cnc 01");
+
+        let mut s = snapshot();
+        s.devices[0].device_id = r"cnc\01".to_owned();
+        let router = app(Arc::new(StaticState(s)));
+        let (status, body) = get(router, "/api/v1/devices/cnc%5C01").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["device"]["device_id"], r"cnc\01");
+    }
+
+    #[tokio::test]
+    async fn state_error_message_never_leaks_internal_detail() {
+        // 评审 P2：StateError 原始文本（可能含路径/连接信息）只进日志，
+        // 外部响应为固定安全文案。
+        let router = app(Arc::new(UnavailableState));
+        let (_, body) = get(router, "/api/v1/health").await;
+        assert_eq!(body["message"], "运行时暂不可用");
+        assert!(
+            !body["message"].as_str().unwrap().contains("停机收尾中"),
+            "内部细节不得出现在响应 message"
+        );
+
+        let router = app(Arc::new(FailingState));
+        let (_, body) = get(router, "/api/v1/devices").await;
+        assert_eq!(body["message"], "内部错误");
+        assert!(
+            !body["message"].as_str().unwrap().contains("快照构造失败"),
+            "内部细节不得出现在响应 message"
+        );
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_does_not_fire_abnormal_exit_notification() {
+        let server = RestApiServer::spawn(
+            Arc::new(StaticState(snapshot())),
+            RestConfig {
+                listen: "127.0.0.1:0".parse().expect("静态地址合法"),
+                max_concurrency: 4,
+            },
+        )
+        .await
+        .expect("绑定成功");
+        let mut exit = server.exit_notified();
+        server.shutdown().await;
+        // 正常停机走 stop 信号，serve 任务优雅返回 Ok：不触发通知。
+        assert!(!*exit.borrow_and_update(), "正常停机不得触发异常退出通知");
+        assert!(exit.has_changed().is_err() || !*exit.borrow(), "通道无新值");
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 //! 轮询调度器（§22 Poll Scheduler）：统一管理设备轮询任务与停机。
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -66,6 +67,28 @@ impl PollScheduler {
                         error = %error,
                         "轮询任务异常退出"
                     );
+                }
+            }
+            self.cancel = None;
+        }
+    }
+
+    /// 取消全部任务并等待它们结束；每个任务等待上限为 `grace`，超时
+    /// 强制 `abort`——阻塞 Driver（如卡死的 Native Plugin 调用）无法
+    /// 自然结束时，停机不得无限等待（评审 P1：REST 绑定失败清理等
+    /// 失败路径必须能按时返回）。
+    pub async fn shutdown_with_timeout(&mut self, grace: Duration) {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            for mut task in self.tasks.drain(..) {
+                if tokio::time::timeout(grace, &mut task).await.is_err() {
+                    warn!(
+                        component = "poll-engine",
+                        error_code = "poll_task_shutdown_timeout",
+                        "轮询任务停机等待超时，强制取消"
+                    );
+                    task.abort();
+                    let _ = (&mut task).await;
                 }
             }
             self.cancel = None;

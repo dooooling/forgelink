@@ -293,8 +293,12 @@ impl CollectorRuntime {
                     // 启动失败收尾（评审 P2）：轮询任务可能正持有阻塞
                     // 的 Driver 调用，必须先取消再释放各组件；清理失败
                     // 只告警，原始 REST 错误优先返回。
+                    // 等待必须有界（评审 P1）：Native Driver 卡死时不得
+                    // 让启动无限挂起，超时强制 abort 轮询任务。
                     let error = CollectorError::Rest(format!("监听 {listen} 失败: {e}"));
-                    scheduler.shutdown().await;
+                    scheduler
+                        .shutdown_with_timeout(Duration::from_secs(5))
+                        .await;
                     if let Ok(mqtt) = Arc::try_unwrap(mqtt_arc)
                         && let Err(e) = mqtt.shutdown().await
                     {
@@ -421,11 +425,16 @@ impl CollectorRuntime {
 
     /// 等待停机信号并执行有序停机（§104：Service Restart 语义下的优雅
     /// 退出）。停机信号来自 `watch::Receiver<bool>`（由 main 挂接系统
-    /// 信号）；发送循环异常终止也会触发停机并返回错误。
+    /// 信号）；发送循环异常终止或 REST 服务异常退出也会触发停机并
+    /// 返回错误（评审 P2：REST 已不可用时不得继续静默运行）。
     pub async fn run_until_shutdown(
         mut self,
         mut signal: watch::Receiver<bool>,
     ) -> Result<(), CollectorError> {
+        // REST 异常退出监视（评审 P2）：serve 任务错误退出时通知本
+        // 运行时，触发错误上报与有序停机——API 不可用但采集继续属于
+        // 静默故障。正常停机路径（shutdown 先发 stop 信号）不触发。
+        let mut rest_exit = self.rest.as_ref().map(|s| s.exit_notified());
         tokio::select! {
             r = signal.changed() => {
                 if r.is_err() {
@@ -452,6 +461,28 @@ impl CollectorRuntime {
                     Ok(()) => CollectorError::Task(msg),
                     Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
                 });
+            }
+            r = async {
+                match rest_exit.as_mut() {
+                    Some(rx) => {
+                        let _ = rx.changed().await;
+                        *rx.borrow()
+                    }
+                    None => std::future::pending::<bool>().await,
+                }
+            }, if self.rest.is_some() => {
+                if r {
+                    // REST serve 任务错误退出：API 已不可用。错误上报
+                    // （日志 + 返回错误）并触发有序停机，不静默运行
+                    // （评审 P2）。
+                    let msg = "REST 服务异常退出，采集停止（API 不可用）".to_owned();
+                    error!(component = "collector", "{msg}");
+                    self.stopping.send(true).ok();
+                    return Err(match self.shutdown().await {
+                        Ok(()) => CollectorError::Task(msg),
+                        Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+                    });
+                }
             }
         }
         info!(component = "collector", "收到停机信号，开始有序停机");
