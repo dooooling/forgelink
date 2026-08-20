@@ -39,10 +39,28 @@ async fn e2e_modbus_to_mqtt_full_chain() {
         assert_eq!(batch["site_id"], "plant-a");
         assert_eq!(batch["device_id"], "vfd-01");
         assert_eq!(batch["sequence"], expect_seq);
-        assert_eq!(batch["replayed"], false);
+        // §31.3/§31.4：连接瞬时断开时未确认批次由客户端自动重发
+        // （QoS 1 at-least-once），重发批次 `replayed=true` 且保留原
+        // message_id/sequence——CI 慢环境偶发，属合法语义而非失败。
+        // 本会话新鲜性由 message_id 内嵌的 `collector_session_id`
+        // 保证：跨会话 WAL 污染必然携带不同 session（重发不改变
+        // message_id，仍属于当前会话）。
         let message_id = batch["message_id"].as_str().expect("message_id");
         assert!(message_id.contains(&format!("{}", expect_seq)));
     }
+    // 两个批次必须同属一个会话（message_id 长度前缀编码解析 session）。
+    let session_of = |payload: &[u8]| -> String {
+        let batch = common::parse_batch(payload);
+        let message_id = batch["message_id"].as_str().expect("message_id");
+        let colon = message_id.find(':').expect("长度前缀分隔符");
+        let len: usize = message_id[..colon].parse().expect("长度数字");
+        message_id[colon + 1..colon + 1 + len].to_owned()
+    };
+    assert_eq!(
+        session_of(&first.payload),
+        session_of(&second.payload),
+        "两个批次必须同属当前会话（无跨会话 WAL 污染）"
+    );
 
     // 值映射（§37.1 + §7.3）：40001=5000→50.0 Hz、40002=2000→20.0 A、
     // coil:1=true（按批次内容验证，避免两个批次顺序假设）。
