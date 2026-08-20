@@ -123,6 +123,14 @@ impl RestApiServer {
                 ),
             ));
         }
+        // 评审 P2：0 是非法配置（无意义并发），直接拒绝而非静默改 1——
+        // 静默修正会让实际并发数与配置不一致，掩盖配置错误。
+        if config.max_concurrency == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rest.max_concurrency 必须大于 0",
+            ));
+        }
         let listener = TcpListener::bind(config.listen).await?;
         let addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -130,7 +138,7 @@ impl RestApiServer {
         // 正常停机（stop 信号触发的优雅退出）不触发。
         let (exit_tx, exit_rx) = watch::channel(false);
         let exit_tx_task = exit_tx.clone();
-        let concurrency = Arc::new(Semaphore::new(config.max_concurrency.max(1)));
+        let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
         let app = router(state, concurrency);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_task = Arc::clone(&alive);
@@ -971,5 +979,43 @@ mod tests {
             !alive.load(Ordering::SeqCst),
             "强制 abort 后 alive 必须显式清除为 false"
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_zero_concurrency() {
+        // 评审 P2：0 是非法配置，`spawn` 必须拒绝而非静默改为 1——
+        // 静默修正会让实际并发数与配置不一致，掩盖配置错误。
+        let result = RestApiServer::spawn(
+            Arc::new(StaticState(snapshot())),
+            RestConfig {
+                listen: "127.0.0.1:0".parse().expect("静态地址合法"),
+                max_concurrency: 0,
+            },
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("0 并发必须拒绝"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_above_max_permits() {
+        // 评审 P2：超过 `Semaphore::MAX_PERMITS` 时 `Semaphore::new`
+        // 会 panic，`spawn` 必须返回错误而非崩溃。
+        let result = RestApiServer::spawn(
+            Arc::new(StaticState(snapshot())),
+            RestConfig {
+                listen: "127.0.0.1:0".parse().expect("静态地址合法"),
+                max_concurrency: Semaphore::MAX_PERMITS + 1,
+            },
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("超限必须拒绝"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 }
