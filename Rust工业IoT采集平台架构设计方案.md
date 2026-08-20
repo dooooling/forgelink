@@ -2380,7 +2380,7 @@ V0.4: FANUC FOCAS Process Plugin
 
 ## 34.7 当前仓库实施状态（非架构决策）
 
-截至 MQTT 客户端合并，以下能力已经在 workspace 中实现并有自动化测试：
+截至 REST v1 只读管理接口合并，以下能力已经在 workspace 中实现并有自动化测试：
 
 ```text
 observation-model     共享规范模型
@@ -2394,15 +2394,18 @@ driver-modbus         Modbus TCP/RTU 读取 Driver MVP
 device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射
 data-pipeline         Telemetry Batch 聚合输出（有界队列、按设备分批、背压/取消/有界排空）
 mqtt-client           MQTT 北向客户端（QoS 1 发布、自动重连退避、LWT、TLS/mTLS、有界队列与背压）
+local-buffer          Local Buffer/WAL（SQLite WAL 崩溃恢复、两级缓冲、幂等补传与 ack 删除）
+rest-api              REST v1 只读管理接口（设备/资源/属性/健康、错误模型、有界并发，§31.5/§31.6）
+collector             Collector 运行时组装（§93/§100：只读采集链路——轮询→映射→组包→WAL→MQTT
+                      QoS1 发布；有序停机有限排空，REST 服务异常退出触发停机）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 
 以下能力仍未完成端到端交付：
 
 ```text
-REST API、Local Buffer/WAL、Control Engine，
-以及 collector / edge-server / manager 的完整运行时组装、三平台部署、
-性能基准和长时间稳定性验收。
+REST 控制链路（Control Engine、driver-write），以及 edge-server / manager
+的完整运行时组装、三平台部署、性能基准和长时间稳定性验收。
 ```
 
 本节只记录实现进度，不改变前述 Normative 契约和 MVP 验收标准。

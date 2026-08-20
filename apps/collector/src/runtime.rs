@@ -38,6 +38,7 @@ use tracing::{error, info, warn};
 use crate::config::CollectorConfig;
 use crate::error::CollectorError;
 use crate::health::CollectorHealth;
+use crate::rest::CollectorApiState;
 use crate::tasks::{HealthState, run_forward, run_heartbeat, run_pump};
 
 /// 心跳日志周期（§104 长期稳定性观测）。
@@ -53,6 +54,9 @@ pub struct CollectorRuntime {
     pipeline: Arc<data_pipeline::Pipeline>,
     buffer: Arc<local_buffer::LocalBuffer>,
     mqtt: Option<Arc<mqtt_client::MqttClient>>,
+    /// REST v1 只读接口（§31.5；配置未启用时为 `None`）。`Arc` 允许
+    /// 外部监督方持有句柄副本订阅异常退出通知（`exit_notified`）。
+    rest: Option<Arc<rest_api::RestApiServer>>,
     pump: tokio::task::JoinHandle<()>,
     // 内部 Result 上报永久性落盘错误等（评审 P1）。
     forward: tokio::task::JoinHandle<Result<(), CollectorError>>,
@@ -257,6 +261,83 @@ impl CollectorRuntime {
         let (lost_tx, lost_rx) = mpsc::channel(128);
         let health = Arc::new(HealthState::default());
         health.started_at_ns.store(started_at_ns, Ordering::Relaxed);
+
+        // 8) REST v1 只读管理接口（§31.5/§104）：默认禁用，显式配置
+        //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
+        //    fail-fast（用户显式配置了端口而不可用，不静默降级），且
+        //    必须先回收已启动组件——轮询任务/MQTT 客户端/管道/缓冲，
+        //    不得遗留后台任务与阻塞 Driver 调用（评审 P2）。
+        //    设备元数据在 `manager` 移入 `manager_arc` 之前提取（注册后
+        //    静态不变，REST 快照的静态部分）。
+        let rest = if let Some(listen) = &config.rest.listen {
+            let listen = listen
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| CollectorError::Rest(format!("监听地址 {listen:?} 非法: {e}")))?;
+            let meta = crate::rest::extract_device_meta(&manager);
+            let state = Arc::new(CollectorApiState::new(
+                Arc::clone(&health),
+                config.site_id.clone(),
+                session_id.clone(),
+                meta,
+            ));
+            let server = match rest_api::RestApiServer::spawn(
+                state,
+                rest_api::RestConfig {
+                    listen,
+                    max_concurrency: config.rest.max_concurrency,
+                },
+            )
+            .await
+            {
+                Ok(server) => server,
+                Err(e) => {
+                    // 启动失败收尾（评审 P2）：轮询任务可能正持有阻塞
+                    // 的 Driver 调用，必须先取消再释放各组件；清理失败
+                    // 只告警，原始 REST 错误优先返回。
+                    // 等待必须有界（评审 P1）：Native Driver 卡死时不得
+                    // 让启动无限挂起，超时强制 abort 轮询任务。
+                    let error = CollectorError::Rest(format!("监听 {listen} 失败: {e}"));
+                    scheduler
+                        .shutdown_with_timeout(Duration::from_secs(5))
+                        .await;
+                    if let Ok(mqtt) = Arc::try_unwrap(mqtt_arc)
+                        && let Err(e) = mqtt.shutdown().await
+                    {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：MQTT 结算失败"
+                        );
+                    }
+                    if let Ok(pipeline) = Arc::try_unwrap(pipeline_arc)
+                        && let Err(e) = pipeline.shutdown().await
+                    {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：管道关闭失败"
+                        );
+                    }
+                    if let Err(e) = buffer.shutdown().await {
+                        warn!(
+                            component = "collector",
+                            error = %e,
+                            "启动失败清理：缓冲关闭失败"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            info!(
+                component = "collector",
+                addr = %server.addr,
+                "REST v1 只读管理接口已启用"
+            );
+            Some(Arc::new(server))
+        } else {
+            None
+        };
+
         let manager_arc = Arc::new(manager);
         let pump = tokio::spawn(run_pump(
             events_rx,
@@ -290,6 +371,7 @@ impl CollectorRuntime {
             pipeline: pipeline_arc,
             buffer,
             mqtt: Some(mqtt_arc),
+            rest,
             pump,
             forward,
             forward_done: false,
@@ -321,6 +403,27 @@ impl CollectorRuntime {
         h
     }
 
+    /// REST 接口实际监听地址（未启用或服务已退出时为 `None`；评审 P2：
+    /// `serve` 任务异常退出后地址失效，避免向已死端口发起请求）。
+    pub fn rest_addr(&self) -> Option<std::net::SocketAddr> {
+        let rest = self.rest.as_ref()?;
+        rest.is_alive().then_some(rest.addr)
+    }
+
+    /// REST 服务是否存活（未启用时为 `false`）。
+    pub fn rest_alive(&self) -> bool {
+        self.rest.as_ref().is_some_and(|s| s.is_alive())
+    }
+
+    /// REST 服务句柄副本（未启用时为 `None`）。外部监督方（如未来的
+    /// manager/运维工具）可据此订阅异常退出通知（`exit_notified`）或
+    /// 探测存活；**关闭责任始终属于运行时**——`shutdown` 为可共享调用
+    /// （`&self`），停机时无条件发送停止信号（评审 P1：外部持有副本
+    /// 不得阻止 REST 随 Collector 一并关闭）。
+    pub fn rest_server(&self) -> Option<Arc<rest_api::RestApiServer>> {
+        self.rest.clone()
+    }
+
     async fn log_health(&self, stage: &str) {
         let h = self.health();
         if h.has_device_errors() {
@@ -330,14 +433,51 @@ impl CollectorRuntime {
         }
     }
 
-    /// 等待停机信号并执行有序停机（§104：Service Restart 语义下的优雅
-    /// 退出）。停机信号来自 `watch::Receiver<bool>`（由 main 挂接系统
-    /// 信号）；发送循环异常终止也会触发停机并返回错误。
+    /// 并行监督运行并在任一终止条件满足时执行有序停机（§104）。
+    ///
+    /// **必须紧跟 `start` 调用**：forward 异常退出与 REST 服务异常
+    /// 退出从启动后立即被监视，不得等到外部停机信号才感知——否则
+    /// REST 已不可用/发送循环已终止时采集仍静默运行（评审 P1）。
+    /// 系统信号（SIGINT/SIGTERM）在本函数内与 forward/REST 监视并行
+    /// 监听。
+    ///
+    /// 终止条件：
+    /// - 系统信号：`ctrl_c`（SIGINT）；SIGTERM 由 main 挂接任务置位
+    ///   `signal`（§104 Service Restart 语义，Windows 不可用时跳过）。
+    /// - 发送循环异常退出（永久性落盘错误等，内部 Result 上报）。
+    /// - REST serve 任务错误退出（API 不可用但采集继续属于静默故障，
+    ///   评审 P2）。正常停机路径（`shutdown` 先发 stop 信号）不触发。
     pub async fn run_until_shutdown(
         mut self,
         mut signal: watch::Receiver<bool>,
     ) -> Result<(), CollectorError> {
+        // REST 异常退出监视（评审 P2）：serve 任务错误退出时通知本
+        // 运行时，触发错误上报与有序停机——API 不可用但采集继续属于
+        // 静默故障。正常停机路径（shutdown 先发 stop 信号）不触发。
+        let mut rest_exit = self.rest.as_ref().map(|s| s.exit_notified());
+        // 启动竞态（评审 P1）：`watch::Receiver` 只报告**订阅后**的新
+        // 变化——若 REST 任务在本函数订阅前已异常退出，通知已置位但
+        // `changed()` 永远不会触发。此处先检查当前存活状态与已置位
+        // 值，任一表明服务已不可用即立即按异常退出处理，不得因错过
+        // 通知而继续采集。
+        if let (Some(rest), Some(rx)) = (self.rest.as_ref(), rest_exit.as_ref()) {
+            if !rest.is_alive() || *rx.borrow() {
+                let msg = "REST 服务在监督启动前已不可用，采集停止（API 不可用）".to_owned();
+                error!(component = "collector", "{msg}");
+                self.stopping.send(true).ok();
+                return Err(match self.shutdown().await {
+                    Ok(()) => CollectorError::Task(msg),
+                    Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+                });
+            }
+        }
         tokio::select! {
+            // 系统信号：SIGINT（Ctrl+C）直接监听；SIGTERM 由 main 挂接
+            // 任务置位 `signal`（Windows 不支持 SIGTERM，main 仅在
+            // UNIX 挂接）。停机信号通道关闭也按停机处理。
+            _ = tokio::signal::ctrl_c() => {
+                info!(component = "collector", "收到 SIGINT（Ctrl+C）");
+            }
             r = signal.changed() => {
                 if r.is_err() {
                     warn!(component = "collector", "停机信号通道关闭，按停机处理");
@@ -364,6 +504,31 @@ impl CollectorRuntime {
                     Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
                 });
             }
+            r = async {
+                match rest_exit.as_mut() {
+                    Some(rx) => match rx.changed().await {
+                        Ok(()) => *rx.borrow(),
+                        // 通道关闭（全部发送端已释放，服务已退出）：按
+                        // 异常处理，不得因忽略通道关闭而继续采集（评审
+                        // P1：订阅竞态与通道关闭情况都不得被漏检）。
+                        Err(_) => true,
+                    },
+                    None => std::future::pending::<bool>().await,
+                }
+            }, if self.rest.is_some() => {
+                if r {
+                    // REST serve 任务错误退出：API 已不可用。错误上报
+                    // （日志 + 返回错误）并触发有序停机，不静默运行
+                    // （评审 P2）。
+                    let msg = "REST 服务异常退出，采集停止（API 不可用）".to_owned();
+                    error!(component = "collector", "{msg}");
+                    self.stopping.send(true).ok();
+                    return Err(match self.shutdown().await {
+                        Ok(()) => CollectorError::Task(msg),
+                        Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+                    });
+                }
+            }
         }
         info!(component = "collector", "收到停机信号，开始有序停机");
         self.shutdown().await
@@ -374,6 +539,16 @@ impl CollectorRuntime {
         self.stopping.send(true).ok();
         // 停机全程的健康快照：字段级取出，避免后续部分 move 的借用冲突。
         let final_health = self.health();
+
+        // 0) REST 接口最先停止（独立任务、有界排空）：拒绝新连接后
+        //    API 不可达，采集/WAL/MQTT 不受影响（§31.5 运行时接入）。
+        //    停机是可共享调用（`shutdown(&self)`）：即使外部监督方持有
+        //    `Arc` 副本，此处也无条件发送停止信号并等待排空——关闭
+        //    责任属于运行时，不得转交给外部副本（评审 P1：外部持有
+        //    句柄时 REST 不得在采集/MQTT/WAL 关闭后继续监听并响应）。
+        if let Some(rest) = self.rest.take() {
+            rest.shutdown().await;
+        }
 
         // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。
         self.scheduler.shutdown().await;

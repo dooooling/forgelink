@@ -1,6 +1,7 @@
 //! 轮询调度器（§22 Poll Scheduler）：统一管理设备轮询任务与停机。
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -66,6 +67,54 @@ impl PollScheduler {
                         error = %error,
                         "轮询任务异常退出"
                     );
+                }
+            }
+            self.cancel = None;
+        }
+    }
+
+    /// 取消全部任务并等待它们结束；所有任务共享**统一截止时间** `grace`
+    /// （评审 P1：按任务分别等待会使总耗时随任务数线性放大——任务数 ×
+    /// grace，失败路径清理仍可能长时间阻塞）。截止时间前等待全部任务
+    /// 自然结束，超时则一次性 `abort` 剩余全部任务，总等待 ≈ grace。
+    ///
+    /// 实现上直接持有原始 `JoinHandle`（评审 P1：`JoinSet` 包装任务被
+    /// `abort_all` 取消时只会丢弃内部句柄，而丢弃句柄**不会**取消 Tokio
+    /// 任务——底层轮询任务会脱离管理继续运行并遗留后台线程，尤其在
+    /// 阻塞 Native Driver 调用或 `shutdown_drain_timeout` 时）。超时必须
+    /// 显式对每个原始句柄调用 `abort`。
+    pub async fn shutdown_with_timeout(&mut self, grace: Duration) {
+        if let Some(cancel) = &self.cancel {
+            cancel.cancel();
+            let deadline = tokio::time::Instant::now() + grace;
+            let mut tasks = self.tasks.drain(..).collect::<Vec<_>>();
+            let mut timed_out = false;
+            for task in &mut tasks {
+                if timed_out {
+                    task.abort();
+                    let _ = (&mut *task).await;
+                    continue;
+                }
+                match tokio::time::timeout_at(deadline, &mut *task).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        warn!(
+                            component = "poll-engine",
+                            error_code = "poll_task_panicked",
+                            error = %error,
+                            "轮询任务异常退出"
+                        );
+                    }
+                    Err(_) => {
+                        timed_out = true;
+                        warn!(
+                            component = "poll-engine",
+                            error_code = "poll_task_shutdown_timeout",
+                            "轮询任务停机等待超时，强制取消全部剩余任务"
+                        );
+                        task.abort();
+                        let _ = (&mut *task).await;
+                    }
                 }
             }
             self.cancel = None;

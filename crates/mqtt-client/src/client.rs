@@ -83,6 +83,25 @@ impl fmt::Display for MqttClientError {
     }
 }
 
+impl MqttClientError {
+    /// 稳定错误码（kebab-case，如 `disconnected`）：不携带连接地址、
+    /// 主题、原因文本等内部细节，可用于外部响应与健康状态（§90.1
+    /// 信息隔离——原始原因仅进日志，经 `diagnostics::redact` 脱敏）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidConfig { .. } => "invalid_config",
+            Self::InvalidTopic { .. } => "invalid_topic",
+            Self::InvalidPayload { .. } => "invalid_payload",
+            Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::Closed => "closed",
+            Self::PublishFailed { .. } => "publish_failed",
+            Self::CollisionOverwritten => "collision_overwritten",
+            Self::Disconnected { .. } => "disconnected",
+            Self::TaskFailed { .. } => "task_failed",
+        }
+    }
+}
+
 impl std::error::Error for MqttClientError {}
 
 /// 一条待发布的请求（带完成通知，保证发布方能感知入队失败、PUBACK

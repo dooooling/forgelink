@@ -58,9 +58,55 @@ const PUBLISH_FAIL_BACKOFF: Duration = Duration::from_millis(200);
 /// 队列，发送循环继续，不阻塞）。
 const PUSH_CAPACITY_WAIT: Duration = Duration::from_millis(500);
 
+/// Driver 错误码白名单（§90.1 信息隔离，评审 P1）：`DriverErrorInfo.code`
+/// 由 Native Plugin 返回——§17.6 `get_last_error_json` 的 `code` 字段是
+/// 任意字符串，可能携带路径、地址、设备细节等敏感内容，不得直接进入
+/// 健康状态与 REST 视图。只有固定集合的稳定码（Core/加载器/轮询引擎
+/// 自身产生 + 已交付 Driver 的稳定码）可以透传；无法识别的统一映射为
+/// `driver_error`（原始码只进脱敏日志）。
+const DRIVER_CODE_WHITELIST: &[&str] = &[
+    // 加载器/ABI/调用类稳定码（driver-loader `LoaderError::code`）。
+    "driver_load_failed",
+    "driver_entry_not_found",
+    "driver_manifest_entry_invalid",
+    "driver_entry_null",
+    "driver_struct_too_small",
+    "driver_abi_incompatible",
+    "driver_manifest_abi_mismatch",
+    "driver_missing_function",
+    "driver_create_failed",
+    "driver_call_failed",
+    "driver_empty_response",
+    "driver_invalid_response",
+    "driver_invalid_handle",
+    "driver_encoding_error",
+    // 轮询引擎生成的稳定码（poll-engine：超时/panic 防御）。
+    "driver_request_timeout",
+    "driver_read_panicked",
+    // 已交付 Driver（modbus）的稳定码（§17.6 错误详情）。
+    "connection_failed",
+    "connection_lost",
+    "timeout",
+    "modbus_exception",
+    "invalid_response",
+    "invalid_address",
+    "config_error",
+    "decode_error",
+];
+
+/// 白名单归一：命中 `DRIVER_CODE_WHITELIST` 原样透传，否则 `driver_error`。
+fn whitelist_driver_code(code: &str) -> &'static str {
+    for known in DRIVER_CODE_WHITELIST {
+        if *known == code {
+            return known;
+        }
+    }
+    "driver_error"
+}
+
 /// 共享健康状态（原子计数 + 短锁小字段，供 `health()` 快照）。
 #[derive(Default)]
-pub(super) struct HealthState {
+pub(crate) struct HealthState {
     pub(super) started_at_ns: AtomicI64,
     mqtt_acked: AtomicU64,
     mqtt_failed: AtomicU64,
@@ -80,9 +126,11 @@ impl HealthState {
         }
     }
 
-    pub(super) fn record_device_error(&self, device_id: &str, err: Option<String>) {
+    /// 记录设备最近失败**稳定错误码**（§90.1：原始错误文本只进脱敏
+    /// 日志，健康状态与 REST 视图不得携带驱动/MQTT 内部细节）。
+    pub(super) fn record_device_error(&self, device_id: &str, code: Option<String>) {
         if let Ok(mut m) = self.device_error.lock() {
-            m.insert(device_id.to_owned(), err);
+            m.insert(device_id.to_owned(), code);
         }
     }
 
@@ -92,12 +140,14 @@ impl HealthState {
         self.inflight.fetch_sub(1, Ordering::Relaxed);
     }
 
-    fn record_failed(&self, at_ns: i64, err: &str) {
+    /// 记录发布失败**稳定错误码**（§90.1：同 `record_device_error`，
+    /// 不保存 `MqttClientError` 原文——可能含 broker 地址/主题等细节）。
+    fn record_failed(&self, at_ns: i64, code: &str) {
         self.mqtt_failed.fetch_add(1, Ordering::Relaxed);
         self.last_failed_at_ns.store(at_ns, Ordering::Relaxed);
         self.inflight.fetch_sub(1, Ordering::Relaxed);
         if let Ok(mut m) = self.last_error.lock() {
-            *m = Some(err.to_owned());
+            *m = Some(code.to_owned());
         }
     }
 
@@ -110,7 +160,7 @@ impl HealthState {
     }
 
     /// 收集健康快照（设备元数据由调用方传入：id/enabled/读取项数/组数）。
-    pub(super) fn snapshot(&self, devices: &[(String, bool, usize, usize)]) -> CollectorHealth {
+    pub(crate) fn snapshot(&self, devices: &[(String, bool, usize, usize)]) -> CollectorHealth {
         let last_batch = self
             .device_last_batch
             .lock()
@@ -220,7 +270,8 @@ async fn pump_event(
                         error = %e,
                         "轮询批次映射失败"
                     );
-                    health.record_device_error(&batch.device_id, Some(format!("映射失败: {e}")));
+                    // 稳定错误码（§90.1：详情只进日志）。
+                    health.record_device_error(&batch.device_id, Some("map_failed".to_owned()));
                 }
             }
         }
@@ -233,7 +284,13 @@ async fn pump_event(
             let Some(instance) = manager.get(device_id) else {
                 return;
             };
-            health.record_device_error(device_id, Some(error.message.clone()));
+            // 稳定错误码（§90.1：DriverErrorInfo.message 可能含地址等
+            // 内部细节，只进日志；`code` 经白名单归一——Plugin 可返回
+            // 任意字符串，无法识别的映射为 driver_error，评审 P1）。
+            health.record_device_error(
+                device_id,
+                Some(whitelist_driver_code(&error.code).to_owned()),
+            );
             match device_manager::map_failure(instance, items, error, &ctx, sequences) {
                 Ok(observations) => ingest_all(pipeline, observations).await,
                 Err(e) => {
@@ -687,14 +744,14 @@ async fn forward_batch(
                 Some(deadline) => tokio::select! {
                     biased;
                     _ = stopping_rx.changed() => {
-                        health.record_failed(at_ns, "停机中断在途发布等待");
+                        health.record_failed(at_ns, "shutdown_interrupted_publish");
                         return Err(CollectorError::Task(
                             "停机中断在途发布等待，记录保留待下次启动补传".to_owned(),
                         ));
                     }
                     r = tokio::time::timeout_at(deadline, receipt.acked()) => match r {
                         Err(_) => {
-                            health.record_failed(at_ns, "排空期限内未收到 PUBACK");
+                            health.record_failed(at_ns, "drain_puback_timeout");
                             return Err(CollectorError::Task(
                                 "排空期限内未收到 PUBACK，记录保留待下次启动补传".to_owned(),
                             ));
@@ -705,7 +762,7 @@ async fn forward_batch(
                 None => tokio::select! {
                     biased;
                     _ = stopping_rx.changed() => {
-                        health.record_failed(at_ns, "停机中断在途发布等待");
+                        health.record_failed(at_ns, "shutdown_interrupted_publish");
                         return Err(CollectorError::Task(
                             "停机中断在途发布等待，记录保留待下次启动补传".to_owned(),
                         ));
@@ -729,7 +786,9 @@ async fn forward_batch(
                     // Closed（停机）/ Disconnected / CollisionOverwritten：
                     // 不得删除，放回队头按序补传（§31.3）。
                     buffer.requeue(stored.local_seq).await?;
-                    health.record_failed(at_ns, &e.to_string());
+                    // 稳定错误码（§90.1：`e` 的 Display 可能含 broker
+                    // 地址/主题等细节，只进日志）。
+                    health.record_failed(at_ns, e.code());
                     tokio::time::sleep(PUBLISH_FAIL_BACKOFF).await;
                     Err(CollectorError::Mqtt(e))
                 }
@@ -737,7 +796,7 @@ async fn forward_batch(
         }
         Err(e) => {
             buffer.requeue(stored.local_seq).await?;
-            health.record_failed(at_ns, &e.to_string());
+            health.record_failed(at_ns, e.code());
             tokio::time::sleep(PUBLISH_FAIL_BACKOFF).await;
             Err(CollectorError::Mqtt(e))
         }
@@ -767,5 +826,56 @@ pub(super) async fn run_heartbeat(
             replayed = h.buffer.replayed_batches,
             "Collector 心跳"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::whitelist_driver_code;
+
+    /// 白名单内的稳定码必须原样透传（§90.1：Core/加载器/轮询引擎与
+    /// 已交付 Driver 的码是可信集合）。
+    #[test]
+    fn whitelist_passes_known_stable_codes() {
+        for code in [
+            // 加载器/调用类。
+            "driver_load_failed",
+            "driver_call_failed",
+            "driver_invalid_response",
+            "driver_encoding_error",
+            // 轮询引擎。
+            "driver_request_timeout",
+            "driver_read_panicked",
+            // modbus Driver。
+            "connection_failed",
+            "connection_lost",
+            "timeout",
+            "modbus_exception",
+            "config_error",
+            "decode_error",
+        ] {
+            assert_eq!(whitelist_driver_code(code), code, "{code} 应透传");
+        }
+    }
+
+    /// Plugin 可返回任意字符串（§17.6）：路径、地址、自由文本、非
+    /// 白名单格式的码（含文档示例的大写风格）一律归一为 driver_error，
+    /// 不得原样进入 REST 视图（评审 P1）。
+    #[test]
+    fn whitelist_maps_unknown_plugin_codes_to_driver_error() {
+        for code in [
+            "CONNECT_REFUSED",
+            "MODBUS_EXCEPTION",
+            "C:\\secret\\driver\\path",
+            "127.0.0.1:502 read failed",
+            "connection refused: tcp 10.0.0.1:502",
+            "",
+        ] {
+            assert_eq!(
+                whitelist_driver_code(code),
+                "driver_error",
+                "{code:?} 应归一"
+            );
+        }
     }
 }
