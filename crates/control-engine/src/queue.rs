@@ -104,12 +104,15 @@ struct QueueInner {
 pub(crate) struct DeviceQueue {
     device_id: DeviceId,
     inner: Mutex<QueueInner>,
+    /// 引擎级停机标志（P1-A：停机在排空后仍可能被 `get_or_create_queue` 重建
+    /// 队列——该标志由 worker/enqueue 检查，保证停机后新建队列也不会接收请求）。
+    closed_flag: Arc<AtomicBool>,
     notify: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DeviceQueue {
-    pub fn new(device_id: DeviceId, capacity: usize) -> Self {
+    pub fn new(device_id: DeviceId, capacity: usize, closed_flag: Arc<AtomicBool>) -> Self {
         Self {
             device_id,
             inner: Mutex::new(QueueInner {
@@ -119,6 +122,7 @@ impl DeviceQueue {
                 len: 0,
                 running: None,
             }),
+            closed_flag,
             notify: Notify::new(),
             worker: Mutex::new(None),
         }
@@ -132,7 +136,9 @@ impl DeviceQueue {
     ) -> Result<(), EnqueueError> {
         {
             let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
-            if inner.closed {
+            // P1-A：引擎已停机则拒绝——停机排空后重建的队列也必须拒绝，
+            // 否则请求在停机后仍被接收且不被任何 worker join。
+            if inner.closed || self.closed_flag.load(Ordering::SeqCst) {
                 return Err(EnqueueError::Closed);
             }
             if inner.len >= inner.capacity {
@@ -210,7 +216,7 @@ impl DeviceQueue {
                         error_code = "queue_worker_join_timeout",
                         "控制队列 worker 停机超时，已强制中止并结算遗留请求"
                     );
-                    self.settle_abandoned(ctx);
+                    self.settle_abandoned(ctx).await;
                 }
             }
         }
@@ -220,7 +226,7 @@ impl DeviceQueue {
     /// （与 P1-7 一致：执行器可能在飞行中，不得宣称未执行）；排队条目从未
     /// 执行 → `Cancelled`。结算在释放队列锁之后进行（`settle_entry` 会访问
     /// Journal/审计/active，不得持有队列锁）。
-    fn settle_abandoned(&self, ctx: &Arc<EngineContext>) {
+    async fn settle_abandoned(&self, ctx: &Arc<EngineContext>) {
         let running: Option<QueuedEntry>;
         let mut queued: Vec<QueuedEntry> = Vec::new();
         let mut taken: usize = 0;
@@ -244,10 +250,11 @@ impl DeviceQueue {
                     "QUEUE_WORKER_ABORTED",
                     "控制队列强制中止，执行结果未知（驱动可能已下发）",
                 ),
-            );
+            )
+            .await;
         }
         for entry in queued {
-            settle_entry(ctx, entry, RunResult::Cancelled);
+            settle_entry(ctx, entry, RunResult::Cancelled).await;
         }
     }
 
@@ -268,6 +275,12 @@ impl DeviceQueue {
             // 取最高优先级、FIFO 顺序的请求；已取消/已过期的就地弹出并结算。
             let picked: Option<Picked> = {
                 let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+                // P1-A：引擎已停机时关闭本队列——排空后 worker 退出，即使队列
+                // 在停机排空后被重建（enqueue 已拒绝，不会再有新条目），
+                // worker 也不会残留运行。
+                if self.closed_flag.load(Ordering::SeqCst) {
+                    inner.closed = true;
+                }
                 if inner.closed && inner.len == 0 {
                     return;
                 }
@@ -300,10 +313,10 @@ impl DeviceQueue {
 
             match picked.kind {
                 PickedKind::Cancelled => {
-                    settle_entry(ctx, picked.entry, RunResult::Cancelled);
+                    settle_entry(ctx, picked.entry, RunResult::Cancelled).await;
                 }
                 PickedKind::Expired => {
-                    settle_entry(ctx, picked.entry, RunResult::Timeout);
+                    settle_entry(ctx, picked.entry, RunResult::Timeout).await;
                 }
                 PickedKind::Ready => {
                     {
@@ -315,7 +328,7 @@ impl DeviceQueue {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                         inner.running = None;
                     }
-                    settle_entry(ctx, picked.entry, result);
+                    settle_entry(ctx, picked.entry, result).await;
                 }
             }
         }
@@ -517,7 +530,7 @@ async fn run_operation(
 }
 
 /// 结算：补全时间戳 → 幂等 Journal → 审计 → 回传结果（§80.1、§89、§90）。
-fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
+async fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
     let completed_at_ns = now_ns();
     let mut result = match run {
         RunResult::Done(result) => result,
@@ -570,7 +583,8 @@ fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
     result.namespace = entry.key.namespace.clone();
 
     // 幂等结算（§80.1：下发前已持久化，完成后更新状态与结果）。
-    if let Err(e) = ctx.journal.settle(&entry.key, &result) {
+    // P2-H：磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
+    if let Err(e) = crate::journal::settle_record(&ctx.journal, &entry.key, &result).await {
         warn!(
             component = "control-engine",
             request_id = %entry.key.request_id,

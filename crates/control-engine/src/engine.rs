@@ -30,9 +30,7 @@ use crate::journal::{ControlJournal, IdempotencyKey, JournalDecision, payload_ha
 use crate::policy::ControlPolicy;
 use crate::queue::{AuditMeta, CancelOutcome, DeviceQueue, EnqueueError, QueuedEntry, now_ns};
 use crate::role::Authorizer;
-use crate::validate::{
-    ValidatedOperation, ValidationError, validate_command, validate_property_write,
-};
+use crate::validate::{ValidatedOperation, validate_command, validate_property_write};
 
 /// 引擎内部上下文（提交后的执行路径共享）。
 pub(crate) struct EngineContext {
@@ -207,7 +205,7 @@ struct Inner {
     authorizer: Arc<dyn Authorizer>,
     context: Arc<EngineContext>,
     queues: Mutex<HashMap<DeviceId, Arc<DeviceQueue>>>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 /// 控制引擎（§81 统一入口）。
@@ -242,7 +240,7 @@ impl ControlEngine {
                 authorizer: config.authorizer,
                 context,
                 queues: Mutex::new(HashMap::new()),
-                closed: AtomicBool::new(false),
+                closed: Arc::new(AtomicBool::new(false)),
             }),
         }
     }
@@ -292,11 +290,15 @@ impl ControlEngine {
                 .as_nanos()
                 .min(i64::MAX as u128) as i64,
         );
-        match self
-            .inner
-            .context
-            .journal
-            .try_insert(&key, hash.clone(), now, expires)
+        // P2-H：幂等登记的磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
+        match crate::journal::insert_record(
+            &self.inner.context.journal,
+            &key,
+            hash.clone(),
+            now,
+            expires,
+        )
+        .await
         {
             Err(e) => {
                 // P1-1：幂等记录持久化失败不得继续下发（进程崩溃后缺少记录，
@@ -307,13 +309,15 @@ impl ControlEngine {
                     error_code = "journal_insert_failed",
                     "幂等记录持久化失败: {e}"
                 );
-                return Ok(self.reject(
-                    &request,
-                    ctx,
-                    &key,
-                    "JOURNAL_UNAVAILABLE",
-                    "幂等记录持久化失败，控制请求被拒绝".to_owned(),
-                ));
+                return Ok(self
+                    .reject(
+                        &request,
+                        ctx,
+                        &key,
+                        "JOURNAL_UNAVAILABLE",
+                        "幂等记录持久化失败，控制请求被拒绝".to_owned(),
+                    )
+                    .await);
             }
             Ok(JournalDecision::Duplicate(entry)) => {
                 // 同 key + 同 payload：返回已有结果/状态，不重复执行（§80.1）。
@@ -365,56 +369,43 @@ impl ControlEngine {
 
         // 3. 设备存在且已启用（§4.2）。
         let Some(device_info) = self.inner.catalog.device(&request.device_id) else {
-            return Ok(self.reject_with_shared(
-                &request,
-                ctx,
-                &key,
-                Some(&shared),
-                "DEVICE_NOT_FOUND",
-                format!("设备 {} 不存在", request.device_id),
-            ));
+            return Ok(self
+                .reject_with_shared(
+                    &request,
+                    ctx,
+                    &key,
+                    Some(&shared),
+                    "DEVICE_NOT_FOUND",
+                    format!("设备 {} 不存在", request.device_id),
+                )
+                .await);
         };
         if !device_info.enabled {
-            return Ok(self.reject_with_shared(
-                &request,
-                ctx,
-                &key,
-                Some(&shared),
-                "DEVICE_DISABLED",
-                format!("设备 {} 已禁用", request.device_id),
-            ));
+            return Ok(self
+                .reject_with_shared(
+                    &request,
+                    ctx,
+                    &key,
+                    Some(&shared),
+                    "DEVICE_DISABLED",
+                    format!("设备 {} 已禁用", request.device_id),
+                )
+                .await);
         }
 
         // 4. 授权（§83、§81 链路顺序）——在 Profile 校验与前置条件之前完成：
         //    未授权用户不得触发设备状态检查（前置条件）或获得校验类信息。
         //    命令的风险等级需要一次静态 Profile 查询（不触设备状态）。
-        let kind = match raw_operation_kind(&device_info.profile, &request.operation) {
-            Ok(kind) => kind,
-            Err(e) => {
-                return Ok(self.reject_with_shared(
-                    &request,
-                    ctx,
-                    &key,
-                    Some(&shared),
-                    e.code(),
-                    e.to_string(),
-                ));
-            }
-        };
+        let kind = raw_operation_kind(&device_info.profile, &request.operation);
         let required = self.inner.context.policy.required_role(kind);
         if let Err(e) = self
             .inner
             .authorizer
             .authorize(&ctx.subject, required, &request.device_id)
         {
-            return Ok(self.reject_with_shared(
-                &request,
-                ctx,
-                &key,
-                Some(&shared),
-                e.code,
-                e.message,
-            ));
+            return Ok(self
+                .reject_with_shared(&request, ctx, &key, Some(&shared), e.code, e.message)
+                .await);
         }
 
         // 5. 校验与映射（§75/§76/§84；全部在 Driver 前完成）。
@@ -423,14 +414,16 @@ impl ControlEngine {
                 match validate_property_write(&device_info.profile, payload) {
                     Ok(op) => op,
                     Err(e) => {
-                        return Ok(self.reject_with_shared(
-                            &request,
-                            ctx,
-                            &key,
-                            Some(&shared),
-                            e.code(),
-                            e.to_string(),
-                        ));
+                        return Ok(self
+                            .reject_with_shared(
+                                &request,
+                                ctx,
+                                &key,
+                                Some(&shared),
+                                e.code(),
+                                e.to_string(),
+                            )
+                            .await);
                     }
                 }
             }
@@ -438,14 +431,16 @@ impl ControlEngine {
                 let op = match validate_command(&device_info.profile, payload) {
                     Ok(op) => op,
                     Err(e) => {
-                        return Ok(self.reject_with_shared(
-                            &request,
-                            ctx,
-                            &key,
-                            Some(&shared),
-                            e.code(),
-                            e.to_string(),
-                        ));
+                        return Ok(self
+                            .reject_with_shared(
+                                &request,
+                                ctx,
+                                &key,
+                                Some(&shared),
+                                e.code(),
+                                e.to_string(),
+                            )
+                            .await);
                     }
                 };
                 // 前置条件（§85）：入队前检查，失败在 Driver 前拒绝。
@@ -454,14 +449,16 @@ impl ControlEngine {
                         unreachable!("CommandExecute 校验结果必为 Execute");
                     };
                     if let Err(e) = checker.check(&request.device_id, preconditions) {
-                        return Ok(self.reject_with_shared(
-                            &request,
-                            ctx,
-                            &key,
-                            Some(&shared),
-                            "PRECONDITION_FAILED",
-                            e.message,
-                        ));
+                        return Ok(self
+                            .reject_with_shared(
+                                &request,
+                                ctx,
+                                &key,
+                                Some(&shared),
+                                "PRECONDITION_FAILED",
+                                e.message,
+                            )
+                            .await);
                     }
                 }
                 op
@@ -479,7 +476,8 @@ impl ControlEngine {
         // 7. 审计元数据（提交时预生成，§90）。
         let audit_meta = audit_meta_for(&request, validated.risk_level());
 
-        // 8. 入队（§87 每设备有界队列；同设备串行）。
+        // 8. 入队（§87 每设备有界队列；同设备串行）。P1-A：`get_or_create_queue`
+        //    传入引擎级停机标志——停机排空后重建的队列同样拒绝入队。
         let queue = self.get_or_create_queue(&request.device_id);
         let entry = QueuedEntry {
             key: key.clone(),
@@ -508,14 +506,16 @@ impl ControlEngine {
             Err(EnqueueError::Full { capacity }) => {
                 // 队列满：拒绝并结算（reject_with_shared 会结算 shared 并
                 // 移除 active——幂等等待者获得一致的拒绝结果）。
-                Ok(self.reject_with_shared(
-                    &request,
-                    ctx,
-                    &key,
-                    Some(&shared),
-                    "QUEUE_FULL",
-                    format!("设备控制队列已满（容量 {capacity}）"),
-                ))
+                Ok(self
+                    .reject_with_shared(
+                        &request,
+                        ctx,
+                        &key,
+                        Some(&shared),
+                        "QUEUE_FULL",
+                        format!("设备控制队列已满（容量 {capacity}）"),
+                    )
+                    .await)
             }
             Err(EnqueueError::Closed) => {
                 // 入队失败且已登记：结算为 Indeterminate（结果未知），
@@ -523,7 +523,18 @@ impl ControlEngine {
                 // shared 一并写入——并发幂等等待者不会永久挂起。
                 let result =
                     interrupted_result(&request, "QUEUE_CLOSED", "引擎停机中，请求未能入队执行");
-                let _ = self.inner.context.journal.settle(&key, &result);
+                // P2-H：结算落盘在阻塞线程池执行；失败只记日志（结果本就是
+                // Indeterminate，重启恢复语义一致，无需再次降级）。
+                if let Err(e) =
+                    crate::journal::settle_record(&self.inner.context.journal, &key, &result).await
+                {
+                    tracing::warn!(
+                        component = "control-engine",
+                        request_id = %key.request_id,
+                        error_code = "journal_settle_failed",
+                        "停机拒绝结算落盘失败: {e}"
+                    );
+                }
                 self.inner
                     .context
                     .active
@@ -615,6 +626,7 @@ impl ControlEngine {
                 Arc::new(DeviceQueue::new(
                     device_id.clone(),
                     self.inner.context.policy.queue_capacity,
+                    self.inner.closed.clone(),
                 ))
             })
             .clone()
@@ -623,7 +635,7 @@ impl ControlEngine {
     /// 校验/授权/前置条件/队列满等 Driver 前的拒绝（§84、§85、§86）。
     ///
     /// 以 `Rejected` 结算：幂等 Journal 记录 + 审计（§90），并立即返回。
-    fn reject(
+    async fn reject(
         &self,
         request: &ControlRequest,
         ctx: &SubmitContext,
@@ -632,11 +644,12 @@ impl ControlEngine {
         message: String,
     ) -> ControlReceipt {
         self.reject_with_shared(request, ctx, key, None, code, message)
+            .await
     }
 
     /// 与 [`Self::reject`] 相同，但额外写入 shared（供已登记的 active 等待者
     /// 获得一致的拒绝结果，不永久挂起；§87 队列满场景）。
-    fn reject_with_shared(
+    async fn reject_with_shared(
         &self,
         request: &ControlRequest,
         ctx: &SubmitContext,
@@ -645,7 +658,7 @@ impl ControlEngine {
         code: &str,
         message: String,
     ) -> ControlReceipt {
-        let result = ControlResult {
+        let mut result = ControlResult {
             request_id: request.request_id.clone(),
             namespace: request.namespace.clone(),
             device_id: request.device_id.clone(),
@@ -659,8 +672,29 @@ impl ControlEngine {
                 details: None,
             }),
         };
-        // 幂等结算（§80.1：拒绝同样是终态）。
-        let _ = self.inner.context.journal.settle(key, &result);
+        // 幂等结算（§80.1：拒绝同样是终态）。P2-H：落盘在阻塞线程池执行。
+        if let Err(e) =
+            crate::journal::settle_record(&self.inner.context.journal, key, &result).await
+        {
+            tracing::warn!(
+                component = "control-engine",
+                request_id = %key.request_id,
+                error_code = "journal_settle_failed",
+                "拒绝结算落盘失败: {e}"
+            );
+            // P2-G：结算失败不得宣称已以 Rejected 终态落盘——当前进程与重启
+            // 恢复（Indeterminate）必须一致。降级为 Indeterminate（原始错误只
+            // 进日志，不进入北向结果）。
+            result = ControlResult {
+                status: ControlStatus::Indeterminate,
+                error: Some(ControlError {
+                    code: "JOURNAL_SETTLE_FAILED".to_owned(),
+                    message: "幂等结算持久化失败，结果不确定".to_owned(),
+                    details: None,
+                }),
+                ..result
+            };
+        }
         // 审计（§90：每个反向控制必须记录）。
         let audit_meta = audit_meta_for(request, None);
         self.inner.context.audit.record(crate::audit::build_event(
@@ -695,22 +729,26 @@ impl ControlEngine {
 }
 
 /// 由请求操作预生成审计元数据（§90）。
+///
+/// P1-B：命令不存在时按最严格风险等级（`Critical`）授权——未授权用户探测
+/// 命令时得到的是权限不足而非"命令不存在"，无法区分两者；命令存在性只对
+/// 已获授权的用户（校验阶段）可见。
 fn raw_operation_kind(
     profile: &profile_engine::DeviceProfile,
     operation: &ControlOperation,
-) -> Result<crate::policy::OperationKind, ValidationError> {
+) -> crate::policy::OperationKind {
     match operation {
-        ControlOperation::PropertyWrite(_) => Ok(crate::policy::OperationKind::PropertyWrite),
+        ControlOperation::PropertyWrite(_) => crate::policy::OperationKind::PropertyWrite,
         ControlOperation::CommandExecute(payload) => {
             // 静态 Profile 查询（不触设备状态）：命令风险等级用于授权（§83）。
-            let descriptor = profile
+            profile
                 .commands
                 .iter()
                 .find(|c| c.id == payload.command)
-                .ok_or_else(|| ValidationError::CommandNotFound {
-                    command: payload.command.clone(),
-                })?;
-            Ok(crate::policy::OperationKind::Command(descriptor.risk_level))
+                .map(|c| crate::policy::OperationKind::Command(c.risk_level))
+                .unwrap_or(crate::policy::OperationKind::Command(
+                    observation_model::CommandRiskLevel::Critical,
+                ))
         }
     }
 }

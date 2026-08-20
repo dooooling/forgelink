@@ -104,6 +104,9 @@ pub enum ValidationError {
         min: Option<f64>,
         max: Option<f64>,
     },
+    /// 参数包含非有限浮点（NaN/±Inf，P1-C）——无法编码为合法协议值
+    /// 且会破坏范围比较，拒绝（不得转为 JSON null 静默透传）。
+    ParameterNotFinite { command: String, parameter: String },
     /// Profile 缩放配置非法（加载时已拦截，防御性路径）。
     ProfileConfiguration { path: PropertyPath, reason: String },
 }
@@ -123,6 +126,7 @@ impl ValidationError {
             ValidationError::ParameterTypeMismatch { .. } => "PARAMETER_TYPE_MISMATCH",
             ValidationError::DuplicateParameter { .. } => "DUPLICATE_PARAMETER",
             ValidationError::ParameterOutOfRange { .. } => "PARAMETER_OUT_OF_RANGE",
+            ValidationError::ParameterNotFinite { .. } => "PARAMETER_NOT_FINITE",
             ValidationError::ProfileConfiguration { .. } => "PROFILE_CONFIGURATION",
         }
     }
@@ -181,6 +185,9 @@ impl std::fmt::Display for ValidationError {
                     f,
                     "命令 {command} 参数 {parameter} 的值 {value} 超出范围 min={min:?} max={max:?}"
                 )
+            }
+            ValidationError::ParameterNotFinite { command, parameter } => {
+                write!(f, "命令 {command} 参数 {parameter} 不是有限数值（NaN/Inf）")
             }
             ValidationError::ProfileConfiguration { path, reason } => {
                 write!(f, "属性 {path} 的 Profile 配置非法: {reason}")
@@ -267,6 +274,14 @@ pub fn validate_command(
                 parameter: param.name.clone(),
             });
         };
+        // P1-C：非有限浮点（NaN/±Inf）无法编码为合法协议值，且会破坏范围比较
+        // ——在类型检查前直接拒绝（含复合类型中的嵌套值，递归检测）。
+        if value_has_non_finite(&param.value) {
+            return Err(ValidationError::ParameterNotFinite {
+                command: request.command.clone(),
+                parameter: param.name.clone(),
+            });
+        }
         if !value_matches_type(&param.value, &desc.data_type) {
             return Err(ValidationError::ParameterTypeMismatch {
                 command: request.command.clone(),
@@ -336,6 +351,17 @@ fn value_to_json(value: &Value) -> serde_json::Value {
                 .map(|f| (f.name.clone(), value_to_json(&f.value)))
                 .collect(),
         ),
+    }
+}
+
+/// 是否含非有限浮点（NaN/±Inf，P1-C）。递归检测复合类型（Array/Struct）。
+fn value_has_non_finite(value: &Value) -> bool {
+    match value {
+        Value::F32(v) => !v.is_finite(),
+        Value::F64(v) => !v.is_finite(),
+        Value::Array(items) => items.iter().any(value_has_non_finite),
+        Value::Struct(fields) => fields.iter().any(|f| value_has_non_finite(&f.value)),
+        _ => false,
     }
 }
 
@@ -1036,6 +1062,79 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "PARAMETER_TYPE_MISMATCH");
+    }
+
+    #[test]
+    fn command_rejects_non_finite_parameter() {
+        // P1-C：为 drive.reset 追加一个 F64 参数——NaN/±Inf 必须拒绝
+        // （不得转为 JSON null 静默透传），复合类型中的嵌套值同样拒绝。
+        let profile = profile_for_test();
+        let mut profile = (*profile).clone();
+        let command = profile
+            .commands
+            .iter_mut()
+            .find(|c| c.id == "drive.reset")
+            .unwrap();
+        command
+            .parameters
+            .push(observation_model::CommandParameterDescriptor {
+                name: "speed".to_owned(),
+                data_type: DataType::F64,
+                required: false,
+                min: None,
+                max: None,
+            });
+
+        for value in [
+            Value::F64(f64::NAN),
+            Value::F64(f64::INFINITY),
+            Value::F64(f64::NEG_INFINITY),
+        ] {
+            let err = validate_command(
+                &profile,
+                &CommandRequest {
+                    command: "drive.reset".to_owned(),
+                    parameters: vec![
+                        param("ack", Value::Bool(true)),
+                        param("speed", value.clone()),
+                    ],
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.code(),
+                "PARAMETER_NOT_FINITE",
+                "非有限浮点 {value:?} 必须拒绝"
+            );
+        }
+        // 嵌套在 Array 中的 NaN 同样拒绝（递归检测）。
+        let err = validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "speed",
+                        Value::Array(vec![Value::F64(1.0), Value::F64(f64::NAN)]),
+                    ),
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "PARAMETER_NOT_FINITE");
+        // 有限值正常通过。
+        validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param("speed", Value::F64(12.5)),
+                ],
+            },
+        )
+        .expect("有限浮点应通过");
     }
 
     #[test]

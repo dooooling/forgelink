@@ -18,9 +18,9 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use observation_model::{ControlResult, ControlStatus, DeviceId, TimestampNs};
+use observation_model::{ControlError, ControlResult, ControlStatus, DeviceId, TimestampNs};
 use serde::{Deserialize, Serialize};
 
 /// 幂等键（§80.1）。
@@ -200,25 +200,25 @@ struct FileJournalInner {
 impl FileJournal {
     /// 打开（或创建）Journal 文件并重放已有记录。
     ///
-    /// `now_ns` 用于判定过期；重放后若发现过期/损坏行，会压缩重写文件。
+    /// `now_ns` 用于判定过期；重放后若发现过期记录，会压缩重写文件。
+    /// 损坏行不静默跳过（P1-F：丢弃 Insert 会重复下发控制动作），直接返回
+    /// [`JournalError::Corrupt`]。
     pub fn open(path: &Path, now_ns: TimestampNs) -> Result<Self, JournalError> {
         let mut entries: HashMap<IdempotencyKey, JournalEntry> = HashMap::new();
         let mut need_compact = false;
 
         if path.exists() {
             let reader = BufReader::new(File::open(path)?);
-            for line in reader.lines() {
+            for (line_no, line) in reader.lines().enumerate() {
+                let line_no = line_no + 1;
                 let line = line.map_err(JournalError::Io)?;
                 if line.trim().is_empty() {
                     continue;
                 }
-                let record: Record = match serde_json::from_str(&line) {
-                    Ok(r) => r,
-                    Err(_) => {
-                        need_compact = true;
-                        continue;
-                    }
-                };
+                // P1-F：损坏行必须 fail-closed——静默丢弃可能丢失已执行请求的
+                // Insert 记录，重试会重复下发控制动作。返回 Corrupt{line}。
+                let record: Record = serde_json::from_str(&line)
+                    .map_err(|_| JournalError::Corrupt { line: line_no })?;
                 match record {
                     Record::Insert {
                         key,
@@ -256,10 +256,26 @@ impl FileJournal {
             }
         }
 
-        // 未结算记录恢复为 Indeterminate（结果不确定，禁止盲目重放）。
+        // 未结算记录恢复为 Indeterminate（结果不确定，禁止盲目重放）并生成
+        // 可见结果——`status()` 只返回 `entry.result`，P1-E：调用方必须能查询
+        // 到"不确定"状态，而不是得到 None。
         for entry in entries.values_mut() {
             if entry.status == ControlStatus::Accepted || entry.status == ControlStatus::Running {
                 entry.status = ControlStatus::Indeterminate;
+                entry.result = Some(ControlResult {
+                    request_id: entry.key.request_id.clone(),
+                    namespace: entry.key.namespace.clone(),
+                    device_id: entry.key.device_id.clone(),
+                    status: ControlStatus::Indeterminate,
+                    started_at_ns: None,
+                    completed_at_ns: Some(now_ns),
+                    result: None,
+                    error: Some(ControlError {
+                        code: "EXECUTION_INTERRUPTED".to_owned(),
+                        message: "执行状态未知（进程可能已重启）".to_owned(),
+                        details: None,
+                    }),
+                });
             }
         }
 
@@ -387,16 +403,21 @@ impl ControlJournal for FileJournal {
 
     fn settle(&self, key: &IdempotencyKey, result: &ControlResult) -> Result<(), JournalError> {
         let mut inner = self.inner.lock().expect("FileJournal 锁被毒化");
-        let Some(entry) = inner.entries.get_mut(key) else {
+        if !inner.entries.contains_key(key) {
             return Ok(());
-        };
-        entry.status = result.status;
-        entry.result = Some(result.clone());
+        }
+        // P1-D：先写盘、成功后改内存——写盘失败时内存仍保持 Running，
+        // 与磁盘（Running）一致，避免"当前进程宣称成功、重启恢复 Indeterminate"
+        // 的内外不一致。
         let record = Record::Settle {
             key: key.clone(),
             result: result.clone(),
         };
-        Self::write_record(&mut inner, &record)
+        Self::write_record(&mut inner, &record)?;
+        let entry = inner.entries.get_mut(key).expect("已确认存在");
+        entry.status = result.status;
+        entry.result = Some(result.clone());
+        Ok(())
     }
 
     fn get(&self, key: &IdempotencyKey) -> Option<JournalEntry> {
@@ -415,6 +436,38 @@ impl ControlJournal for FileJournal {
         }
         removed
     }
+}
+
+/// 在阻塞线程池上执行幂等登记（P2-H：`write_all`/`flush`/`sync_all` 等磁盘 I/O
+/// 不占用 Tokio worker 线程；std Mutex 的等待也在阻塞线程上发生，不阻塞调度器）。
+pub(crate) async fn insert_record(
+    journal: &Arc<dyn ControlJournal>,
+    key: &IdempotencyKey,
+    payload_hash: String,
+    created_at_ns: TimestampNs,
+    expires_at_ns: TimestampNs,
+) -> Result<JournalDecision, JournalError> {
+    let journal = journal.clone();
+    let key = key.clone();
+    tokio::task::spawn_blocking(move || {
+        journal.try_insert(&key, payload_hash, created_at_ns, expires_at_ns)
+    })
+    .await
+    .expect("Journal 阻塞任务不可取消")
+}
+
+/// 在阻塞线程池上执行幂等结算（P2-H，同上）。
+pub(crate) async fn settle_record(
+    journal: &Arc<dyn ControlJournal>,
+    key: &IdempotencyKey,
+    result: &ControlResult,
+) -> Result<(), JournalError> {
+    let journal = journal.clone();
+    let key = key.clone();
+    let result = result.clone();
+    tokio::task::spawn_blocking(move || journal.settle(&key, &result))
+        .await
+        .expect("Journal 阻塞任务不可取消")
 }
 
 /// 日志记录（JSONL 行的种类）。
@@ -596,8 +649,47 @@ mod tests {
             let journal = FileJournal::open(&path, 2_000_000).unwrap();
             let entry = journal.get(&key("cmd-1")).unwrap();
             assert_eq!(entry.status, ControlStatus::Indeterminate);
-            assert_eq!(entry.result, None);
+            // P1-E：恢复时生成可见结果（`status()` 只返回 `entry.result`），
+            // 调用方必须能查询到"不确定"，而不是 None。
+            let result = entry.result.expect("恢复后应生成 Indeterminate 结果");
+            assert_eq!(result.status, ControlStatus::Indeterminate);
+            assert_eq!(result.error.unwrap().code, "EXECUTION_INTERRUPTED");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_journal_corrupt_line_fails_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "forge-control-journal-{}-corrupt",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+
+        {
+            let journal = FileJournal::open(&path, 1_000).unwrap();
+            let k = key("cmd-1");
+            journal
+                .try_insert(&k, "hash-a".to_owned(), 0, 10_000_000)
+                .unwrap();
+            journal
+                .settle(&k, &result_for("cmd-1", ControlStatus::Succeeded))
+                .unwrap();
+        }
+        // 追加一行损坏记录（截断的 JSON）——模拟磁盘/断电损坏。
+        {
+            use std::io::Write;
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(file, "{{truncated").unwrap();
+        }
+        // P1-F：损坏行 fail-closed——静默跳过可能丢失已执行请求的 Insert，
+        // 重试将重复下发控制动作。
+        let err = FileJournal::open(&path, 2_000_000).unwrap_err();
+        assert!(
+            matches!(err, JournalError::Corrupt { line: 3 }),
+            "损坏行应返回 Corrupt 错误，实际 {err:?}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

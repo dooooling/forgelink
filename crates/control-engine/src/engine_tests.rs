@@ -475,7 +475,9 @@ async fn validation_failures_rejected_before_driver() {
     cases.push((
         "unknown-command".to_owned(),
         cmd_unknown,
-        "COMMAND_NOT_FOUND",
+        // P1-B：未授权用户（Operator 不足以执行 Critical 级命令）探测未知命令
+        // 时不得泄露命令是否存在——统一以权限不足拒绝。
+        "INSUFFICIENT_ROLE",
     ));
     let mut cmd_missing = command_request("r-6", true);
     let ControlOperation::CommandExecute(c) = &mut cmd_missing.operation else {
@@ -496,6 +498,37 @@ async fn validation_failures_rejected_before_driver() {
         );
     }
     assert_eq!(executor.call_count(), 0, "Driver 前拒绝：执行器不得被调用");
+
+    // P1-B：已获授权（Administrator）的用户探测未知命令时才可见
+    // COMMAND_NOT_FOUND（命令存在性不向未授权用户泄露）。
+    let admin_executor = MockExecutor::new();
+    admin_executor.release();
+    let admin_engine = engine_with(
+        catalog(),
+        authorizer(Role::Administrator),
+        Arc::new(InMemoryJournal::new()),
+        admin_executor.clone(),
+        Arc::new(MemoryAuditSink::new()),
+        default_policy(),
+    );
+    let mut cmd_unknown_admin = command_request("r-8", true);
+    let ControlOperation::CommandExecute(c) = &mut cmd_unknown_admin.operation else {
+        unreachable!()
+    };
+    c.command = "drive.foo".to_owned();
+    let receipt = admin_engine
+        .submit(cmd_unknown_admin, &context())
+        .await
+        .unwrap();
+    assert!(receipt.is_ready(), "已授权用户探测未知命令应即时拒绝");
+    let result = receipt.wait().await;
+    assert_eq!(result.status, ControlStatus::Rejected);
+    assert_eq!(
+        result.error.unwrap().code,
+        "COMMAND_NOT_FOUND",
+        "已授权用户的探测应得到 COMMAND_NOT_FOUND"
+    );
+    assert_eq!(admin_executor.call_count(), 0);
 }
 
 /// 越权（§83）与前置条件不满足（§85）在 Driver 前拒绝。
@@ -1276,4 +1309,142 @@ async fn shutdown_joins_devices_concurrently() {
     );
     assert_eq!(p1.wait().await.status, ControlStatus::Indeterminate);
     assert_eq!(p2.wait().await.status, ControlStatus::Indeterminate);
+}
+
+/// P1-A：停机排空并 join 完成后提交必须 `EngineClosed`——即使
+/// `get_or_create_queue` 会重建队列，新建队列共享引擎停机标志，入队拒绝，
+/// 请求绝不在停机后被接受。
+#[tokio::test]
+async fn submit_after_shutdown_never_accepted() {
+    let executor = MockExecutor::new(); // 阻塞运行中的请求
+    let audit = Arc::new(MemoryAuditSink::new());
+    let journal = Arc::new(InMemoryJournal::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    // 让一个请求在停机时处于运行中（强制中止路径）。
+    let running = engine
+        .submit(frequency_write("p1a-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    engine.shutdown(Duration::from_millis(20)).await;
+    executor.release();
+    assert_eq!(
+        running.wait().await.status,
+        ControlStatus::Indeterminate,
+        "运行中条目应被强制中止结算"
+    );
+
+    // 停机完成后提交：一律 EngineClosed，且不得留下任何 Journal 记录。
+    let err = match engine
+        .submit(frequency_write("p1a-2", 20.0), &context())
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("停机后提交必须被拒绝"),
+    };
+    assert!(matches!(err, SubmitError::EngineClosed));
+    assert!(
+        journal.get(&key("p1a-2")).is_none(),
+        "停机后拒绝的请求不得进入 Journal"
+    );
+    assert_eq!(executor.call_count(), 1, "停机后的请求不得触达执行器");
+}
+
+/// P1-A：与停机并发提交（覆盖"初始 closed 检查通过后停机排空、再入队"的
+/// 竞态窗口）——任何结果都必须有界且 Journal 不残留 Running。
+#[tokio::test]
+async fn submit_concurrent_with_shutdown_leaves_no_running() {
+    let executor = MockExecutor::new(); // 阻塞首个请求
+    let audit = Arc::new(MemoryAuditSink::new());
+    let journal = Arc::new(InMemoryJournal::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    let first = engine
+        .submit(frequency_write("p1b-0", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+
+    let shutdown_engine = engine.clone();
+    let shutdown = tokio::spawn(async move {
+        shutdown_engine.shutdown(Duration::from_millis(30)).await;
+    });
+    let mut tasks = Vec::new();
+    for i in 1..=10 {
+        let engine = engine.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = engine
+                .submit(frequency_write(&format!("p1b-{i}"), 10.0), &context())
+                .await;
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    shutdown.await.unwrap();
+    executor.release();
+    let _ = first.wait().await;
+
+    // 竞态窗口内任何被接受的请求都必须已结算；不得残留 Running。
+    for i in 1..=10 {
+        let k = key(&format!("p1b-{i}"));
+        if let Some(entry) = journal.get(&k) {
+            assert_ne!(
+                entry.status,
+                ControlStatus::Running,
+                "停机窗口内的请求不得残留 Running: {k:?}"
+            );
+        }
+    }
+    assert_eq!(executor.call_count(), 1, "竞态窗口内的请求不得触达执行器");
+}
+
+/// P2-G：拒绝路径（设备不存在）结算落盘失败 → 结果降级 Indeterminate
+/// （JOURNAL_SETTLE_FAILED），不得宣称已以 Rejected 终态落盘。
+#[tokio::test]
+async fn reject_path_settle_failure_downgrades_to_indeterminate() {
+    let journal = FailingJournal::new();
+    journal.fail_settle(true);
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    let mut request = frequency_write("p2g-1", 10.0);
+    request.device_id = "ghost".to_owned();
+    let result = engine
+        .submit(request, &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+    assert_eq!(
+        result.error.unwrap().code,
+        "JOURNAL_SETTLE_FAILED",
+        "拒绝结算失败必须降级为 Indeterminate"
+    );
+    assert_eq!(executor.call_count(), 0);
 }
