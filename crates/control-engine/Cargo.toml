@@ -4,5 +4,20 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description = "Control Engine（§81-§90）：统一控制链路——认证/授权/校验/策略/每设备队列/幂等 Journal/审计（§80.1 复用 observation-model ControlRequest/ControlResult）"
 
 [dependencies]
+async-trait = "0.1"
+driver-sdk = { path = "../driver-sdk" }
+observation-model = { path = "../observation-model" }
+profile-engine = { path = "../profile-engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
