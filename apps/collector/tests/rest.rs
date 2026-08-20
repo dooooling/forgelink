@@ -355,7 +355,7 @@ async fn rest_abnormal_exit_immediately_triggers_shutdown() {
         .await;
     let mut buf = Vec::new();
     let _ = stream.read_to_end(&mut buf).await;
-    rest.force_abnormal_exit();
+    rest.force_abnormal_exit().await;
     drop(rest);
 
     let result = tokio::time::timeout(Duration::from_secs(20), supervisor)
@@ -370,6 +370,37 @@ async fn rest_abnormal_exit_immediately_triggers_shutdown() {
         result.err().unwrap().to_string().contains("REST"),
         "错误应包含 REST 原因"
     );
+    broker.stop().await;
+}
+
+/// 外部持有 REST 句柄时仍必须关闭服务（评审 P1）：`shutdown` 为可共享
+/// 调用（`&self`）——即使外部监督方保留 `Arc` 副本（不 drop），运行时
+/// 停机仍无条件发送停止信号并等待排空，REST 不得在采集/MQTT/WAL
+/// 关闭后继续监听并响应；关闭责任属于运行时，不得转交给外部副本。
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_external_handle_does_not_prevent_shutdown() {
+    let broker = MockBroker::start().await;
+    let harness = harness_rest(broker.addr().port());
+    let runtime = collector::CollectorRuntime::start(harness.config.clone())
+        .await
+        .expect("运行时启动");
+    let addr = runtime.rest_addr().expect("REST 已启用");
+    // 外部监督方保留副本直到断言结束：运行时停机必须无条件关闭服务。
+    let external = runtime.rest_server().expect("REST 句柄可共享");
+    assert!(external.is_alive(), "停机前服务存活");
+
+    runtime.shutdown().await.expect("优雅停机");
+
+    assert!(
+        !external.is_alive(),
+        "外部持有副本时 REST 仍必须随运行时关闭"
+    );
+    assert!(
+        TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err(),
+        "停机后 REST 端口应关闭（外部副本不得阻止关闭）"
+    );
+    // 重复停机幂等（服务已停止，立即返回）。
+    external.shutdown().await;
     broker.stop().await;
 }
 

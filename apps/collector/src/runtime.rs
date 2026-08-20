@@ -417,8 +417,9 @@ impl CollectorRuntime {
 
     /// REST 服务句柄副本（未启用时为 `None`）。外部监督方（如未来的
     /// manager/运维工具）可据此订阅异常退出通知（`exit_notified`）或
-    /// 探测存活；运行时自身通过 `run_until_shutdown` 在启动后即刻监督
-    /// （评审 P1：REST 异常退出不得静默继续采集）。
+    /// 探测存活；**关闭责任始终属于运行时**——`shutdown` 为可共享调用
+    /// （`&self`），停机时无条件发送停止信号（评审 P1：外部持有副本
+    /// 不得阻止 REST 随 Collector 一并关闭）。
     pub fn rest_server(&self) -> Option<Arc<rest_api::RestApiServer>> {
         self.rest.clone()
     }
@@ -522,17 +523,12 @@ impl CollectorRuntime {
 
         // 0) REST 接口最先停止（独立任务、有界排空）：拒绝新连接后
         //    API 不可达，采集/WAL/MQTT 不受影响（§31.5 运行时接入）。
+        //    停机是可共享调用（`shutdown(&self)`）：即使外部监督方持有
+        //    `Arc` 副本，此处也无条件发送停止信号并等待排空——关闭
+        //    责任属于运行时，不得转交给外部副本（评审 P1：外部持有
+        //    句柄时 REST 不得在采集/MQTT/WAL 关闭后继续监听并响应）。
         if let Some(rest) = self.rest.take() {
-            match Arc::try_unwrap(rest) {
-                Ok(server) => server.shutdown().await,
-                // 外部持有句柄副本（监督方/测试）：不消费句柄，服务由
-                // 持有方接管。正常生产路径运行时是唯一持有者，可安全
-                // 消费（评审 P1：监督从启动后立即生效）。
-                Err(_) => warn!(
-                    component = "collector",
-                    "REST 服务句柄仍被外部持有，跳过停机消费（由持有方接管）"
-                ),
-            }
+            rest.shutdown().await;
         }
 
         // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。

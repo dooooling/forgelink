@@ -26,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::HEALTH_PATH;
@@ -75,10 +75,15 @@ impl Default for RestConfig {
     }
 }
 
-/// 服务器句柄：持有停止信号与任务，提供有界停机。
+/// 服务器句柄：持有停止信号与任务，提供可共享的有界停机。
 pub struct RestApiServer {
     stop: watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
+    /// serve 任务句柄。`Mutex<Option<_>>` 使停机成为**可共享调用**
+    /// （`shutdown(&self)`）：任意持有方都能发送停止信号并接管排空
+    /// 等待，多次调用幂等（首个完成等待后置 `None`）。评审 P1：外部
+    /// 监督方持有 `Arc` 副本时，运行时停机仍必须无条件关闭 REST——
+    /// 关闭责任属于运行时，不得转交给外部副本。
+    join: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 服务存活标记：`serve` 任务退出（正常停机或异常）后置 false，
     /// 供调用方（Collector 运行时）感知异常退出（评审 P2）。
     alive: Arc<AtomicBool>,
@@ -145,7 +150,7 @@ impl RestApiServer {
         );
         Ok(Self {
             stop: stop_tx,
-            join,
+            join: Mutex::new(Some(join)),
             alive,
             exit_rx,
             exit_tx,
@@ -175,29 +180,42 @@ impl RestApiServer {
     /// 复现，此钩子供集成测试验证调用方（Collector 运行时）的监督反应
     /// （评审 P1：REST 异常退出从启动后即被监视）。
     #[cfg(feature = "test-utils")]
-    pub fn force_abnormal_exit(&self) {
+    pub async fn force_abnormal_exit(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        self.join.abort();
+        if let Some(handle) = self.join.lock().await.as_ref() {
+            handle.abort();
+        }
         let _ = self.exit_tx.send(true);
     }
 
     /// 优雅停机：拒绝新连接 → 在途请求限时排空 → 任务结束。
     ///
+    /// **可共享调用**（`&self`，评审 P1）：停止信号与排空等待不依赖
+    /// 唯一所有权——`Arc` 副本被外部（监督方/测试）持有时，任何一方
+    /// 调用都会无条件发送停止信号并等待排空，不得把关闭责任转交给
+    /// 外部副本。多次调用幂等：任务已结束（`join` 置 `None`）后重复
+    /// 调用立即返回。
+    ///
     /// 有界（`SHUTDOWN_GRACE` 2s）：超时强制取消，绝不阻塞采集链路。
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(&self) {
         let _ = self.stop.send(true);
-        drop(self.stop);
-        if tokio::time::timeout(SHUTDOWN_GRACE, &mut self.join)
-            .await
-            .is_err()
-        {
-            warn!(component = "rest-api", "REST 停机排空超时，强制取消");
-            // 强制 abort 不经过 serve 任务内部的 alive=false 置位
-            // （评审 P2），此处显式清除存活标记，调用方不得继续误报。
-            self.alive.store(false, Ordering::SeqCst);
-            self.join.abort();
-            let _ = (&mut self.join).await;
+        let mut guard = self.join.lock().await;
+        if let Some(handle) = guard.as_mut() {
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut *handle)
+                .await
+                .is_err()
+            {
+                warn!(component = "rest-api", "REST 停机排空超时，强制取消");
+                // 强制 abort 不经过 serve 任务内部的 alive=false 置位
+                // （评审 P2），此处显式清除存活标记，调用方不得继续误报。
+                self.alive.store(false, Ordering::SeqCst);
+                handle.abort();
+                let _ = handle.await;
+            }
         }
+        // 释放句柄：任务已结束（优雅退出或 abort 后等待完成），后续
+        // 重复调用不再重复等待/排空。
+        guard.take();
         info!(component = "rest-api", "REST v1 接口已停止");
     }
 }
@@ -836,7 +854,7 @@ mod tests {
         let alive = server.alive.clone();
         let _ = server.stop.send(true);
         drop(server.stop);
-        let _ = server.join.await;
+        let _ = server.join.lock().await.take().expect("任务句柄存在").await;
         assert!(
             !alive.load(Ordering::SeqCst),
             "serve 任务退出后 alive 必须为 false"
