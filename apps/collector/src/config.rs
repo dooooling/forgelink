@@ -459,7 +459,44 @@ impl RestOptions {
         if self.max_concurrency == 0 {
             return Err(ConfigError::invalid("rest.max_concurrency", "必须大于 0").into());
         }
+        // 评审 P2：超过 Tokio `Semaphore::MAX_PERMITS` 时 `Semaphore::new`
+        // 会 panic，配置层必须限制上限并返回配置错误（不静默截断）。
+        if self.max_concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid(
+                "rest.max_concurrency",
+                format!(
+                    "超出 Tokio Semaphore 并发上限 {}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                ),
+            )
+            .into());
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_max_concurrency_upper_bound_rejected() {
+        // 评审 P2：Semaphore::new 对超限 permits 会 panic，配置必须
+        // 在启动前返回错误而非崩溃。
+        let ok = RestOptions {
+            listen: None,
+            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS,
+        };
+        assert!(ok.validate().is_ok(), "等于上限应通过");
+        let over = RestOptions {
+            listen: None,
+            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS + 1,
+        };
+        let err = over.validate().expect_err("超限必须拒绝");
+        assert!(
+            err.to_string().contains("rest.max_concurrency"),
+            "错误应指向字段: {err}"
+        );
     }
 }
 

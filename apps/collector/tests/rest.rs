@@ -404,6 +404,36 @@ async fn rest_external_handle_does_not_prevent_shutdown() {
     broker.stop().await;
 }
 
+/// 启动竞态回归（评审 P1）：REST 任务可能在监督订阅前已异常退出——
+/// 通知已置位、服务已不可用，新建的 `watch::Receiver` 不会感知该
+/// 通知（`changed()` 只报告订阅后的新变化）。监督必须在启动前检查
+/// 当前存活状态与已置位值，立即触发有序停机，不得静默继续采集。
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_exited_before_supervision_triggers_shutdown() {
+    let broker = MockBroker::start().await;
+    let harness = harness_rest(broker.addr().port());
+    let runtime = collector::CollectorRuntime::start(harness.config.clone())
+        .await
+        .expect("运行时启动");
+    let rest = runtime.rest_server().expect("REST 已启用");
+    // 在 `run_until_shutdown` 订阅前强制异常退出（时序竞态窗口）。
+    rest.force_abnormal_exit().await;
+    assert!(!rest.is_alive(), "REST 已异常退出");
+
+    let (_sig_tx, sig_rx) = tokio::sync::watch::channel(false);
+    let supervisor = tokio::spawn(runtime.run_until_shutdown(sig_rx));
+    let result = tokio::time::timeout(Duration::from_secs(20), supervisor)
+        .await
+        .expect("监督应在期限内返回（启动前已异常退出必须立即触发停机）")
+        .expect("监督任务正常结束");
+    assert!(result.is_err(), "必须上报 REST 异常（实际 {result:?}）");
+    assert!(
+        result.err().unwrap().to_string().contains("REST"),
+        "错误应包含 REST 原因"
+    );
+    broker.stop().await;
+}
+
 /// 无 REST 配置时默认不监听（§90.1：REST 默认禁用）。
 #[tokio::test(flavor = "multi_thread")]
 async fn rest_disabled_by_default() {

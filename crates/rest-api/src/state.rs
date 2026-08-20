@@ -36,9 +36,9 @@ pub trait ApiState: Send + Sync + 'static {
 /// 把适配错误映射为 API 错误（503/500）。
 ///
 /// 评审 P2：外部响应只暴露固定安全消息，内部细节（数据库路径、连接
-/// 信息、错误堆栈等）**不得**写入 HTTP message——详细原因由调用方
-/// 在 [`ApiState::snapshot`] 失败处记录日志（`server::snapshot_or_error`
-/// 已记录 `error = %e`），外部只能看到固定文案。
+/// 信息、错误堆栈等）**不得**写入 HTTP message——`server::snapshot_or_error`
+/// 在 [`ApiState::snapshot`] 失败处也只记录映射后的稳定错误码（不写
+/// `StateError` 原文），详细原因由调用方按需在更上层脱敏记录。
 pub(crate) fn map_state_error(err: &StateError) -> crate::ApiError {
     match err {
         StateError::Unavailable(_) => crate::ApiError::unavailable("运行时暂不可用"),

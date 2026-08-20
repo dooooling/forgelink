@@ -111,6 +111,18 @@ impl RestApiServer {
         state: Arc<dyn ApiState>,
         config: RestConfig,
     ) -> Result<Self, std::io::Error> {
+        // 评审 P2：`Semaphore::new` 对超过 `MAX_PERMITS` 的 permits 会
+        // panic。配置层（collector config）已先行校验，此处兜底拒绝
+        // 直接构造的 `RestConfig`，返回错误而非崩溃。
+        if config.max_concurrency > Semaphore::MAX_PERMITS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "rest.max_concurrency 超出 Tokio Semaphore 并发上限 {}",
+                    Semaphore::MAX_PERMITS
+                ),
+            ));
+        }
         let listener = TcpListener::bind(config.listen).await?;
         let addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -314,7 +326,15 @@ fn snapshot_or_error(
     id: &RequestId,
 ) -> Result<ApiSnapshot, ApiErrorResponse> {
     state.snapshot().map_err(|e| {
-        error!(component = "rest-api", request_id = %id, error = %e, "REST 快照失败");
+        // 评审 P2：`StateError` 原文可能含路径、连接信息等敏感内容，
+        // 不得直接写入日志；只记录映射后的稳定错误码与固定安全文案
+        // （`map_state_error` 输出固定 message）。
+        error!(
+            component = "rest-api",
+            request_id = %id,
+            error = %map_state_error(&e),
+            "REST 快照失败"
+        );
         ApiErrorResponse(id.clone(), map_state_error(&e))
     })
 }

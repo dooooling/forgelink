@@ -455,6 +455,22 @@ impl CollectorRuntime {
         // 运行时，触发错误上报与有序停机——API 不可用但采集继续属于
         // 静默故障。正常停机路径（shutdown 先发 stop 信号）不触发。
         let mut rest_exit = self.rest.as_ref().map(|s| s.exit_notified());
+        // 启动竞态（评审 P1）：`watch::Receiver` 只报告**订阅后**的新
+        // 变化——若 REST 任务在本函数订阅前已异常退出，通知已置位但
+        // `changed()` 永远不会触发。此处先检查当前存活状态与已置位
+        // 值，任一表明服务已不可用即立即按异常退出处理，不得因错过
+        // 通知而继续采集。
+        if let (Some(rest), Some(rx)) = (self.rest.as_ref(), rest_exit.as_ref()) {
+            if !rest.is_alive() || *rx.borrow() {
+                let msg = "REST 服务在监督启动前已不可用，采集停止（API 不可用）".to_owned();
+                error!(component = "collector", "{msg}");
+                self.stopping.send(true).ok();
+                return Err(match self.shutdown().await {
+                    Ok(()) => CollectorError::Task(msg),
+                    Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+                });
+            }
+        }
         tokio::select! {
             // 系统信号：SIGINT（Ctrl+C）直接监听；SIGTERM 由 main 挂接
             // 任务置位 `signal`（Windows 不支持 SIGTERM，main 仅在
@@ -490,10 +506,13 @@ impl CollectorRuntime {
             }
             r = async {
                 match rest_exit.as_mut() {
-                    Some(rx) => {
-                        let _ = rx.changed().await;
-                        *rx.borrow()
-                    }
+                    Some(rx) => match rx.changed().await {
+                        Ok(()) => *rx.borrow(),
+                        // 通道关闭（全部发送端已释放，服务已退出）：按
+                        // 异常处理，不得因忽略通道关闭而继续采集（评审
+                        // P1：订阅竞态与通道关闭情况都不得被漏检）。
+                        Err(_) => true,
+                    },
                     None => std::future::pending::<bool>().await,
                 }
             }, if self.rest.is_some() => {
