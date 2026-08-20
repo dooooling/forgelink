@@ -86,12 +86,16 @@ pub enum ValidationError {
     MissingParameter { command: String, parameter: String },
     /// 请求包含 Profile 未声明的参数（§78 参数列表是唯一合法集合）。
     UnknownParameter { command: String, parameter: String },
-    /// 参数类型与 descriptor `data_type` 不匹配。
+    /// 参数类型与 descriptor `data_type` 不匹配（含复合类型递归字段/元素校验，
+    /// §78）。
     ParameterTypeMismatch {
         command: String,
         parameter: String,
         expected: DataType,
     },
+    /// 请求包含重复的参数名（§78 参数集合唯一；重复会静默覆盖造成
+    /// 校验/幂等哈希/实际下发 payload 三者不一致）。
+    DuplicateParameter { command: String, parameter: String },
     /// 参数超出 descriptor `min`/`max`（§84）。
     ParameterOutOfRange {
         command: String,
@@ -117,6 +121,7 @@ impl ValidationError {
             ValidationError::MissingParameter { .. } => "MISSING_PARAMETER",
             ValidationError::UnknownParameter { .. } => "UNKNOWN_PARAMETER",
             ValidationError::ParameterTypeMismatch { .. } => "PARAMETER_TYPE_MISMATCH",
+            ValidationError::DuplicateParameter { .. } => "DUPLICATE_PARAMETER",
             ValidationError::ParameterOutOfRange { .. } => "PARAMETER_OUT_OF_RANGE",
             ValidationError::ProfileConfiguration { .. } => "PROFILE_CONFIGURATION",
         }
@@ -161,6 +166,9 @@ impl std::fmt::Display for ValidationError {
                     f,
                     "命令 {command} 参数 {parameter} 类型与 {expected:?} 不匹配"
                 )
+            }
+            ValidationError::DuplicateParameter { command, parameter } => {
+                write!(f, "命令 {command} 包含重复参数 {parameter}")
             }
             ValidationError::ParameterOutOfRange {
                 command,
@@ -232,6 +240,16 @@ pub fn validate_command(
             command: request.command.clone(),
         })?;
 
+    // 完整性：不允许重复参数名（P2-10）。
+    let mut seen = std::collections::HashSet::new();
+    for param in &request.parameters {
+        if !seen.insert(&param.name) {
+            return Err(ValidationError::DuplicateParameter {
+                command: request.command.clone(),
+                parameter: param.name.clone(),
+            });
+        }
+    }
     // 完整性：必填参数必须出现。
     for param in &descriptor.parameters {
         if param.required && !request.parameters.iter().any(|p| p.name == param.name) {
@@ -323,13 +341,26 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 
 /// 语义值类型是否与 descriptor `data_type` 兼容（数值族互通，与
 /// `profile_engine` 写入语义一致）。
+///
+/// P2-11：复合类型（`Array`/`Struct`）递归校验——`Array` 逐元素校验类型、
+/// `Struct` 逐字段校验字段名与类型，避免 `Array<U16>` 携带字符串等穿透。
 fn value_matches_type(value: &Value, data_type: &DataType) -> bool {
     match (data_type, value) {
         (DataType::Bool, Value::Bool(_)) => true,
         (DataType::String, Value::String(_)) => true,
         (DataType::Bytes, Value::Bytes(_)) => true,
-        (DataType::Array(_), Value::Array(_)) => true,
-        (DataType::Struct(_), Value::Struct(_)) => true,
+        (DataType::Array(elem), Value::Array(items)) => {
+            items.iter().all(|v| value_matches_type(v, elem))
+        }
+        (DataType::Struct(fields), Value::Struct(values)) => {
+            // 字段集合必须完全一致（无缺字段/无多余字段）且逐字段类型匹配。
+            fields.len() == values.len()
+                && fields.iter().all(|f| {
+                    values
+                        .iter()
+                        .any(|v| v.name == f.name && value_matches_type(&v.value, &f.data_type))
+                })
+        }
         (t, v) if is_numeric_type(t) && is_numeric_value(v) => true,
         _ => false,
     }
@@ -516,10 +547,14 @@ fn whitelist_driver_code(code: &str) -> &'static str {
 }
 
 /// `DriverErrorInfo` → 稳定 `ControlError`（§80.1、§90.1）。
+///
+/// P1-8：不复制 `info.message`——Driver 原始文本可能含路径/地址/厂商敏感细节，
+/// 只以白名单稳定码生成固定文案（原始文本只进脱敏日志）。
 pub fn map_driver_error(info: &driver_sdk::DriverErrorInfo) -> ControlError {
+    let code = whitelist_driver_code(&info.code);
     ControlError {
-        code: whitelist_driver_code(&info.code).to_owned(),
-        message: info.message.clone(),
+        code: code.to_owned(),
+        message: format!("Driver 错误（{code}）"),
         details: info
             .protocol_code
             .map(|code| serde_json::json!({ "protocol_code": code })),
@@ -548,6 +583,7 @@ pub fn write_item(path: &str, value: Value) -> PropertyWriteItem {
 mod tests {
     use driver_sdk::RawValue;
     use observation_model::CommandPrecondition;
+    use observation_model::FieldValue;
 
     use super::*;
     use crate::catalog::tests::profile_for_test;
@@ -836,6 +872,12 @@ mod tests {
             known.details,
             Some(serde_json::json!({ "protocol_code": 0x80 }))
         );
+        // P1-8：原始 message 不得透传（可能含路径/地址等敏感细节，§90.1）。
+        assert!(
+            !known.message.contains("slave"),
+            "Driver 原始文本不得进入控制结果: {}",
+            known.message
+        );
 
         let unknown = map_driver_error(&driver_sdk::DriverErrorInfo {
             code: "C:\\factory\\secret_path 里的怪码".to_owned(),
@@ -844,6 +886,156 @@ mod tests {
             retryable: false,
         });
         assert_eq!(unknown.code, "driver_error");
+        assert!(
+            !unknown.message.contains("secret_path"),
+            "原始文本/路径不得泄漏: {}",
+            unknown.message
+        );
+    }
+
+    #[test]
+    fn command_rejects_duplicate_parameter() {
+        let profile = profile_for_test();
+        let err = validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param("ack", Value::Bool(false)), // 重复名
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "DUPLICATE_PARAMETER");
+        assert!(
+            matches!(err, ValidationError::DuplicateParameter { parameter, .. } if parameter == "ack")
+        );
+    }
+
+    #[test]
+    fn command_compound_parameter_recursively_validated() {
+        // 为 drive.reset 追加一个 Array<U16> 与一个 Struct 参数（§6.2 递归类型）。
+        let profile = profile_for_test();
+        let mut profile = (*profile).clone();
+        let command = profile
+            .commands
+            .iter_mut()
+            .find(|c| c.id == "drive.reset")
+            .unwrap();
+        command
+            .parameters
+            .push(observation_model::CommandParameterDescriptor {
+                name: "levels".to_owned(),
+                data_type: DataType::Array(Box::new(DataType::U16)),
+                required: false,
+                min: None,
+                max: None,
+            });
+        command
+            .parameters
+            .push(observation_model::CommandParameterDescriptor {
+                name: "pid".to_owned(),
+                data_type: DataType::Struct(vec![observation_model::FieldSchema {
+                    name: "kp".to_owned(),
+                    data_type: DataType::F64,
+                }]),
+                required: false,
+                min: None,
+                max: None,
+            });
+
+        // 合法的 Array<U16> 通过。
+        validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "levels",
+                        Value::Array(vec![Value::U16(1), Value::U16(2), Value::U16(3)]),
+                    ),
+                ],
+            },
+        )
+        .expect("Array<U16> 全元素合法应通过");
+
+        // P2-11：Array<U16> 携带字符串 → 拒绝（不再只查外层是数组）。
+        let err = validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "levels",
+                        Value::Array(vec![Value::U16(1), Value::String("x".to_owned())]),
+                    ),
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "PARAMETER_TYPE_MISMATCH");
+
+        // 合法的 Struct 字段名 + 类型通过。
+        validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "pid",
+                        Value::Struct(vec![FieldValue {
+                            name: "kp".to_owned(),
+                            value: Value::F64(1.5),
+                        }]),
+                    ),
+                ],
+            },
+        )
+        .expect("Struct 字段合法应通过");
+
+        // 字段名不符 → 拒绝。
+        let err = validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "pid",
+                        Value::Struct(vec![FieldValue {
+                            name: "kd".to_owned(), // 期望 kp
+                            value: Value::F64(1.5),
+                        }]),
+                    ),
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "PARAMETER_TYPE_MISMATCH");
+
+        // 字段类型不符 → 拒绝。
+        let err = validate_command(
+            &profile,
+            &CommandRequest {
+                command: "drive.reset".to_owned(),
+                parameters: vec![
+                    param("ack", Value::Bool(true)),
+                    param(
+                        "pid",
+                        Value::Struct(vec![FieldValue {
+                            name: "kp".to_owned(),
+                            value: Value::Bool(true), // 期望 F64
+                        }]),
+                    ),
+                ],
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "PARAMETER_TYPE_MISMATCH");
     }
 
     #[test]

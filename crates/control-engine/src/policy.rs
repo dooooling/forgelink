@@ -112,6 +112,19 @@ pub enum OperationKind {
 }
 
 impl ControlPolicy {
+    /// 校验策略配置（§80.1：幂等保留期下限 24h；装配引擎时调用，fail-fast）。
+    ///
+    /// 保留期过短会放大"进程崩溃后重复执行/结果错配"的风险，须在装配期拒绝。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.idempotency_retention < Duration::from_secs(24 * 3600) {
+            return Err(format!(
+                "idempotency_retention 不得低于 24 小时（当前 {:?}）",
+                self.idempotency_retention
+            ));
+        }
+        Ok(())
+    }
+
     /// 该操作要求的最小角色（§83）。
     pub fn required_role(&self, kind: OperationKind) -> Role {
         match kind {

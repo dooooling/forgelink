@@ -87,13 +87,16 @@ pub trait ControlJournal: Send + Sync {
     ///
     /// 同 key 已有未过期记录时按 payload 判定 `Duplicate` / `Conflict`；
     /// 过期记录视为不存在（可覆盖）。
+    ///
+    /// **失败语义**：持久化失败必须返回 `Err`——引擎收到 `Err` 后不得继续
+    /// 下发 Driver（否则进程崩溃后缺少幂等记录，重试可能重复执行控制动作）。
     fn try_insert(
         &self,
         key: &IdempotencyKey,
         payload_hash: String,
         created_at_ns: TimestampNs,
         expires_at_ns: TimestampNs,
-    ) -> JournalDecision;
+    ) -> Result<JournalDecision, JournalError>;
 
     /// 结算（覆盖状态与结果；幂等可重复调用）。
     fn settle(&self, key: &IdempotencyKey, result: &ControlResult) -> Result<(), JournalError>;
@@ -126,17 +129,17 @@ impl ControlJournal for InMemoryJournal {
         payload_hash: String,
         created_at_ns: TimestampNs,
         expires_at_ns: TimestampNs,
-    ) -> JournalDecision {
+    ) -> Result<JournalDecision, JournalError> {
         let mut entries = self.entries.lock().expect("InMemoryJournal 锁被毒化");
         if let Some(existing) = entries.get(key) {
             // 过期记录视为不存在。
             if existing.expires_at_ns >= created_at_ns {
                 if existing.payload_hash == payload_hash {
-                    return JournalDecision::Duplicate(existing.clone());
+                    return Ok(JournalDecision::Duplicate(existing.clone()));
                 }
-                return JournalDecision::Conflict {
+                return Ok(JournalDecision::Conflict {
                     existing: existing.clone(),
-                };
+                });
             }
         }
         let entry = JournalEntry {
@@ -148,7 +151,7 @@ impl ControlJournal for InMemoryJournal {
             result: None,
         };
         entries.insert(key.clone(), entry.clone());
-        JournalDecision::Inserted
+        Ok(JournalDecision::Inserted)
     }
 
     fn settle(&self, key: &IdempotencyKey, result: &ControlResult) -> Result<(), JournalError> {
@@ -349,16 +352,16 @@ impl ControlJournal for FileJournal {
         payload_hash: String,
         created_at_ns: TimestampNs,
         expires_at_ns: TimestampNs,
-    ) -> JournalDecision {
+    ) -> Result<JournalDecision, JournalError> {
         let mut inner = self.inner.lock().expect("FileJournal 锁被毒化");
         if let Some(existing) = inner.entries.get(key) {
             if existing.expires_at_ns >= created_at_ns {
                 if existing.payload_hash == payload_hash {
-                    return JournalDecision::Duplicate(existing.clone());
+                    return Ok(JournalDecision::Duplicate(existing.clone()));
                 }
-                return JournalDecision::Conflict {
+                return Ok(JournalDecision::Conflict {
                     existing: existing.clone(),
-                };
+                });
             }
         }
         let entry = JournalEntry {
@@ -376,16 +379,10 @@ impl ControlJournal for FileJournal {
             created_at_ns,
             expires_at_ns,
         };
-        if let Err(e) = Self::write_record(&mut inner, &record) {
-            tracing::warn!(
-                component = "control-engine",
-                error_code = "journal_append_failed",
-                "幂等记录落盘失败: {e}"
-            );
-            // 落盘失败时内存记录仍登记（尽力而为）；上层会记录审计错误。
-        }
+        // 先落盘再登记内存：失败必须向上传播（引擎据此拒绝下发，§80.1）。
+        Self::write_record(&mut inner, &record)?;
         inner.entries.insert(key.clone(), entry.clone());
-        JournalDecision::Inserted
+        Ok(JournalDecision::Inserted)
     }
 
     fn settle(&self, key: &IdempotencyKey, result: &ControlResult) -> Result<(), JournalError> {
@@ -483,15 +480,15 @@ mod tests {
         let k = key("cmd-1");
         let hash = "hash-a".to_owned();
         assert_eq!(
-            journal.try_insert(&k, hash.clone(), 0, 100),
+            journal.try_insert(&k, hash.clone(), 0, 100).unwrap(),
             JournalDecision::Inserted
         );
         assert_eq!(
-            journal.try_insert(&k, hash.clone(), 0, 100),
+            journal.try_insert(&k, hash.clone(), 0, 100).unwrap(),
             JournalDecision::Duplicate(journal.get(&k).unwrap())
         );
         assert_eq!(
-            journal.try_insert(&k, "hash-b".to_owned(), 0, 100),
+            journal.try_insert(&k, "hash-b".to_owned(), 0, 100).unwrap(),
             JournalDecision::Conflict {
                 existing: journal.get(&k).unwrap()
             }
@@ -503,12 +500,14 @@ mod tests {
         let journal = InMemoryJournal::new();
         let k = key("cmd-1");
         assert_eq!(
-            journal.try_insert(&k, "hash-a".to_owned(), 0, 100),
+            journal.try_insert(&k, "hash-a".to_owned(), 0, 100).unwrap(),
             JournalDecision::Inserted
         );
         // 100 之后过期：此时 created_at_ns=200 > expires=100，视为新请求。
         assert_eq!(
-            journal.try_insert(&k, "hash-b".to_owned(), 200, 300),
+            journal
+                .try_insert(&k, "hash-b".to_owned(), 200, 300)
+                .unwrap(),
             JournalDecision::Inserted
         );
     }
@@ -517,7 +516,7 @@ mod tests {
     fn in_memory_settle_and_get() {
         let journal = InMemoryJournal::new();
         let k = key("cmd-1");
-        journal.try_insert(&k, "hash-a".to_owned(), 0, 100);
+        journal.try_insert(&k, "hash-a".to_owned(), 0, 100).unwrap();
         let result = result_for("cmd-1", ControlStatus::Succeeded);
         journal.settle(&k, &result).unwrap();
         let entry = journal.get(&k).unwrap();
@@ -537,7 +536,9 @@ mod tests {
             let journal = FileJournal::open(&path, 1_000).unwrap();
             let k = key("cmd-1");
             assert_eq!(
-                journal.try_insert(&k, "hash-a".to_owned(), 0, 10_000_000),
+                journal
+                    .try_insert(&k, "hash-a".to_owned(), 0, 10_000_000)
+                    .unwrap(),
                 JournalDecision::Inserted
             );
             journal
@@ -562,7 +563,9 @@ mod tests {
         {
             let journal = FileJournal::open(&path, 3_000_000).unwrap();
             let k = key("cmd-1");
-            let decision = journal.try_insert(&k, "hash-a".to_owned(), 3_000_000, 4_000_000);
+            let decision = journal
+                .try_insert(&k, "hash-a".to_owned(), 3_000_000, 4_000_000)
+                .unwrap();
             match decision {
                 JournalDecision::Duplicate(e) => assert_eq!(e.status, ControlStatus::Succeeded),
                 other => panic!("应判定 Duplicate，实际 {other:?}"),
@@ -584,7 +587,9 @@ mod tests {
         {
             let journal = FileJournal::open(&path, 1_000).unwrap();
             let k = key("cmd-1");
-            journal.try_insert(&k, "hash-a".to_owned(), 0, 10_000_000);
+            journal
+                .try_insert(&k, "hash-a".to_owned(), 0, 10_000_000)
+                .unwrap();
             // 不结算，模拟进程在执行中被终止。
         }
         {
@@ -608,9 +613,11 @@ mod tests {
         {
             let journal = FileJournal::open(&path, 1_000).unwrap();
             let k = key("cmd-1");
-            journal.try_insert(&k, "hash-a".to_owned(), 0, 500); // 早期过期
+            journal.try_insert(&k, "hash-a".to_owned(), 0, 500).unwrap(); // 早期过期
             let k2 = key("cmd-2");
-            journal.try_insert(&k2, "hash-b".to_owned(), 0, 10_000_000); // 长期
+            journal
+                .try_insert(&k2, "hash-b".to_owned(), 0, 10_000_000)
+                .unwrap(); // 长期
         }
         {
             // now=1_000_000：cmd-1 已过期，cmd-2 保留。

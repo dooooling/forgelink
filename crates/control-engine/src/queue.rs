@@ -6,12 +6,14 @@
 //!   （§87 避免 `start/stop/reset/program.select/parameter.write` 无序并发）；
 //! - **优先级**：按 [`Priority`](crate::Priority) 取最高优先级，同级 FIFO；
 //! - **超时**：入队即计算截止时间（请求与策略超时取较小值）；排到但已过期
-//!   的请求直接以 `Timeout` 结算，执行中也以同一截止时间限时；
-//! - **取消**：`CancellationToken`；排队中与执行中的请求均可取消（执行中
-//!   由引擎 select 取消分支中止执行器 future；已下发但结果不确定的情况由
-//!   执行器显式返回 `Indeterminate`，§80.1）。
+//!   的请求直接以 `Timeout` 结算；执行中（执行器已开始）超时视为结果不确定，
+//!   以 `Indeterminate` 结算（驱动可能已下发，§80.1）；
+//! - **取消**：`CancellationToken`；排队中取消以 `Cancelled` 结算，执行中取消
+//!   以 `Indeterminate` 结算（结果不确定，§80.1）；取消按幂等键匹配，不误伤
+//!   其他请求。
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -47,6 +49,7 @@ pub(crate) enum CancelOutcome {
 }
 
 /// 排队中的控制请求（提交时已完成全部校验与映射）。
+#[derive(Clone)]
 pub(crate) struct QueuedEntry {
     /// 幂等键（§80.1）。
     pub key: IdempotencyKey,
@@ -71,6 +74,7 @@ impl QueuedEntry {
 }
 
 /// 审计元数据（提交时预生成，结算时使用；§90）。
+#[derive(Clone)]
 pub(crate) struct AuditMeta {
     pub operation: AuditOperation,
     /// 命令 ID 或属性路径列表（§90）。
@@ -91,8 +95,9 @@ struct QueueInner {
     closed: bool,
     /// 已入队请求数（含等待与正在执行）。
     len: usize,
-    /// 正在执行的请求取消令牌（§87 cancel：运行中的请求也须可取消）。
-    running_cancel: Option<CancellationToken>,
+    /// 正在执行的请求条目（§87 cancel：运行中的请求也须可取消；
+    /// 保存完整条目以便强制中止时结算，且取消按幂等键匹配防止误取消）。
+    running: Option<QueuedEntry>,
 }
 
 /// 每设备独立队列 + 串行 worker（§87）。
@@ -112,7 +117,7 @@ impl DeviceQueue {
                 capacity,
                 closed: false,
                 len: 0,
-                running_cancel: None,
+                running: None,
             }),
             notify: Notify::new(),
             worker: Mutex::new(None),
@@ -158,10 +163,12 @@ impl DeviceQueue {
                 }
             }
         }
-        // 运行中：取消令牌生效于 run_entry 的三路 select（§87）。
-        if let Some(token) = &inner.running_cancel {
-            token.cancel();
-            return CancelOutcome::Marked;
+        // 运行中：按幂等键匹配才取消（§87 取消不得误伤其他请求）。
+        if let Some(running) = &inner.running {
+            if running.key.namespace == key.namespace && running.key.request_id == key.request_id {
+                running.cancel.cancel();
+                return CancelOutcome::Marked;
+            }
         }
         CancelOutcome::NotFound
     }
@@ -181,7 +188,11 @@ impl DeviceQueue {
     }
 
     /// 等待 worker 退出（引擎停机流程用；join 后句柄被取走）。
-    pub async fn join(&self, grace: std::time::Duration) {
+    ///
+    /// `grace` 内未退出则强制中止：运行中条目以 `Indeterminate` 结算、
+    /// 排队条目以 `Cancelled` 结算——收据等待者不会永久挂起，Journal 也不
+    /// 残留 `Running`（§93 停机语义）。
+    pub async fn join(&self, grace: std::time::Duration, ctx: &Arc<EngineContext>) {
         let handle = self
             .worker
             .lock()
@@ -197,10 +208,46 @@ impl DeviceQueue {
                         component = "control-engine",
                         device_id = %self.device_id,
                         error_code = "queue_worker_join_timeout",
-                        "控制队列 worker 停机超时，已强制中止"
+                        "控制队列 worker 停机超时，已强制中止并结算遗留请求"
                     );
+                    self.settle_abandoned(ctx);
                 }
             }
+        }
+    }
+
+    /// 强制中止后结算遗留请求（P1-4）：运行中条目结果未知 → `Indeterminate`
+    /// （与 P1-7 一致：执行器可能在飞行中，不得宣称未执行）；排队条目从未
+    /// 执行 → `Cancelled`。结算在释放队列锁之后进行（`settle_entry` 会访问
+    /// Journal/审计/active，不得持有队列锁）。
+    fn settle_abandoned(&self, ctx: &Arc<EngineContext>) {
+        let running: Option<QueuedEntry>;
+        let mut queued: Vec<QueuedEntry> = Vec::new();
+        let mut taken: usize = 0;
+        {
+            let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+            inner.closed = true;
+            running = inner.running.take();
+            for deque in inner.entries.values_mut() {
+                while let Some(entry) = deque.pop_front() {
+                    taken += 1;
+                    queued.push(entry);
+                }
+            }
+            inner.len = inner.len.saturating_sub(taken);
+        }
+        if let Some(entry) = running {
+            settle_entry(
+                ctx,
+                entry,
+                RunResult::Indeterminate(
+                    "QUEUE_WORKER_ABORTED",
+                    "控制队列强制中止，执行结果未知（驱动可能已下发）",
+                ),
+            );
+        }
+        for entry in queued {
+            settle_entry(ctx, entry, RunResult::Cancelled);
         }
     }
 
@@ -261,12 +308,12 @@ impl DeviceQueue {
                 PickedKind::Ready => {
                     {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
-                        inner.running_cancel = Some(picked.entry.cancel.clone());
+                        inner.running = Some(picked.entry.clone());
                     }
                     let result = run_entry(ctx, &picked.entry).await;
                     {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
-                        inner.running_cancel = None;
+                        inner.running = None;
                     }
                     settle_entry(ctx, picked.entry, result);
                 }
@@ -292,19 +339,47 @@ enum RunResult {
     Done(ControlResult),
     Timeout,
     Cancelled,
+    /// 执行器在飞行中被超时/取消/中止打断，结果未知（§80.1：不得宣称未执行）。
+    Indeterminate(&'static str, &'static str),
 }
 
 /// 执行 + 超时 + 取消三路竞争（§77、§80.1）。
+///
+/// P1-7：执行器一旦开始（`started` 标记），超时/取消不得再宣称
+/// `Timeout`/`Cancelled`——驱动可能已下发控制但结果未返回，此时以
+/// `Indeterminate` 结算（禁止上层盲目重试）；只有排队期间已过期/已取消
+/// （执行器从未被轮询）才保持 `Timeout`/`Cancelled`。
 async fn run_entry(ctx: &Arc<EngineContext>, entry: &QueuedEntry) -> RunResult {
     let remaining = entry.deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return RunResult::Timeout;
     }
     let cancel = entry.cancel.clone();
+    let started = Arc::new(AtomicBool::new(false));
+    let flag = started.clone();
+    let operation = entry.operation.clone();
+    let device_id = entry.key.device_id.clone();
+    let executor_fut = async move {
+        flag.store(true, Ordering::SeqCst);
+        run_operation(ctx, &device_id, &operation).await
+    };
+    tokio::pin!(executor_fut);
     tokio::select! {
-        _ = tokio::time::sleep(remaining) => RunResult::Timeout,
-        _ = cancel.cancelled() => RunResult::Cancelled,
-        outcome = run_operation(ctx, &entry.key.device_id, &entry.operation) => RunResult::Done(outcome),
+        _ = tokio::time::sleep(remaining) => {
+            if started.load(Ordering::SeqCst) {
+                RunResult::Indeterminate("TIMEOUT", "控制请求超时且结果不确定（驱动可能已下发）")
+            } else {
+                RunResult::Timeout
+            }
+        }
+        _ = cancel.cancelled() => {
+            if started.load(Ordering::SeqCst) {
+                RunResult::Indeterminate("CANCELLED", "控制请求已取消且结果不确定（驱动可能已下发）")
+            } else {
+                RunResult::Cancelled
+            }
+        }
+        outcome = &mut executor_fut => RunResult::Done(outcome),
     }
 }
 
@@ -357,9 +432,22 @@ async fn run_operation(
                                 },
                             }
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    // P2-12：批量写入部分失败不得宣称顶层成功（北向状态须自洽）。
+                    let any_failed = item_results.iter().any(|r| !r.success);
+                    let status = if any_failed {
+                        observation_model::ControlStatus::Failed
+                    } else {
+                        observation_model::ControlStatus::Succeeded
+                    };
+                    let error = any_failed.then(|| observation_model::ControlError {
+                        code: "PARTIAL_WRITE_FAILURE".to_owned(),
+                        message: "批量写入存在失败项（详见逐项结果）".to_owned(),
+                        details: None,
+                    });
                     ControlResult {
-                        status: observation_model::ControlStatus::Succeeded,
+                        status,
+                        error,
                         result: Some(observation_model::ControlPayloadResult::PropertyWrite(
                             item_results,
                         )),
@@ -388,7 +476,9 @@ async fn run_operation(
                             result: Some(observation_model::ControlPayloadResult::Command(
                                 observation_model::CommandResult {
                                     device_code: raw.protocol_code,
-                                    message: raw.error.as_ref().map(|e| e.message.clone()),
+                                    // P1-8：不得把 Driver 原始错误文本透传给北向
+                                    // （可能含路径/地址等敏感细节，§90.1）。
+                                    message: None,
                                     payload: raw.payload,
                                 },
                             )),
@@ -459,6 +549,20 @@ fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
                 details: None,
             }),
         },
+        RunResult::Indeterminate(code, message) => ControlResult {
+            request_id: entry.key.request_id.clone(),
+            namespace: entry.key.namespace.clone(),
+            device_id: entry.key.device_id.clone(),
+            status: observation_model::ControlStatus::Indeterminate,
+            started_at_ns: Some(completed_at_ns),
+            completed_at_ns: Some(completed_at_ns),
+            result: None,
+            error: Some(observation_model::ControlError {
+                code: code.to_owned(),
+                message: message.to_owned(),
+                details: None,
+            }),
+        },
     };
     result.completed_at_ns = Some(completed_at_ns);
     // 回填信封标识（§89：Done 路径由执行器构造，须统一回填 request_id/namespace）。
@@ -473,6 +577,18 @@ fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
             error_code = "journal_settle_failed",
             "幂等结算落盘失败: {e}"
         );
+        // P1-2：结算失败不得向调用方宣称成功——当前进程与重启恢复
+        // （Indeterminate）必须一致。降级为 Indeterminate（原始错误只进日志，
+        // 不进入北向结果）。
+        result = ControlResult {
+            status: observation_model::ControlStatus::Indeterminate,
+            error: Some(observation_model::ControlError {
+                code: "JOURNAL_SETTLE_FAILED".to_owned(),
+                message: "幂等结算持久化失败，结果不确定".to_owned(),
+                details: None,
+            }),
+            ..result
+        };
     }
     // 从活跃登记移除（幂等 Duplicate 的等待者此后从 Journal 取已结算结果）。
     ctx.active
