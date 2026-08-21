@@ -22,21 +22,28 @@ use tracing::warn;
 use crate::bind::DriverFactory;
 use crate::error::DeviceManagerError;
 use crate::read_items::{ReadGroup, ReadItem, generate_read_items, group_read_items};
+use crate::session::{SessionPollHandle, SharedSession};
 
 /// 已绑定的设备实例（§72 Device Instance）。
 ///
 /// - `profile`：绑定的 Device Profile（§37）；
-/// - `driver`：绑定的驱动实例（Poll Driver 契约，§22），多采集组共享；
+/// - `session`：共享 Driver 会话（读 + 写 + 命令，§15），每设备一个实例；
+/// - `driver`：同一会话的 Poll Engine 只读视图，多采集组共享；
 /// - `groups`：按采集间隔分组的读取项（§22 Group）。
 ///
-/// `driver` 为 `Arc<Mutex<Box<dyn PollDriver>>>`：同一设备的所有
-/// `PollTarget` 共享一个实例，由 Poll Engine 串行化调用（§17.5 调用约定）。
+/// # 会话串行化（§82 最后一段）
+///
+/// `session` 与 `driver` 内部指向**同一把**互斥锁：Poll Engine 的读取经
+/// `driver` 进入会话锁，Control Executor 的写入/命令经 `session` 进入
+/// 同一把锁——读写互斥且共用同一条底层连接，避免读写并发破坏协议状态。
 pub struct DeviceInstance {
     /// 设备配置（§4.2）。
     pub device: Device,
     /// 绑定的 Device Profile。
     pub profile: Arc<DeviceProfile>,
-    /// 绑定的驱动实例（供 PollScheduler 共享）。
+    /// 共享 Driver 会话（控制执行器入口）：写入/命令在此锁上与读取互斥。
+    pub session: SharedSession,
+    /// 绑定的驱动实例的只读视图（供 PollScheduler 共享）。
     pub driver: Arc<Mutex<Box<dyn PollDriver>>>,
     /// 全部读取项（声明序，`item_id` 即数组索引）。
     pub(crate) read_items: Vec<ReadItem>,
@@ -174,10 +181,16 @@ impl DeviceManager {
             }
         })?;
 
+        // 会话与 Poll 视图共享同一把锁（§82）：driver 是 session 的只读
+        // 适配，二者不是两个驱动实例。
+        let session: SharedSession = Arc::new(Mutex::new(driver));
         let instance = DeviceInstance {
             device,
             profile: Arc::clone(profile),
-            driver: Arc::new(Mutex::new(driver)),
+            driver: Arc::new(Mutex::new(Box::new(SessionPollHandle::new(Arc::clone(
+                &session,
+            ))))),
+            session,
             read_items,
             groups,
         };
@@ -218,6 +231,7 @@ mod tests {
 
     use super::*;
     use crate::bind::BindError;
+    use crate::session::DriverSession;
 
     /// 无副作用测试工厂：按 driver_id 返回同名驱动（不连接）。
     struct StubFactory;
@@ -227,9 +241,9 @@ mod tests {
             &self,
             driver_id: &str,
             _config: &serde_json::Value,
-        ) -> Result<Box<dyn PollDriver>, BindError> {
+        ) -> Result<Box<dyn DriverSession>, BindError> {
             match driver_id {
-                "modbus-tcp" => Ok(Box::new(StubDriver)),
+                "modbus-tcp" => Ok(Box::new(StubSession)),
                 other => Err(BindError::UnknownDriver {
                     driver_id: other.to_owned(),
                 }),
@@ -237,16 +251,35 @@ mod tests {
         }
     }
 
-    /// 最小 PollDriver 实现（pipeline 测试直接调用，不依赖网络）。
+    /// 最小 DriverSession 实现（注册流程测试不依赖网络）。
     #[derive(Debug)]
-    struct StubDriver;
+    struct StubSession;
 
-    impl PollDriver for StubDriver {
+    impl DriverSession for StubSession {
         fn read_batch(
             &mut self,
             _items: &[driver_sdk::DriverReadItem],
         ) -> Result<Vec<observation_model::RawReadResult>, driver_sdk::DriverErrorInfo> {
             Ok(vec![])
+        }
+
+        fn write_batch(
+            &mut self,
+            _items: &[driver_sdk::DriverWriteItem],
+        ) -> Result<Vec<driver_sdk::RawWriteResult>, driver_sdk::DriverErrorInfo> {
+            Ok(vec![])
+        }
+
+        fn execute_command(
+            &mut self,
+            _command: &driver_sdk::DriverCommand,
+        ) -> Result<driver_sdk::RawCommandResult, driver_sdk::DriverErrorInfo> {
+            Ok(driver_sdk::RawCommandResult {
+                success: true,
+                protocol_code: None,
+                payload: None,
+                error: None,
+            })
         }
     }
 

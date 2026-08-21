@@ -7,6 +7,8 @@ license.workspace = true
 description = "设备实例管理：Driver/Profile 绑定、读取项生成与 RawReadResult→Profile→Domain→Observation 全链路映射（§2、§22、§47、§63、§72、§100）"
 
 [dependencies]
+async-trait = "0.1"
+control-engine = { path = "../control-engine" }
 diagnostics = { path = "../diagnostics" }
 domain-model = { path = "../domain-model" }
 driver-loader = { path = "../driver-loader" }
@@ -15,6 +17,7 @@ observation-model = { path = "../observation-model" }
 poll-engine = { path = "../poll-engine" }
 profile-engine = { path = "../profile-engine" }
 serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
 tracing = "0.1"
 
 [dev-dependencies]

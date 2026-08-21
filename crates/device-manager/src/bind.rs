@@ -5,7 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use driver_loader::{LoaderError, NativeDriver, NativePlugin};
-use poll_engine::{NativeDriverAdapter, PollDriver};
+
+use crate::session::{DriverSession, NativeSessionDriver};
 
 /// Driver 绑定失败。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +35,7 @@ impl fmt::Display for BindError {
 
 impl std::error::Error for BindError {}
 
-/// Driver 工厂：按 `driver_id` 创建已绑定配置的 [`PollDriver`] 实例。
+/// Driver 工厂：按 `driver_id` 创建已绑定配置的 [`DriverSession`] 实例。
 ///
 /// # 约定（§33 原则 2）
 ///
@@ -46,14 +47,16 @@ pub trait DriverFactory: Send + Sync {
     /// `config` 是 `DeviceConnection.config`（§4.2），Core 只透传 JSON，
     /// 不解释协议私有字段；合法性由 Driver 自己校验。
     ///
-    /// 本方法返回的驱动可能处于未连接状态：传输级错误由 Poll Engine
-    /// 按 [`PollDriver`] 约定整体失败并退避重试（§34.3），Driver 负责
-    /// 在读取前建立连接。
+    /// 返回完整会话视图（读 + 写 + 命令，§15）：读取供 Poll Engine 使用，
+    /// 写入/命令供 Control Executor 使用，二者共享同一实例（§82 会话
+    /// 串行化）。本方法返回的驱动可能处于未连接状态：传输级错误由 Poll
+    /// Engine 按约定整体失败并退避重试（§34.3），Driver 负责在读取前
+    /// 建立连接。
     fn create_driver(
         &self,
         driver_id: &str,
         config: &serde_json::Value,
-    ) -> Result<Box<dyn PollDriver>, BindError>;
+    ) -> Result<Box<dyn DriverSession>, BindError>;
 }
 
 /// 基于 Native Plugin（C ABI v1）的默认 Driver 工厂（§19、§20）。
@@ -91,7 +94,7 @@ impl DriverFactory for NativeDriverFactory {
         &self,
         driver_id: &str,
         config: &serde_json::Value,
-    ) -> Result<Box<dyn PollDriver>, BindError> {
+    ) -> Result<Box<dyn DriverSession>, BindError> {
         let plugin = self
             .plugins
             .get(driver_id)
@@ -109,7 +112,7 @@ impl DriverFactory for NativeDriverFactory {
                 error: loader_error_detail(&error),
             }
         })?;
-        Ok(Box::new(NativeDriverAdapter::new(driver)))
+        Ok(Box::new(NativeSessionDriver::new(driver)))
     }
 }
 

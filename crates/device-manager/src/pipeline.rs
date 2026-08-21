@@ -228,23 +228,48 @@ mod tests {
         let profile = std::sync::Arc::new(profile());
         let read_items = crate::read_items::generate_read_items(&profile, 1000);
         let groups = crate::read_items::group_read_items(read_items.clone()).expect("间隔合法");
+        let session: crate::session::SharedSession =
+            std::sync::Arc::new(std::sync::Mutex::new(Box::new(NoopSession)));
         DeviceInstance {
             device: device(),
             profile,
-            driver: std::sync::Arc::new(std::sync::Mutex::new(Box::new(NoopDriver))),
+            driver: std::sync::Arc::new(std::sync::Mutex::new(Box::new(
+                crate::session::SessionPollHandle::new(std::sync::Arc::clone(&session)),
+            ))),
+            session,
             read_items,
             groups,
         }
     }
 
-    struct NoopDriver;
+    /// 最小 DriverSession 实现（pipeline 测试不触碰驱动）。
+    struct NoopSession;
 
-    impl poll_engine::PollDriver for NoopDriver {
+    impl crate::session::DriverSession for NoopSession {
         fn read_batch(
             &mut self,
             _items: &[DriverReadItem],
         ) -> Result<Vec<RawReadResult>, DriverErrorInfo> {
             Ok(vec![])
+        }
+
+        fn write_batch(
+            &mut self,
+            _items: &[driver_sdk::DriverWriteItem],
+        ) -> Result<Vec<driver_sdk::RawWriteResult>, DriverErrorInfo> {
+            Ok(vec![])
+        }
+
+        fn execute_command(
+            &mut self,
+            _command: &driver_sdk::DriverCommand,
+        ) -> Result<driver_sdk::RawCommandResult, DriverErrorInfo> {
+            Ok(driver_sdk::RawCommandResult {
+                success: true,
+                protocol_code: None,
+                payload: None,
+                error: None,
+            })
         }
     }
 
