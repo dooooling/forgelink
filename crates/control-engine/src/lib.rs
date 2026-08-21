@@ -34,8 +34,8 @@
 //!   的 `Arc<Mutex<Box<dyn PollDriver>>>` 会话串行化，§88）由上层实现，
 //!   引擎保证同设备控制请求串行执行（§87）。
 
-mod auth;
 mod audit;
+mod auth;
 mod catalog;
 mod engine;
 #[cfg(test)]
@@ -51,6 +51,7 @@ mod validate;
 pub use audit::{
     AuditEvent, AuditOperation, AuditParameter, AuditSink, MemoryAuditSink, NoopAuditSink,
 };
+pub use auth::{CREDENTIALS_SCHEMA, CredentialsError, StaticTokenAuthorizer};
 pub use catalog::{DeviceCatalog, DeviceInfo, MemoryDeviceCatalog};
 pub use engine::{
     CancelError, ControlEngine, ControlEngineConfig, ControlReceipt, SubmitContext, SubmitError,
@@ -67,7 +68,6 @@ pub use precondition::{
     PatternPreconditionChecker, PermissivePreconditionChecker, PreconditionChecker,
     PreconditionError,
 };
-pub use auth::{CredentialsError, StaticTokenAuthorizer, CREDENTIALS_SCHEMA};
 pub use role::{AuthorizationError, Authorizer, MemoryAuthorizer, Role, role_ordering};
 pub use validate::{
     ValidatedOperation, ValidationError, map_driver_error, validate_command,

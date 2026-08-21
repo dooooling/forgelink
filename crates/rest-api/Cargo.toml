@@ -1,6 +1,6 @@
 [package]
 name = "rest-api"
-description = "ForgeLink REST v1 只读管理接口（§31.5/§31.6）：设备/资源/属性/健康检查，统一错误模型与 schema 版本"
+description = "ForgeLink REST v1 管理接口（§31.5/§31.6）：只读设备/资源/属性/健康检查 + feature 门控的控制端点（§31.5 控制链路、§90.2 Bearer 认证），统一错误模型与 schema 版本"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,13 @@ license.workspace = true
 # 复现）。仅集成测试启用，不影响生产构建。
 test-utils = []
 
+# 控制端点（§31.5 控制链路 + §90.2 Bearer 认证）：启用后可挂载
+# POST /api/v1/devices/{device_id}/controls 与
+# GET /api/v1/control-requests/{request_id}。默认不启用——只读构建
+# 不编译任何控制代码，控制路由不存在（404/405 语义与只读分支一致，
+# §固定架构：只读版本不得暴露控制入口）。
+control = ["dep:control-engine", "dep:observation-model", "dep:async-trait"]
+
 [dependencies]
 axum = "0.8"
 mqtt-client = { path = "../mqtt-client" }
@@ -18,6 +25,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "sync", "time", "macros", "rt"] }
 tracing = "0.1"
+# 控制链路依赖（仅 feature = "control" 时编译进产物）：
+async-trait = { version = "0.1", optional = true }
+control-engine = { path = "../control-engine", optional = true }
+observation-model = { path = "../observation-model", optional = true }
+# 仅控制端点测试使用（构造最小 DeviceProfile 与执行器替身）；二者本就是
+# control-engine 的依赖，经由 control feature 引入不扩大构建图，且默认
+# （只读）构建与测试不编译。
+driver-sdk = { path = "../driver-sdk", optional = true }
+profile-engine = { path = "../profile-engine", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
