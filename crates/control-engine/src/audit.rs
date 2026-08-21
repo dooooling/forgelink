@@ -102,19 +102,31 @@ pub(crate) async fn record_bounded(
     timeout_ms: u64,
     event: AuditEvent,
 ) {
-    if tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        sink.record(event),
-    )
-    .await
-    .is_err()
-    {
-        tracing::error!(
-            component = "control-engine",
-            error_code = "audit_timeout",
-            "审计写入超时，本条审计事件丢失（控制继续）"
-        );
+    // 五审 S4：超时不直接丢弃——重试一次（总耗时上界 2×timeout_ms），
+    // 仍失败才放弃并记录错误日志。
+    for attempt in 0..2 {
+        if tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            sink.record(event.clone()),
+        )
+        .await
+        .is_ok()
+        {
+            return;
+        }
+        if attempt == 0 {
+            tracing::warn!(
+                component = "control-engine",
+                error_code = "audit_timeout_retry",
+                "审计写入超时，重试一次"
+            );
+        }
     }
+    tracing::error!(
+        component = "control-engine",
+        error_code = "audit_timeout",
+        "审计写入超时（含一次重试），本条审计事件丢失（控制继续）"
+    );
 }
 
 /// 丢弃审计事件的输出（默认值）。

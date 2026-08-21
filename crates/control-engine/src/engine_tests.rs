@@ -22,7 +22,9 @@ use crate::audit::{AuditOperation, MemoryAuditSink};
 use crate::catalog::{DeviceCatalog, MemoryDeviceCatalog, tests::profile_for_test};
 use crate::engine::{ControlEngine, ControlEngineConfig, StatusQuery, SubmitContext, SubmitError};
 use crate::executor::{ControlExecutor, ExecuteOutcome, WriteOutcome};
-use crate::journal::{ControlJournal, FileJournal, IdempotencyKey, InMemoryJournal, JournalError};
+use crate::journal::{
+    ControlJournal, FileJournal, IdempotencyKey, InMemoryJournal, JournalDecision, JournalError,
+};
 use crate::policy::{CommandPriority, ControlPolicy, Priority};
 use crate::precondition::{PreconditionChecker, PreconditionError};
 use crate::queue::now_ns;
@@ -376,6 +378,9 @@ fn default_policy() -> Arc<ControlPolicy> {
     // 自行覆盖（AlwaysFailChecker / 无检查器）。
     policy.precondition_checker =
         Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
+    // 冷却期机制由专项测试覆盖（显式策略）；机制类测试关闭以避免
+    // Indeterminate 结算后的冷却拒绝干扰后续提交。
+    policy.indeterminate_cooldown_ms = 0;
     Arc::new(policy)
 }
 
@@ -1575,8 +1580,9 @@ async fn submit_concurrent_with_shutdown_leaves_no_running() {
     assert_eq!(executor.call_count(), 1, "竞态窗口内的请求不得触达执行器");
 }
 
-/// P2-G：拒绝路径（设备不存在）结算落盘失败 → 结果降级 Indeterminate
-/// （JOURNAL_SETTLE_FAILED），不得宣称已以 Rejected 终态落盘。
+/// P2-G：拒绝路径（校验失败，发生在幂等登记之后）结算落盘失败 → 结果降级
+/// Indeterminate（JOURNAL_SETTLE_FAILED），不得宣称已以 Rejected 终态落盘。
+/// （五审 P2 后：设备不存在/未授权等登记前拒绝不再写 Journal，无结算可言。）
 #[tokio::test]
 async fn reject_path_settle_failure_downgrades_to_indeterminate() {
     let journal = FailingJournal::new();
@@ -1593,8 +1599,8 @@ async fn reject_path_settle_failure_downgrades_to_indeterminate() {
         default_policy(),
     );
 
-    let mut request = frequency_write("p2g-1", 10.0);
-    request.device_id = "ghost".to_owned();
+    // 只读属性：通过登记（设备存在、已授权），在校验阶段被拒。
+    let request = write_request("p2g-1", "drive.mode", Value::String("auto".to_owned()));
     let result = engine
         .submit(request, &context())
         .await
@@ -2001,4 +2007,331 @@ async fn conflict_over_stale_running_record_leaves_no_stale_active() {
         "仅首个执行调用 Driver，重提不得重放"
     );
     engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 五审 P1 测试替身：首次 `try_insert` 阻塞直到放行、然后失败；后续调用
+/// 直接透传内存 Journal——用于构造"登记者 insert 失败、后来者 insert 成功"
+/// 的领导权/所有权分离竞态。
+struct RaceJournal {
+    inner: InMemoryJournal,
+    call_no: AtomicUsize,
+    gate: Arc<AtomicBool>,
+}
+
+impl RaceJournal {
+    fn new(gate: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: InMemoryJournal::new(),
+            call_no: AtomicUsize::new(0),
+            gate,
+        })
+    }
+}
+
+impl ControlJournal for RaceJournal {
+    fn try_insert(
+        &self,
+        key: &IdempotencyKey,
+        payload_hash: String,
+        created_at_ns: observation_model::TimestampNs,
+        expires_at_ns: observation_model::TimestampNs,
+    ) -> Result<JournalDecision, JournalError> {
+        let n = self.call_no.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            // 阻塞首次插入直到放行（spawn_blocking 线程内自旋等待，测试专用）。
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !self.gate.load(Ordering::SeqCst) {
+                if std::time::Instant::now() > deadline {
+                    panic!("RaceJournal 门闩超时");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return Err(JournalError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "forced insert failure",
+            )));
+        }
+        self.inner
+            .try_insert(key, payload_hash, created_at_ns, expires_at_ns)
+    }
+
+    fn settle(
+        &self,
+        key: &IdempotencyKey,
+        result: &observation_model::ControlResult,
+    ) -> Result<(), JournalError> {
+        self.inner.settle(key, result)
+    }
+
+    fn get(&self, key: &IdempotencyKey) -> Option<crate::journal::JournalEntry> {
+        self.inner.get(key)
+    }
+
+    fn purge_expired(&self, now_ns: observation_model::TimestampNs) -> usize {
+        self.inner.purge_expired(now_ns)
+    }
+}
+
+/// 五审 P1：幂等并发竞态——登记者（fresh）的 insert 失败、后来者的 insert
+/// 成功时，后来者不得执行设备动作（否则"客户端收到拒绝，动作却在执行"）。
+#[tokio::test]
+async fn idempotency_race_loser_does_not_execute() {
+    let gate = Arc::new(AtomicBool::new(false));
+    let journal = RaceJournal::new(gate.clone());
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal,
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    // A 先登记 active（fresh），其 insert 被门闩阻塞。
+    let a = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .submit(frequency_write("race-9", 10.0), &context())
+                .await
+                .unwrap()
+                .wait()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // 等 A 完成登记并进入 insert
+
+    // B 后登记（非 fresh），其 insert 立即成功 → Inserted && !fresh。
+    let b = engine
+        .submit(frequency_write("race-9", 10.0), &context())
+        .await
+        .unwrap();
+    let b_result = tokio::time::timeout(Duration::from_secs(2), b.wait())
+        .await
+        .expect("B 应及时返回");
+    assert_eq!(b_result.status, ControlStatus::Rejected);
+    assert_eq!(
+        b_result.error.unwrap().code,
+        "IDEMPOTENCY_RACE",
+        "失去领导权的提交不得执行"
+    );
+
+    // 放行 A 的 insert（失败）→ A 以 JOURNAL_UNAVAILABLE 拒绝。
+    gate.store(true, Ordering::SeqCst);
+    let a_result = tokio::time::timeout(Duration::from_secs(2), a)
+        .await
+        .expect("A 应及时返回")
+        .expect("A 任务不应 panic");
+    assert_eq!(a_result.status, ControlStatus::Rejected);
+
+    // 关键不变式：设备动作零执行。
+    assert_eq!(executor.call_count(), 0, "领导权竞争双方都不得触达 Driver");
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 五审 P1：授权先于幂等登记——未授权请求不占用 request_id（Journal 无
+/// 记录）、合法用户随后可正常使用同一 request_id。
+#[tokio::test]
+async fn unauthorized_cannot_occupy_request_id() {
+    let journal = Arc::new(InMemoryJournal::new());
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let auth = MemoryAuthorizer::new();
+    auth.set_role("alice", Role::Operator); // mallory 无角色
+    let engine = engine_with(
+        catalog(),
+        Arc::new(auth),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    // 未授权用户提交 → INSUFFICIENT_ROLE，且不得在 Journal 留痕。
+    let err = engine
+        .submit(frequency_write("occ-1", 10.0), &context_for("mallory"))
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(err.status, ControlStatus::Rejected);
+    assert_eq!(err.error.unwrap().code, "INSUFFICIENT_ROLE");
+    assert!(
+        journal.get(&key("occ-1")).is_none(),
+        "未授权请求不得占用 request_id（Journal 无记录）"
+    );
+
+    // 合法用户使用同一 request_id 正常执行（不受占用影响）。
+    let result = engine
+        .submit(frequency_write("occ-1", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Succeeded);
+    assert_eq!(executor.call_count(), 1);
+}
+
+/// 五审 P1：停机开始后不得启动新动作——排队条目就地 Cancelled，
+/// 仅允许已在执行的条目自然完成。
+#[tokio::test]
+async fn shutdown_does_not_start_queued_actions() {
+    let executor = MockExecutor::new(); // 阻塞制造排队窗口
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    let holder = engine
+        .submit(frequency_write("sd-h", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    let q1 = engine
+        .submit(command_request("sd-1", true), &context())
+        .await
+        .unwrap();
+    let q2 = engine
+        .submit(frequency_write("sd-2", 20.0), &context())
+        .await
+        .unwrap();
+
+    // 长 grace 停机（旧实现会在 holder 完成后继续下发排队命令）。
+    let shutdown = tokio::spawn({
+        let engine = engine.clone();
+        async move { engine.shutdown(Duration::from_secs(5)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    executor.release(); // holder 完成 → 排队条目必须被取消而非下发
+
+    let (holder_result, q1_result, q2_result) = tokio::join!(holder.wait(), q1.wait(), q2.wait());
+    assert_eq!(holder_result.status, ControlStatus::Succeeded);
+    assert_eq!(q1_result.status, ControlStatus::Cancelled);
+    assert_eq!(q2_result.status, ControlStatus::Cancelled);
+    assert_eq!(executor.call_count(), 1, "停机后排队命令不得下发给 Driver");
+    shutdown.await.unwrap();
+}
+
+/// 五审 P1：不确定结果触发设备冷却期——冷却期内新动作被拒绝，
+/// 冷却结束后恢复。
+#[tokio::test]
+async fn indeterminate_triggers_device_cooldown() {
+    let executor = MockExecutor::new(); // 阻塞
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut policy = ControlPolicy::default();
+    policy.indeterminate_cooldown_ms = 300;
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(policy),
+    );
+
+    let receipt = engine
+        .submit(frequency_write("cd-a", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    engine.cancel(&key("cd-a"), &context()).await.unwrap();
+    let result = receipt.wait().await;
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+
+    // 冷却期内：新动作拒绝。
+    let rejected = engine
+        .submit(frequency_write("cd-b", 20.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(rejected.status, ControlStatus::Rejected);
+    assert_eq!(rejected.error.unwrap().code, "DEVICE_COOLDOWN");
+
+    // 冷却结束后：恢复正常。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    executor.release();
+    let ok = engine
+        .submit(frequency_write("cd-c", 30.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(ok.status, ControlStatus::Succeeded);
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 五审 S1：远未来时间戳拒绝（REQUEST_TOO_NEW）——防止绕过新鲜度校验。
+#[tokio::test]
+async fn future_timestamp_rejected() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    let mut request = frequency_write("ft-1", 10.0);
+    request.requested_at_ns = now_ns() + 60 * 60 * 1_000_000_000; // 1 小时后
+    let err = match engine.submit(request, &context()).await {
+        Err(e) => e,
+        Ok(_) => panic!("远未来时间戳应被拒绝"),
+    };
+    match err {
+        SubmitError::InvalidRequest { code, .. } => assert_eq!(code, "REQUEST_TOO_NEW"),
+        other => panic!("应为 InvalidRequest，实际 {other:?}"),
+    }
+}
+
+/// 五审 S4：审计写入超时重试一次——慢一次的审计最终落库，控制不受阻塞。
+#[tokio::test]
+async fn audit_timeout_retries_once() {
+    use crate::audit::{AuditEvent, AuditSink};
+    use std::sync::atomic::AtomicUsize;
+
+    struct SlowOnceAuditSink {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl AuditSink for SlowOnceAuditSink {
+        async fn record(&self, _event: AuditEvent) {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(300)).await; // 首次慢
+            }
+        }
+    }
+
+    let executor = MockExecutor::new();
+    executor.release();
+    let sink = Arc::new(SlowOnceAuditSink {
+        calls: AtomicUsize::new(0),
+    });
+    let mut policy = ControlPolicy::default();
+    policy.audit_timeout_ms = 50;
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        sink.clone(),
+        Arc::new(policy),
+    );
+
+    let started = std::time::Instant::now();
+    let result = engine
+        .submit(frequency_write("ar-1", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Succeeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "重试不得阻塞控制（耗时 {:?}）",
+        started.elapsed()
+    );
+    assert!(
+        sink.calls.load(Ordering::SeqCst) >= 2,
+        "超时后应至少重试一次"
+    );
 }

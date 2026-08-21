@@ -128,7 +128,7 @@ pub enum StatusQuery {
     /// 已接受、尚未结算（排队或执行中）。
     Running,
     /// 已有终态结果。
-    Settled(ControlResult),
+    Settled(Box<ControlResult>),
 }
 
 /// 状态查询错误。
@@ -302,8 +302,10 @@ impl ControlEngine {
 
     /// 提交控制请求（§81 统一链路入口）。
     ///
-    /// 流程：信封校验 → 幂等登记（§80.1）→ 设备存在/启用 → 授权（§83）→
-    /// 校验与映射（§75/§84）→ 前置条件（§85）→ 入队（§87）。
+    /// 流程：信封校验 → 新鲜度 → 授权（§83，五审 P1：先于幂等登记——未授权
+    /// 请求不得占用 request_id 或借 Duplicate 探测既有状态）→ 设备存在/启用
+    /// → 幂等登记（§80.1）→ 校验与映射（§75/§84）→ 前置条件（§85）→
+    /// 入队（§87）。
     ///
     /// 返回收据：幂等命中/即时拒绝已就绪；否则等待 worker 执行结果。
     pub async fn submit(
@@ -328,24 +330,92 @@ impl ControlEngine {
                 message: "timeout_ms 必须大于 0".to_owned(),
             });
         }
-        // 1.5 新鲜度（四审 P2）：`requested_at_ns` 距今超过策略上限的请求
-        // 拒绝执行——长时间滞留/重放的旧控制请求不得下发（时钟回拨时
-        // `saturating_sub` 得 0，不会误拒；远未来时间戳不在此拦截）。
+        // 2. 新鲜度（四审 P2 + 五审 S1）：`requested_at_ns` 距今超过策略上限
+        // 的旧请求拒绝执行（长时间滞留/重放）；远超时钟偏差的未来时间戳同样
+        // 拒绝——否则可绕过过期判定使新鲜度校验失效。
         {
             let now = now_ns();
+            let max_age_ms = self.inner.context.policy.max_request_age_ms as i64;
             let age_ms = now.saturating_sub(request.requested_at_ns) / 1_000_000;
-            if age_ms > self.inner.context.policy.max_request_age_ms as i64 {
+            if age_ms > max_age_ms {
                 return Err(SubmitError::InvalidRequest {
                     code: "REQUEST_TOO_OLD",
+                    message: format!("请求年龄 {age_ms} ms 超过上限 {max_age_ms} ms，拒绝执行"),
+                });
+            }
+            let ahead_ms = request.requested_at_ns.saturating_sub(now) / 1_000_000;
+            if ahead_ms > max_age_ms {
+                return Err(SubmitError::InvalidRequest {
+                    code: "REQUEST_TOO_NEW",
                     message: format!(
-                        "请求年龄 {age_ms} ms 超过上限 {} ms，拒绝执行",
-                        self.inner.context.policy.max_request_age_ms
+                        "请求时间戳超前 {ahead_ms} ms，超过允许时钟偏差 {max_age_ms} ms"
                     ),
                 });
             }
         }
 
-        // 2. 幂等登记（§80.1：下发前先持久化）。
+        // 3. 授权（五审 P1：先于幂等登记——未授权请求不写 Journal、不登记
+        // active，无法占用 request_id 阻塞合法用户，也无法借 Duplicate 探测
+        // 既有请求状态）。命令风险等级来自静态 Profile；设备未知时按最严格
+        // Critical 要求授权（防设备存在性探测），设备检查在授权之后进行。
+        let required = match &request.operation {
+            ControlOperation::PropertyWrite(_) => self
+                .inner
+                .context
+                .policy
+                .required_role(crate::policy::OperationKind::PropertyWrite),
+            ControlOperation::CommandExecute(payload) => {
+                let risk = self.inner.catalog.device(&request.device_id).map_or(
+                    observation_model::CommandRiskLevel::Critical,
+                    |info| {
+                        info.profile
+                            .commands
+                            .iter()
+                            .find(|c| c.id == payload.command)
+                            .map(|c| c.risk_level)
+                            .unwrap_or(observation_model::CommandRiskLevel::Critical)
+                    },
+                );
+                self.inner
+                    .context
+                    .policy
+                    .required_role(crate::policy::OperationKind::Command(risk))
+            }
+        };
+        if let Err(e) = self
+            .inner
+            .authorizer
+            .authorize(&ctx.subject, required, &request.device_id)
+        {
+            return Ok(self
+                .reject_unregistered(&request, ctx, e.code, e.message)
+                .await);
+        }
+
+        // 4. 设备存在且已启用（§4.2）。此时尚未持久化/登记，拒绝不留 Journal
+        // 记录（审计仍记录，§90）。
+        let Some(device_info) = self.inner.catalog.device(&request.device_id) else {
+            return Ok(self
+                .reject_unregistered(
+                    &request,
+                    ctx,
+                    "DEVICE_NOT_FOUND",
+                    format!("设备 {} 不存在", request.device_id),
+                )
+                .await);
+        };
+        if !device_info.enabled {
+            return Ok(self
+                .reject_unregistered(
+                    &request,
+                    ctx,
+                    "DEVICE_DISABLED",
+                    format!("设备 {} 已禁用", request.device_id),
+                )
+                .await);
+        }
+
+        // 5. 幂等登记（§80.1：下发前先持久化）。
         let key = IdempotencyKey {
             namespace: request.namespace.clone(),
             device_id: request.device_id.clone(),
@@ -509,51 +579,30 @@ impl ControlEngine {
                 }
                 return Err(SubmitError::Conflict { existing });
             }
-            Ok(JournalDecision::Inserted) => {} // 本请求成为执行者。
+            Ok(JournalDecision::Inserted) => {
+                if !active_fresh {
+                    // 五审 P1：领导权与 active 条目所有权分离——本请求的幂等
+                    // 记录已持久化，但活跃条目属于其他并发提交（其登记早于
+                    // 本请求，其 Journal 写入可能已失败并将结算该条目为
+                    // Rejected）。若本请求继续执行，会出现"设备动作进行中、
+                    // 客户端却收到拒绝/不确定"。安全做法：不执行；将记录落盘
+                    // 为 Rejected 并直接返回就绪收据（不触碰他人 shared/active，
+                    // 对方终态路径会写入 shared）。
+                    return Ok(self
+                        .reject_orphan_record(
+                            &request,
+                            ctx,
+                            &key,
+                            "IDEMPOTENCY_RACE",
+                            "并发提交竞争导致本请求未能执行，请使用新的 request_id 重试".to_owned(),
+                        )
+                        .await);
+                }
+                // 本请求成为执行者（且拥有 active 条目）。
+            }
         }
 
-        // 3. 设备存在且已启用（§4.2）。
-        let Some(device_info) = self.inner.catalog.device(&request.device_id) else {
-            return Ok(self
-                .reject_with_shared(
-                    &request,
-                    ctx,
-                    &key,
-                    &shared,
-                    "DEVICE_NOT_FOUND",
-                    format!("设备 {} 不存在", request.device_id),
-                )
-                .await);
-        };
-        if !device_info.enabled {
-            return Ok(self
-                .reject_with_shared(
-                    &request,
-                    ctx,
-                    &key,
-                    &shared,
-                    "DEVICE_DISABLED",
-                    format!("设备 {} 已禁用", request.device_id),
-                )
-                .await);
-        }
-
-        // 4. 授权（§83、§81 链路顺序）——在 Profile 校验与前置条件之前完成：
-        //    未授权用户不得触发设备状态检查（前置条件）或获得校验类信息。
-        //    命令的风险等级需要一次静态 Profile 查询（不触设备状态）。
-        let kind = raw_operation_kind(&device_info.profile, &request.operation);
-        let required = self.inner.context.policy.required_role(kind);
-        if let Err(e) = self
-            .inner
-            .authorizer
-            .authorize(&ctx.subject, required, &request.device_id)
-        {
-            return Ok(self
-                .reject_with_shared(&request, ctx, &key, &shared, e.code, e.message)
-                .await);
-        }
-
-        // 5. 校验与映射（§75/§76/§84；全部在 Driver 前完成）。
+        // 6. 校验与映射（§75/§76/§84；全部在 Driver 前完成）。
         let validated = match &request.operation {
             ControlOperation::PropertyWrite(payload) => {
                 match validate_property_write(&device_info.profile, payload) {
@@ -663,6 +712,23 @@ impl ControlEngine {
         // 8. 入队（§87 每设备有界队列；同设备串行）。P1-A：`get_or_create_queue`
         //    传入引擎级停机标志——停机排空后重建的队列同样拒绝入队。
         let queue = self.get_or_create_queue(&request.device_id);
+        // 五审 P1：不确定结果冷却期——底层物理动作可能仍在进行，冷却期内
+        // 不接受该设备的新动作（已持久化记录以 Rejected 结算，可安全重试）。
+        if queue.in_cooldown() {
+            return Ok(self
+                .reject_with_shared(
+                    &request,
+                    ctx,
+                    &key,
+                    &shared,
+                    "DEVICE_COOLDOWN",
+                    format!(
+                        "设备存在未确定结果的控制动作，冷却期（{} ms）内拒绝新动作",
+                        self.inner.context.policy.indeterminate_cooldown_ms
+                    ),
+                )
+                .await);
+        }
         let entry = QueuedEntry {
             key: key.clone(),
             operation: validated,
@@ -835,7 +901,7 @@ impl ControlEngine {
         .await;
         match entry {
             Some(entry) => match entry.result {
-                Some(result) => Ok(StatusQuery::Settled(result)),
+                Some(result) => Ok(StatusQuery::Settled(Box::new(result))),
                 None => Ok(StatusQuery::Running),
             },
             None => {
@@ -889,6 +955,7 @@ impl ControlEngine {
                     device_id.clone(),
                     self.inner.context.policy.queue_capacity,
                     self.inner.closed.clone(),
+                    self.inner.context.clone(),
                 ))
             })
             .clone()
@@ -921,6 +988,85 @@ impl ControlEngine {
             }),
         };
         // 审计（§90：每个反向控制必须记录）。四审 P2：有界超时，慢审计不阻塞。
+        let audit_meta = audit_meta_for(request, None);
+        crate::audit::record_bounded(
+            &self.inner.context.audit,
+            self.inner.context.policy.audit_timeout_ms,
+            crate::audit::build_event(
+                &ctx.subject,
+                &ctx.source,
+                &request.namespace,
+                &request.device_id,
+                &request.request_id,
+                audit_meta.operation,
+                &audit_meta.target,
+                &audit_meta.parameters,
+                None,
+                result.status,
+                result.error.as_ref().map(|e| e.code.clone()),
+                None,
+                0,
+                now_ns(),
+            ),
+        )
+        .await;
+        ControlReceipt::ready(result)
+    }
+
+    /// 结算"已持久化但本请求不拥有 active 条目"的幂等记录（五审 P1）。
+    ///
+    /// 用于 `Inserted && !fresh`：Journal 记录由本请求写入，但执行权不归本
+    /// 请求（并发竞争）。落盘 `Rejected` + 审计后返回就绪收据；不触碰他人
+    /// shared/active（对方终态路径负责写入 shared）。
+    async fn reject_orphan_record(
+        &self,
+        request: &ControlRequest,
+        ctx: &SubmitContext,
+        key: &IdempotencyKey,
+        code: &str,
+        message: String,
+    ) -> ControlReceipt {
+        let mut result = ControlResult {
+            request_id: request.request_id.clone(),
+            namespace: request.namespace.clone(),
+            device_id: request.device_id.clone(),
+            status: ControlStatus::Rejected,
+            started_at_ns: None,
+            completed_at_ns: Some(now_ns()),
+            result: None,
+            error: Some(ControlError {
+                code: code.to_owned(),
+                message,
+                details: None,
+            }),
+        };
+        // 记录已存在（本请求插入），结算安全；失败降级 Indeterminate（与
+        // reject_with_shared 一致，重启恢复语义一致）。
+        if let Err(e) = crate::journal::settle_record(
+            &self.inner.context.journal,
+            &self.inner.context.journal_io_gate,
+            key,
+            &result,
+        )
+        .await
+        {
+            tracing::warn!(
+                component = "control-engine",
+                request_id = %key.request_id,
+                error_code = "journal_settle_failed",
+                "孤儿记录结算落盘失败: {e}"
+            );
+            result = ControlResult {
+                status: ControlStatus::Indeterminate,
+                error: Some(ControlError {
+                    code: "JOURNAL_SETTLE_FAILED".to_owned(),
+                    message: "幂等结算持久化失败，结果不确定".to_owned(),
+                    details: None,
+                }),
+                ..result
+            };
+        }
+        // 审计（§90）。四审 P2：有界超时。
         let audit_meta = audit_meta_for(request, None);
         crate::audit::record_bounded(
             &self.inner.context.audit,
@@ -1041,30 +1187,6 @@ impl ControlEngine {
 }
 
 /// 由请求操作预生成审计元数据（§90）。
-///
-/// P1-B：命令不存在时按最严格风险等级（`Critical`）授权——未授权用户探测
-/// 命令时得到的是权限不足而非"命令不存在"，无法区分两者；命令存在性只对
-/// 已获授权的用户（校验阶段）可见。
-fn raw_operation_kind(
-    profile: &profile_engine::DeviceProfile,
-    operation: &ControlOperation,
-) -> crate::policy::OperationKind {
-    match operation {
-        ControlOperation::PropertyWrite(_) => crate::policy::OperationKind::PropertyWrite,
-        ControlOperation::CommandExecute(payload) => {
-            // 静态 Profile 查询（不触设备状态）：命令风险等级用于授权（§83）。
-            profile
-                .commands
-                .iter()
-                .find(|c| c.id == payload.command)
-                .map(|c| crate::policy::OperationKind::Command(c.risk_level))
-                .unwrap_or(crate::policy::OperationKind::Command(
-                    observation_model::CommandRiskLevel::Critical,
-                ))
-        }
-    }
-}
-
 fn audit_meta_for(
     request: &ControlRequest,
     risk_level: Option<observation_model::CommandRiskLevel>,

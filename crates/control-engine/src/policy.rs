@@ -68,6 +68,11 @@ pub struct ControlPolicy {
     /// 一级有效优先级（逐级晋升至 Critical），防止严格优先级饿死；`0`
     /// 表示禁用老化。
     pub priority_aging_ms: u64,
+    /// 不确定结果冷却期（毫秒，五审 P1）：设备出现"执行器已开始但结果
+    /// 不确定"（超时/取消/中止打断，或执行器自报 Indeterminate）后，底层
+    /// 物理动作可能仍在进行——冷却期内该设备不下发新动作（入队拒绝
+    /// `DEVICE_COOLDOWN`，队列中已排队条目暂缓启动）。`0` 表示禁用。
+    pub indeterminate_cooldown_ms: u64,
 }
 
 impl std::fmt::Debug for ControlPolicy {
@@ -121,6 +126,7 @@ impl Default for ControlPolicy {
             control_status_required_role: Role::Operator,
             audit_timeout_ms: 1_000,
             priority_aging_ms: 10_000,
+            indeterminate_cooldown_ms: 5_000,
         }
     }
 }
@@ -171,7 +177,6 @@ impl ControlPolicy {
         }
         Ok(())
     }
-
     /// 该操作要求的最小角色（§83）。
     pub fn required_role(&self, kind: OperationKind) -> Role {
         match kind {

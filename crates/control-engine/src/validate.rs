@@ -466,6 +466,20 @@ fn is_integer_type(t: &DataType) -> bool {
     )
 }
 
+fn is_integer_value(v: &Value) -> bool {
+    matches!(
+        v,
+        Value::I8(_)
+            | Value::I16(_)
+            | Value::I32(_)
+            | Value::I64(_)
+            | Value::U8(_)
+            | Value::U16(_)
+            | Value::U32(_)
+            | Value::U64(_)
+    )
+}
+
 /// 整数类型的取值范围（i128 精确承载，防 64 位边界经 f64 失真）。
 fn integer_range(t: &DataType) -> Option<std::ops::RangeInclusive<i128>> {
     Some(match t {
@@ -501,6 +515,18 @@ fn value_representable(value: &Value, data_type: &DataType) -> bool {
                 .filter(|v| v.name == f.name)
                 .all(|v| value_representable(&v.value, &f.data_type))
         }),
+        // 五审 S2：浮点目标类型的可表示性——F64 值写入 F32 目标时范围溢出
+        // 会静默变为 ±inf；整数超出浮点精确整数范围（F32 为 2^24、F64 为
+        // 2^53）时无法无损表示。浮点值写入浮点目标仅受范围约束（舍入可接受）。
+        (DataType::F32, Value::F64(v)) => v.is_finite() && (*v as f32).is_finite(),
+        (DataType::F32, v) if is_integer_value(v) => match value_to_i128(v) {
+            Some(i) => i.abs() < (1i128 << 24),
+            None => false,
+        },
+        (DataType::F64, v) if is_integer_value(v) => match value_to_i128(v) {
+            Some(i) => i.abs() < (1i128 << 53),
+            None => false,
+        },
         (t, v) if is_integer_type(t) && is_numeric_value(v) => {
             let Some(range) = integer_range(t) else {
                 return true;
@@ -1283,5 +1309,59 @@ mod tests {
     fn precondition_type_referenced() {
         // §85 引用完整性：ProfileCommand.preconditions 类型可用。
         let _p: Option<CommandPrecondition> = None;
+    }
+
+    #[test]
+    fn command_float_target_representability() {
+        // 五审 S2：F64→F32 范围溢出拒绝（静默变 ±inf）；整数超出浮点精确
+        // 整数范围（2^24）拒绝；范围内数值正常通过。
+        use crate::catalog::tests::profile_for_test;
+        let profile = profile_for_test();
+        let mut profile = (*profile).clone();
+        let command = profile
+            .commands
+            .iter_mut()
+            .find(|c| c.id == "drive.reset")
+            .unwrap();
+        command
+            .parameters
+            .push(observation_model::CommandParameterDescriptor {
+                name: "ratio".to_owned(),
+                data_type: DataType::F32,
+                required: false,
+                min: None,
+                max: None,
+            });
+        for value in [Value::F64(1e30), Value::F32(1.5), Value::U32(1000)] {
+            validate_command(
+                &profile,
+                &CommandRequest {
+                    command: "drive.reset".to_owned(),
+                    parameters: vec![
+                        param("ack", Value::Bool(true)),
+                        param("ratio", value.clone()),
+                    ],
+                },
+            )
+            .unwrap_or_else(|e| panic!("数值 {value:?} 应被接受: {e}"));
+        }
+        for value in [Value::F64(1e300), Value::I64(1 << 40)] {
+            let err = validate_command(
+                &profile,
+                &CommandRequest {
+                    command: "drive.reset".to_owned(),
+                    parameters: vec![
+                        param("ack", Value::Bool(true)),
+                        param("ratio", value.clone()),
+                    ],
+                },
+            )
+            .expect_err("不可表示数值应被拒绝");
+            assert_eq!(
+                err.code(),
+                "PARAMETER_NOT_REPRESENTABLE",
+                "{value:?} 应判定为不可表示"
+            );
+        }
     }
 }

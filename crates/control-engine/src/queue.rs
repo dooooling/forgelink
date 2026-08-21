@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use observation_model::{ControlResult, DeviceId};
 use tokio::sync::Notify;
@@ -98,6 +98,9 @@ struct QueueInner {
     /// 正在执行的请求条目（§87 cancel：运行中的请求也须可取消；
     /// 保存完整条目以便强制中止时结算，且取消按幂等键匹配防止误取消）。
     running: Option<QueuedEntry>,
+    /// 不确定结果冷却期截止时刻（五审 P1）：底层物理动作可能仍在进行，
+    /// 冷却期内 worker 不启动新动作。
+    cooldown_until: Option<Instant>,
 }
 
 /// 每设备独立队列 + 串行 worker（§87）。
@@ -109,10 +112,17 @@ pub(crate) struct DeviceQueue {
     closed_flag: Arc<AtomicBool>,
     notify: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 引擎上下文（五审 S3：监督任务重启 worker / 冷却期判定所需）。
+    ctx: Arc<EngineContext>,
 }
 
 impl DeviceQueue {
-    pub fn new(device_id: DeviceId, capacity: usize, closed_flag: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        device_id: DeviceId,
+        capacity: usize,
+        closed_flag: Arc<AtomicBool>,
+        ctx: Arc<EngineContext>,
+    ) -> Self {
         Self {
             device_id,
             inner: Mutex::new(QueueInner {
@@ -121,11 +131,19 @@ impl DeviceQueue {
                 closed: false,
                 len: 0,
                 running: None,
+                cooldown_until: None,
             }),
             closed_flag,
             notify: Notify::new(),
             worker: Mutex::new(None),
+            ctx,
         }
+    }
+
+    /// 是否处于不确定结果冷却期（五审 P1：提交侧拒绝新动作）。
+    pub fn in_cooldown(&self) -> bool {
+        let inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+        inner.cooldown_until.is_some_and(|t| t > Instant::now())
     }
 
     /// 入队（有界）。成功时确保 worker 已启动（惰性，每设备一个）。
@@ -150,7 +168,7 @@ impl DeviceQueue {
             inner.entries.entry(priority).or_default().push_back(entry);
             inner.len += 1;
         }
-        self.ensure_worker(ctx);
+        self.ensure_worker();
         self.notify.notify_one();
         Ok(())
     }
@@ -217,6 +235,11 @@ impl DeviceQueue {
     /// `grace` 内未退出则强制中止：运行中条目以 `Indeterminate` 结算、
     /// 排队条目以 `Cancelled` 结算——收据等待者不会永久挂起，Journal 也不
     /// 残留 `Running`（§93 停机语义）。
+    ///
+    /// 五审 S5：强制中止后的结算阶段有独立总预算（约 grace 的一半，钳制在
+    /// 50ms~500ms）——极端磁盘卡死时，超预算的条目跳过 Journal 落盘、仅
+    /// 回填收据（Journal 停留 Running，重启恢复为 Indeterminate，语义
+    /// 一致），保证停机总时长有界。
     pub async fn join(&self, grace: std::time::Duration, ctx: &Arc<EngineContext>) {
         let handle = self
             .worker
@@ -235,7 +258,10 @@ impl DeviceQueue {
                         error_code = "queue_worker_join_timeout",
                         "控制队列 worker 停机超时，已强制中止并结算遗留请求"
                     );
-                    self.settle_abandoned(ctx).await;
+                    let settle_budget = (grace / 2)
+                        .max(std::time::Duration::from_millis(50))
+                        .min(std::time::Duration::from_millis(500));
+                    self.settle_abandoned(ctx, settle_budget).await;
                 }
             }
         }
@@ -251,12 +277,16 @@ impl DeviceQueue {
     /// （收据不永久挂起、Journal 不残留 Running）。已结算的条目（`reply` 已
     /// 写入）跳过，避免重复结算。
     ///
+    /// 五审 S5：`budget` 为结算阶段总预算——每条目的 Journal 落盘受剩余预算
+    /// 约束；预算耗尽后跳过落盘仅回填收据（Journal 停留 Running，重启恢复
+    /// Indeterminate），保证停机总时长严格有界。
+    ///
     /// 已知竞态（可接受）：中止若落在 worker 的 `settle_record` 阻塞任务执行
     /// 期间，被丢弃的任务仍可能写入真实结果，与本函数的 QUEUE_WORKER_ABORTED
     /// 形成"最后写者胜出"——Journal 终态不确定，但收据方向安全（至多
     /// Indeterminate，绝不向调用方宣称成功；§80.1 本就禁止对 Indeterminate
     /// 盲目重放）。
-    async fn settle_abandoned(&self, ctx: &Arc<EngineContext>) {
+    async fn settle_abandoned(&self, ctx: &Arc<EngineContext>, budget: std::time::Duration) {
         let running: Option<QueuedEntry>;
         let mut queued: Vec<QueuedEntry> = Vec::new();
         let mut taken: usize = 0;
@@ -272,6 +302,7 @@ impl DeviceQueue {
             }
             inner.len = inner.len.saturating_sub(taken);
         }
+        let deadline = Instant::now() + budget;
         if let Some(entry) = running.filter(|e| !e.reply.is_set()) {
             settle_entry(
                 ctx,
@@ -280,11 +311,18 @@ impl DeviceQueue {
                     "QUEUE_WORKER_ABORTED",
                     "控制队列强制中止，执行结果未知（驱动可能已下发）",
                 ),
+                Some(deadline.saturating_duration_since(Instant::now())),
             )
             .await;
         }
         for entry in queued {
-            settle_entry(ctx, entry, RunResult::Cancelled).await;
+            settle_entry(
+                ctx,
+                entry,
+                RunResult::Cancelled,
+                Some(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
     }
 
@@ -293,18 +331,52 @@ impl DeviceQueue {
     /// 四审 P2：worker 任务 panic 后句柄仍在但任务已死——`is_finished()`
     /// 检测到已结束的 worker 时重新拉起，避免队列永久失活（排队请求无人
     /// 处理、收据永久挂起）。
-    fn ensure_worker(self: &Arc<Self>, ctx: &Arc<EngineContext>) {
+    ///
+    /// 五审 S3：每次拉起 worker 时同时派生监督任务（500ms 轮询）——worker
+    /// 异常终止（panic）时自动重启，不依赖下一次入队/取消等外部触发；
+    /// 引擎停机后监督结束。
+    fn ensure_worker(self: &Arc<Self>) {
         let mut worker = self.worker.lock().expect("DeviceQueue worker 锁被毒化");
         if worker.as_ref().is_none_or(|h| h.is_finished()) {
             let this = self.clone();
-            let ctx = ctx.clone();
             *worker = Some(tokio::spawn(async move {
-                this.worker_loop(&ctx).await;
+                this.worker_loop().await;
             }));
+            drop(worker);
+            // 五审 S3：监督任务轮询 worker 存活状态（500ms 周期）——panic
+            // 后自动重启，不依赖下一次入队等外部触发。JoinHandle 不可克隆，
+            // 用 is_finished 轮询实现；正常退出（停机排空）后随 closed_flag
+            // 结束监督。
+            let supervisor = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    if supervisor.closed_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let dead = supervisor
+                        .worker
+                        .lock()
+                        .expect("DeviceQueue worker 锁被毒化")
+                        .as_ref()
+                        .is_some_and(|h| h.is_finished());
+                    if dead {
+                        warn!(
+                            component = "control-engine",
+                            device_id = %supervisor.device_id,
+                            error_code = "queue_worker_panic_respawn",
+                            "控制队列 worker 异常终止，已自动重启"
+                        );
+                        supervisor.ensure_worker();
+                        return;
+                    }
+                }
+            });
         }
     }
 
-    async fn worker_loop(self: &Arc<Self>, ctx: &Arc<EngineContext>) {
+    async fn worker_loop(self: &Arc<Self>) {
+        let ctx = self.ctx.clone();
         // 四审 P2：前一个 worker panic 遗留的"运行中"条目在此结算——
         // 执行结果未知（Indeterminate），收据与 Journal 不残留。
         let orphan = {
@@ -320,18 +392,19 @@ impl DeviceQueue {
                 "检测到已终止 worker 的遗留请求，以 Indeterminate 结算"
             );
             settle_entry(
-                ctx,
+                &ctx,
                 entry,
                 RunResult::Indeterminate(
                     "QUEUE_WORKER_ABORTED",
                     "控制队列 worker 异常终止，执行结果未知",
                 ),
+                None,
             )
             .await;
         }
         loop {
-            // 取最高优先级、FIFO 顺序的请求；已取消/已过期的就地弹出并结算。
-            let picked: Option<Picked> = {
+            // ---- 阶段 A：停机排空（独立锁作用域，await 不持有队列锁）----
+            let drained: Option<(Vec<QueuedEntry>, bool)> = {
                 let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                 // P1-A：引擎已停机时关闭本队列——排空后 worker 退出，即使队列
                 // 在停机排空后被重建（enqueue 已拒绝，不会再有新条目），
@@ -339,65 +412,114 @@ impl DeviceQueue {
                 if self.closed_flag.load(Ordering::SeqCst) {
                     inner.closed = true;
                 }
-                if inner.closed && inner.len == 0 {
+                if !(inner.closed && inner.len > 0) {
+                    if inner.closed && inner.running.is_none() {
+                        return;
+                    }
+                    None
+                } else {
+                    // 五审 P1：停机后不得启动新动作——排队条目就地以
+                    // `Cancelled` 结算；仅允许已在执行的条目自然完成（受 join
+                    // grace 约束），完成后下一轮循环退出。
+                    let mut cancelled = Vec::new();
+                    for deque in inner.entries.values_mut() {
+                        while let Some(entry) = deque.pop_front() {
+                            cancelled.push(entry);
+                        }
+                    }
+                    inner.len = 0;
+                    let running_active = inner.running.is_some();
+                    Some((cancelled, running_active))
+                }
+            };
+            if let Some((cancelled, running_active)) = drained {
+                for entry in cancelled {
+                    settle_entry(&ctx, entry, RunResult::Cancelled, None).await;
+                }
+                if !running_active {
                     return;
                 }
-                let mut picked = None;
-                // 四审 P2：优先级老化——低优先级请求排队超过阈值后按停留
-                // 时长逐级提升有效优先级（至 Critical），防止严格优先级调度
-                // 长期饿死低优先级队列（过期/取消条目直接取走结算，不参与
-                // 比较）。同级内仍保持 FIFO；同有效优先级时基础优先级高者
-                // 先行（降序遍历 + 严格大于实现）。
-                let aging_ms = ctx.policy.priority_aging_ms;
-                let now_ns = now_ns();
-                let mut best: Option<(i64, Priority)> = None;
-                for (prio, deque) in inner.entries.iter().rev() {
-                    let Some(front) = deque.front() else {
-                        continue;
-                    };
-                    let ready = !front.is_cancelled() && Instant::now() < front.deadline;
-                    let base = *prio as i64;
-                    let boost = if aging_ms > 0 && ready {
-                        let waited_ms =
-                            now_ns.saturating_sub(front.audit_meta.queued_at_ns) / 1_000_000;
-                        (waited_ms / aging_ms as i64).clamp(0, 3 - base)
-                    } else {
-                        0
-                    };
-                    let eff = base + boost;
-                    if best.is_none_or(|(best_eff, _)| eff > best_eff) {
-                        best = Some((eff, *prio));
+                continue;
+            }
+
+            // ---- 阶段 B：冷却判定 + 挑选（独立锁作用域）----
+            // 取最高优先级、FIFO 顺序的请求；已取消/已过期的就地弹出并结算。
+            let mut cooldown_remaining = Duration::ZERO;
+            let picked: Option<Picked> = {
+                let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+                // 五审 P1：不确定结果冷却期——底层物理动作可能仍在进行，
+                // 冷却期内不启动新动作（已有条目暂缓，等冷却结束再调度）。
+                if let Some(until) = inner.cooldown_until {
+                    let remaining = until.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        cooldown_remaining = remaining;
                     }
                 }
-                if let Some((_, prio)) = best {
-                    let deque = inner.entries.get_mut(&prio).expect("存在");
-                    let front = deque.front().expect("非空");
-                    let kind = if front.is_cancelled() {
-                        PickedKind::Cancelled
-                    } else if Instant::now() >= front.deadline {
-                        PickedKind::Expired
-                    } else {
-                        PickedKind::Ready
-                    };
-                    let entry = deque.pop_front().expect("front 非空");
-                    inner.len -= 1;
-                    picked = Some(Picked { entry, kind });
+                let mut picked = None;
+                if cooldown_remaining.is_zero() {
+                    // 四审 P2：优先级老化——低优先级请求排队超过阈值后按停留
+                    // 时长逐级提升有效优先级（至 Critical），防止严格优先级调度
+                    // 长期饿死低优先级队列（过期/取消条目直接取走结算，不参与
+                    // 比较）。同级内仍保持 FIFO；同有效优先级时基础优先级高者
+                    // 先行（降序遍历 + 严格大于实现）。
+                    let aging_ms = ctx.policy.priority_aging_ms;
+                    let now_ns = now_ns();
+                    let mut best: Option<(i64, Priority)> = None;
+                    for (prio, deque) in inner.entries.iter().rev() {
+                        let Some(front) = deque.front() else {
+                            continue;
+                        };
+                        let ready = !front.is_cancelled() && Instant::now() < front.deadline;
+                        let base = *prio as i64;
+                        let boost = if aging_ms > 0 && ready {
+                            let waited_ms =
+                                now_ns.saturating_sub(front.audit_meta.queued_at_ns) / 1_000_000;
+                            (waited_ms / aging_ms as i64).clamp(0, 3 - base)
+                        } else {
+                            0
+                        };
+                        let eff = base + boost;
+                        if best.is_none_or(|(best_eff, _)| eff > best_eff) {
+                            best = Some((eff, *prio));
+                        }
+                    }
+                    if let Some((_, prio)) = best {
+                        let deque = inner.entries.get_mut(&prio).expect("存在");
+                        let front = deque.front().expect("非空");
+                        let kind = if front.is_cancelled() {
+                            PickedKind::Cancelled
+                        } else if Instant::now() >= front.deadline {
+                            PickedKind::Expired
+                        } else {
+                            PickedKind::Ready
+                        };
+                        let entry = deque.pop_front().expect("front 非空");
+                        inner.len -= 1;
+                        picked = Some(Picked { entry, kind });
+                    }
                 }
                 picked
             };
 
             let Some(picked) = picked else {
-                // 空队列：等待唤醒（停机时 notify 会唤醒）。
-                self.notify.notified().await;
+                // 空队列（或冷却期内）：等待唤醒或冷却截止。
+                if cooldown_remaining.is_zero() {
+                    self.notify.notified().await;
+                } else {
+                    tokio::select! {
+                        _ = self.notify.notified() => {}
+                        _ = tokio::time::sleep(cooldown_remaining) => {}
+                    }
+                }
                 continue;
             };
 
             match picked.kind {
                 PickedKind::Cancelled => {
-                    settle_entry(ctx, picked.entry, RunResult::Cancelled).await;
+                    settle_entry(&ctx, picked.entry, RunResult::Cancelled, None).await;
                 }
                 PickedKind::Expired => {
-                    settle_entry(ctx, picked.entry, RunResult::Timeout).await;
+                    settle_entry(&ctx, picked.entry, RunResult::Timeout, None).await;
                 }
                 PickedKind::Ready => {
                     let entry = picked.entry;
@@ -405,11 +527,24 @@ impl DeviceQueue {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                         inner.running = Some(entry.clone());
                     }
-                    let result = run_entry(ctx, &entry).await;
+                    let result = run_entry(&ctx, &entry).await;
+                    // 五审 P1：执行器已开始但结果不确定（超时/取消/中止打断），
+                    // 或执行器自报 Indeterminate——底层物理动作可能仍在进行，
+                    // 进入设备冷却期，冷却结束前不启动新动作。
+                    let indeterminate = matches!(&result, RunResult::Indeterminate(..))
+                        || matches!(&result, RunResult::Done(r)
+                            if r.status == observation_model::ControlStatus::Indeterminate);
+                    if indeterminate && ctx.policy.indeterminate_cooldown_ms > 0 {
+                        let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+                        inner.cooldown_until = Some(
+                            Instant::now()
+                                + Duration::from_millis(ctx.policy.indeterminate_cooldown_ms),
+                        );
+                    }
                     // 三审 P1：结算完成前不清除 running——否则强制中止恰好在
                     // 异步 Journal 结算期间发生时，settle_abandoned 找不到该
                     // 条目，收据会永久挂起且 Journal 残留 Running。
-                    settle_entry(ctx, entry, result).await;
+                    settle_entry(&ctx, entry, result, None).await;
                     {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                         inner.running = None;
@@ -664,7 +799,17 @@ async fn run_operation(
 }
 
 /// 结算：补全时间戳 → 幂等 Journal → 审计 → 回传结果（§80.1、§89、§90）。
-async fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResult) {
+///
+/// `journal_timeout`（五审 S5）：`None` 正常落盘；`Some(d)` 且 `d > 0` 时
+/// Journal 结算受超时约束（超时跳过落盘，收据照常回填）；`Some(0)` 直接
+/// 跳过落盘——仅用于停机结算预算耗尽的兜底路径（Journal 停留 Running，
+/// 重启恢复为 Indeterminate，语义一致）。
+async fn settle_entry(
+    ctx: &Arc<EngineContext>,
+    entry: QueuedEntry,
+    run: RunResult,
+    journal_timeout: Option<std::time::Duration>,
+) {
     let completed_at_ns = now_ns();
     let mut result = match run {
         RunResult::Done(result) => result,
@@ -718,9 +863,38 @@ async fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResu
 
     // 幂等结算（§80.1：下发前已持久化，完成后更新状态与结果）。
     // P2-H：磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
-    if let Err(e) =
-        crate::journal::settle_record(&ctx.journal, &ctx.journal_io_gate, &entry.key, &result).await
-    {
+    // 五审 S5：停机预算耗尽（Some(0)）或单次落盘超时（Some(d) 超时）时跳过
+    // Journal 更新——收据照常回填，Journal 停留 Running 由重启恢复兜底。
+    let skip_journal = journal_timeout.is_some_and(|d| d.is_zero());
+    let settle_result = {
+        let settle =
+            crate::journal::settle_record(&ctx.journal, &ctx.journal_io_gate, &entry.key, &result);
+        if skip_journal {
+            warn!(
+                component = "control-engine",
+                request_id = %entry.key.request_id,
+                error_code = "journal_settle_skipped",
+                "停机结算预算耗尽，跳过幂等落盘（重启恢复为 Indeterminate）"
+            );
+            Ok(())
+        } else if let Some(timeout) = journal_timeout {
+            match tokio::time::timeout(timeout, settle).await {
+                Err(_) => {
+                    warn!(
+                        component = "control-engine",
+                        request_id = %entry.key.request_id,
+                        error_code = "journal_settle_timeout",
+                        "幂等结算落盘超时，跳过（重启恢复为 Indeterminate）"
+                    );
+                    Ok(())
+                }
+                Ok(r) => r,
+            }
+        } else {
+            settle.await
+        }
+    };
+    if let Err(e) = settle_result {
         warn!(
             component = "control-engine",
             request_id = %entry.key.request_id,
