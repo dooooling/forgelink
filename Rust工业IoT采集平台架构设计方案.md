@@ -5298,7 +5298,7 @@ TLS -> Authentication -> Authorization -> Validation
 
 - **控制路由必须认证**：无有效凭据一律 `401`，loopback 监听亦不豁免（fail-closed）。
 - 只读管理接口（§31.5 GET 端点）MVP 维持现状（不强制认证，依赖 loopback 默认与 §90.1 网络边界）；后续版本再统一收紧。
-- 远程（非 loopback）监听必须同时满足 §90.1 的 TLS 要求；TLS 终止前的明文控制请求不得放行。
+- 远程（非 loopback）监听必须同时满足 §90.1 的 TLS 要求；TLS 终止前的明文控制请求不得放行。MVP 实现强制：控制链路启用时 REST 只允许绑定 loopback——远程访问由带 TLS 的反向代理转发到 loopback，原生 TLS listener 就绪前不开放非 loopback 直连。
 
 ---
 
