@@ -271,7 +271,9 @@ impl DeviceQueue {
     ///
     /// `grace` 内未退出则强制中止：运行中条目以 `Indeterminate` 结算、
     /// 排队条目以 `Cancelled` 结算——收据等待者不会永久挂起，Journal 也不
-    /// 残留 `Running`（§93 停机语义）。
+    /// 残留 `Running`（§93 停机语义）。worker 在停机窗口内 panic
+    /// （`Ok(Err(JoinError))`）同样触发结算——此时 supervisor 因
+    /// `closed_flag` 置位不再重启，遗留条目仅此路径可接管（五审回归 P1）。
     ///
     /// 五审 S5：强制中止后的结算阶段有独立总预算（约 grace 的一半，钳制在
     /// 50ms~500ms）——极端磁盘卡死时，超预算的条目跳过 Journal 落盘、仅
@@ -285,8 +287,28 @@ impl DeviceQueue {
             .take();
         if let Some(handle) = handle {
             let abort = handle.abort_handle();
+            // 结算预算（五审 S5）：grace 的一半，钳制在 50ms~500ms——超预算
+            // 条目跳过 Journal 落盘仅回填收据，停机总时长严格有界。
+            let settle_budget = (grace / 2)
+                .max(std::time::Duration::from_millis(50))
+                .min(std::time::Duration::from_millis(500));
             match tokio::time::timeout(grace, handle).await {
-                Ok(_) => {}
+                // 正常退出：worker 已自行排空（closed 且无 running/draining），
+                // 无遗留条目。
+                Ok(Ok(())) => {}
+                // 五审回归 P1：worker 在停机窗口内 panic（`JoinError`）——
+                // supervisor 因 `closed_flag` 已置位不再重启，遗留的
+                // running/draining 条目只有此处能接管；当作正常退出吞掉会
+                // 导致收据永久挂起、Journal 残留 Running。
+                Ok(Err(_)) => {
+                    warn!(
+                        component = "control-engine",
+                        device_id = %self.device_id,
+                        error_code = "queue_worker_panic",
+                        "控制队列 worker 在停机窗口内异常终止，结算遗留请求"
+                    );
+                    self.settle_abandoned(ctx, settle_budget).await;
+                }
                 Err(_) => {
                     abort.abort();
                     warn!(
@@ -295,9 +317,6 @@ impl DeviceQueue {
                         error_code = "queue_worker_join_timeout",
                         "控制队列 worker 停机超时，已强制中止并结算遗留请求"
                     );
-                    let settle_budget = (grace / 2)
-                        .max(std::time::Duration::from_millis(50))
-                        .min(std::time::Duration::from_millis(500));
                     self.settle_abandoned(ctx, settle_budget).await;
                 }
             }

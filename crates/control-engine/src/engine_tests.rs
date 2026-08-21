@@ -2012,6 +2012,38 @@ async fn worker_panic_queue_recovers() {
     engine.shutdown(Duration::from_millis(500)).await;
 }
 
+/// 五审回归（P1）：worker 在停机窗口内 panic——`join()` 收到
+/// `Ok(Err(JoinError))` 时不得当作正常退出吞掉。此时 supervisor 因
+/// `closed_flag` 已置位不再重启，若不调用 `settle_abandoned`，遗留的
+/// running/draining 条目无人接管：收据永久挂起、Journal 残留 Running。
+#[tokio::test]
+async fn worker_panics_then_shutdown_settles_receipt() {
+    let executor = MockExecutor::new();
+    executor.release();
+    executor.set_panic_once();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    // 执行器 panic → worker 任务终止，running 条目遗留（收据未写）。
+    let first = engine
+        .submit(frequency_write("wp-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    // 留出 panic 传播时间；须远小于 supervisor 的 500ms 轮询周期——
+    // 保证停机时 worker 句柄仍是"已死未重启"状态。
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 停机：join 拿到已终止 worker 的句柄 → `Ok(Err(JoinError))`。
+    engine.shutdown(Duration::from_millis(500)).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(2), first.wait())
+        .await
+        .expect("panic 遗留请求收据不得永久挂起");
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+    assert_eq!(result.error.unwrap().code, "QUEUE_WORKER_ABORTED");
+}
+
 /// 四审 P2：慢审计不阻塞控制——审计写入超时后控制照常完成。
 #[tokio::test]
 async fn slow_audit_does_not_block_control() {
