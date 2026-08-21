@@ -20,7 +20,7 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 - `mqtt-client`：QoS 1 北向发布（rumqttc）、Topic 命名空间与 Status Envelope、断线重发与指数退避重连、LWT、TLS/mTLS、优雅停机排空
 - `local-buffer`：Local Buffer/WAL（SQLite Embedded DB）——以完整 ObservationBatch 为持久化单位、本地序号按序补传、message_id 幂等、PUBACK 后删除、容量背压/拒绝、崩溃恢复
 - `modbus-mock`：测试共用 Mock Modbus TCP server（非生产）
-- `rest-api`：REST v1 管理接口（§31.5/§31.6/§104）——只读：设备/资源/属性查询、健康检查、`forgelink.error.v1` 错误模型、有界并发与优雅停机；控制（control feature 门控）：`POST /api/v1/devices/{id}/controls`（202 + request_id 异步受理）、`GET /api/v1/control-requests/{request_id}`（三态查询）、Bearer 认证（§90.2）；已接入 `collector` 运行时
+- `rest-api`：REST v1 管理接口（§31.5/§31.6/§104）——只读：设备/资源/属性查询、健康检查、`forgelink.error.v1` 错误模型、有界并发与优雅停机；控制（control feature 门控）：`POST /api/v1/devices/{id}/controls`（202 + request_id 异步受理）、`GET /api/v1/devices/{id}/control-requests/{request_id}`（三态查询，查询键与幂等键对齐）、Bearer 认证（§90.2）；已接入 `collector` 运行时
 
 仍在建设中的能力：
 

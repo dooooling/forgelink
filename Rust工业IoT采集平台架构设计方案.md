@@ -1975,7 +1975,7 @@ GET  /api/v1/devices/{device_id}/resources
 GET  /api/v1/devices/{device_id}/properties
 
 POST /api/v1/devices/{device_id}/controls
-GET  /api/v1/control-requests/{request_id}
+GET  /api/v1/devices/{device_id}/control-requests/{request_id}
 ```
 
 控制提交统一返回：
@@ -1992,7 +1992,7 @@ GET  /api/v1/control-requests/{request_id}
 }
 ```
 
-`GET /api/v1/control-requests/{request_id}` 返回请求当前状态（§77 异步控制三态）：
+`GET /api/v1/devices/{device_id}/control-requests/{request_id}` 返回请求当前状态（§77 异步控制三态）。查询键与幂等键（§80.1）对齐——request_id 的唯一性作用域是设备；不同设备复用同一 request_id 是两个独立请求，互不影响：
 
 ```json
 {
@@ -5263,7 +5263,7 @@ TLS -> Authentication -> Authorization -> Validation
 
 # 90.2 REST 控制面认证（Normative）
 
-启用 Control 能力时，REST 控制 API（§31.5 `POST /api/v1/devices/{device_id}/controls`、`GET /api/v1/control-requests/{request_id}`）必须启用认证。MVP 采用静态 Bearer Token 方案；mTLS 客户端证书认证留给 Edge/Manager 阶段扩展。
+启用 Control 能力时，REST 控制 API（§31.5 `POST /api/v1/devices/{device_id}/controls`、`GET /api/v1/devices/{device_id}/control-requests/{request_id}`）必须启用认证。MVP 采用静态 Bearer Token 方案；mTLS 客户端证书认证留给 Edge/Manager 阶段扩展。
 
 ## 凭据形态
 

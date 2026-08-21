@@ -13,7 +13,7 @@ test-utils = []
 
 # 控制端点（§31.5 控制链路 + §90.2 Bearer 认证）：启用后可挂载
 # POST /api/v1/devices/{device_id}/controls 与
-# GET /api/v1/control-requests/{request_id}。默认不启用——只读构建
+# GET /api/v1/devices/{device_id}/control-requests/{request_id}。默认不启用——只读构建
 # 不编译任何控制代码，控制路由不存在（404/405 语义与只读分支一致，
 # §固定架构：只读版本不得暴露控制入口）。
 control = ["dep:control-engine", "dep:observation-model", "dep:async-trait"]

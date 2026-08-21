@@ -126,9 +126,10 @@ impl RestApiServer {
     /// 绑定并启动带控制端点的服务器（§31.5 控制链路；`control` feature）。
     ///
     /// 在只读路由之上合并控制路由（`POST /api/v1/devices/{device_id}/controls`
-    /// 与 `GET /api/v1/control-requests/{request_id}`），共用同一并发门控；
-    /// 所有控制端点要求 Bearer 认证（§90.2）。listen 地址必须为 **loopback**
-    /// （评审二轮 P2，[`Self::validate_config`] 之外的额外校验）。
+    /// 与 `GET /api/v1/devices/{device_id}/control-requests/{request_id}`），
+    /// 共用同一并发门控；所有控制端点要求 Bearer 认证（§90.2）。listen 地址
+    /// 必须为 **loopback**（评审二轮 P2，[`Self::validate_config`] 之外的额外
+    /// 校验）。
     ///
     /// # Errors
     ///
@@ -823,7 +824,8 @@ mod tests {
     #[tokio::test]
     async fn control_routes_not_exposed() {
         let app = app(Arc::new(StaticState(snapshot())));
-        // POST /controls 与 GET /control-requests 都不存在；未知方法返回 405。
+        // POST /controls 与 GET devices/{id}/control-requests 都不存在；
+        // 未知方法返回 405。
         // 本测试在两种构建下都必须通过：
         // - 默认（只读）构建：`control` feature 未启用，控制代码不编译，
         //   路由天然不存在（§固定架构：只读版本不得暴露控制入口）；
@@ -837,7 +839,7 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/api/v1/control-requests/cmd-1",
+                "/api/v1/devices/vfd-01/control-requests/cmd-1",
                 StatusCode::NOT_FOUND,
             ),
             (

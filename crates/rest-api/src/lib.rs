@@ -19,7 +19,9 @@
 //! GET  /api/v1/health                         健康检查（§104 Health endpoint）
 //! --- 以下仅 control feature ---
 //! POST /api/v1/devices/{device_id}/controls   控制提交（202 异步受理，§31.5）
-//! GET  /api/v1/control-requests/{request_id}  控制状态查询（三态，§31.5）
+//! GET  /api/v1/devices/{device_id}/control-requests/{request_id}
+//!                                             控制状态查询（三态，§31.5；
+//!                                             查询键与幂等键 §80.1 对齐）
 //! ```
 //!
 //! 所有响应显式携带 `schema` 版本字段（§31.6：禁止依赖隐式字段解释）：
@@ -83,7 +85,7 @@ pub mod state;
 pub use control::{
     CONTROL_ACCEPTED_SCHEMA, CONTROL_REQUEST_SCHEMA, CONTROL_REQUESTS_PATH, CONTROL_STATUS_SCHEMA,
     CONTROLS_PATH, ControlAcceptedResponse, ControlAdapter, ControlGateway, ControlStatusQuery,
-    ControlStatusResponse, ControlSubmitError, EngineControlAdapter, StatusQueryError, Submission,
+    ControlStatusResponse, EngineControlAdapter, StatusQueryError, Submission,
 };
 pub use error::{ApiError, ErrorCode, ErrorResponse, RequestId};
 pub use models::{

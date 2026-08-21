@@ -83,7 +83,10 @@ fn write_body(request_id: &str, value: f64) -> String {
 }
 
 /// 轮询状态端点直至 settled（§77 三态；真实引擎异步结算，毫秒级）。
-async fn wait_until_settled(addr: SocketAddr, request_id: &str) -> Value {
+///
+/// 状态查询路径带 device_id（查询键与幂等键 §80.1 对齐——request_id 的
+/// 唯一性作用域是设备）。
+async fn wait_until_settled(addr: SocketAddr, device_id: &str, request_id: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         assert!(
@@ -93,7 +96,7 @@ async fn wait_until_settled(addr: SocketAddr, request_id: &str) -> Value {
         let (status, body) = http(
             addr,
             "GET",
-            &format!("/api/v1/control-requests/{request_id}"),
+            &format!("/api/v1/devices/{device_id}/control-requests/{request_id}"),
             Some(TOKEN_OPERATOR),
             None,
         );
@@ -146,7 +149,7 @@ async fn control_write_end_to_end_updates_register() {
     assert_eq!(body["status"], "accepted");
 
     // 轮询至终态：执行成功（Driver 写入完成）。
-    let settled = wait_until_settled(addr, &request_id).await;
+    let settled = wait_until_settled(addr, "vfd-01", &request_id).await;
     assert_eq!(settled["result"]["status"], "succeeded", "{settled}");
     assert_eq!(settled["result"]["request_id"], request_id);
     assert_eq!(settled["result"]["device_id"], "vfd-01");
