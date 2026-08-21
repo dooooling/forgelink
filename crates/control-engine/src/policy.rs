@@ -52,6 +52,22 @@ pub struct ControlPolicy {
     pub command_timeout_ms: HashMap<CommandRiskLevel, u64>,
     /// 命令前置条件检查器（§85）；`None` 表示跳过前置条件检查。
     pub precondition_checker: Option<std::sync::Arc<dyn crate::precondition::PreconditionChecker>>,
+    /// 前置条件单次检查超时（毫秒，四审 P1）：检查器卡死不得让请求永久
+    /// 停留在 Running；超时按失败处理（fail-closed）。
+    pub precondition_timeout_ms: u64,
+    /// 请求最大年龄（毫秒，四审 P2）：`requested_at_ns` 距今超过该值的请求
+    /// 以 `REQUEST_TOO_OLD` 拒绝——长时间滞留/重放的旧控制请求不得执行。
+    pub max_request_age_ms: u64,
+    /// 控制状态查询（`status`）要求的最小角色（四审 P1：控制面查询同样
+    /// 需要授权，防止未授权方借状态接口探测设备/命令信息）。
+    pub control_status_required_role: Role,
+    /// 单条审计事件写入超时（毫秒，四审 P2）：慢审计不得阻塞控制 worker；
+    /// 超时放弃该条审计并记录错误日志（控制继续）。
+    pub audit_timeout_ms: u64,
+    /// 优先级老化阈值（毫秒，四审 P2）：排队超过该值的低优先级请求提升
+    /// 一级有效优先级（逐级晋升至 Critical），防止严格优先级饿死；`0`
+    /// 表示禁用老化。
+    pub priority_aging_ms: u64,
 }
 
 impl std::fmt::Debug for ControlPolicy {
@@ -100,6 +116,11 @@ impl Default for ControlPolicy {
                 (CommandRiskLevel::Critical, 20_000),
             ]),
             precondition_checker: None,
+            precondition_timeout_ms: 1_000,
+            max_request_age_ms: 60_000,
+            control_status_required_role: Role::Operator,
+            audit_timeout_ms: 1_000,
+            priority_aging_ms: 10_000,
         }
     }
 }
@@ -138,6 +159,15 @@ impl ControlPolicy {
                     "command_timeout_ms[{risk:?}] 必须大于 0（0 会让请求立即超时）"
                 ));
             }
+        }
+        if self.precondition_timeout_ms == 0 {
+            return Err("precondition_timeout_ms 必须大于 0".to_owned());
+        }
+        if self.max_request_age_ms == 0 {
+            return Err("max_request_age_ms 必须大于 0（0 会拒绝所有请求）".to_owned());
+        }
+        if self.audit_timeout_ms == 0 {
+            return Err("audit_timeout_ms 必须大于 0".to_owned());
         }
         Ok(())
     }

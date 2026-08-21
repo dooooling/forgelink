@@ -101,6 +101,9 @@ pub enum CancelError {
     NotFound,
     /// 引擎已停机。
     EngineClosed,
+    /// 调用者角色不足（四审 P1：取消是控制面操作，须与被取消操作的
+    /// 风险等级要求角色一致，防止低权限方绕行取消高权限动作）。
+    Unauthorized { code: String, message: String },
 }
 
 impl std::fmt::Display for CancelError {
@@ -108,11 +111,43 @@ impl std::fmt::Display for CancelError {
         match self {
             CancelError::NotFound => write!(f, "请求不存在（已结算或未知）"),
             CancelError::EngineClosed => write!(f, "控制引擎已停机"),
+            CancelError::Unauthorized { code, message } => write!(f, "{code}: {message}"),
         }
     }
 }
 
 impl std::error::Error for CancelError {}
+
+/// 控制请求状态查询结果（§77：Accepted/Running 是合法中间态；四审 P1：
+/// "未知请求"与"正在执行"必须可区分——两者都返回 `None` 会把执行中误报
+/// 为不存在，调用方无法安全轮询）。
+#[derive(Debug, Clone)]
+pub enum StatusQuery {
+    /// 无该请求的任何记录（未知 `request_id`，或已过保留期被清理）。
+    Unknown,
+    /// 已接受、尚未结算（排队或执行中）。
+    Running,
+    /// 已有终态结果。
+    Settled(ControlResult),
+}
+
+/// 状态查询错误。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusError {
+    /// 调用者角色不足（四审 P1：控制面查询同样需要授权，防止未授权方
+    /// 借状态接口探测设备/命令信息）。
+    Unauthorized { code: String, message: String },
+}
+
+impl std::fmt::Display for StatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StatusError::Unauthorized { code, message } => write!(f, "{code}: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for StatusError {}
 
 /// 控制请求收据（§77 异步控制）。
 ///
@@ -293,6 +328,22 @@ impl ControlEngine {
                 message: "timeout_ms 必须大于 0".to_owned(),
             });
         }
+        // 1.5 新鲜度（四审 P2）：`requested_at_ns` 距今超过策略上限的请求
+        // 拒绝执行——长时间滞留/重放的旧控制请求不得下发（时钟回拨时
+        // `saturating_sub` 得 0，不会误拒；远未来时间戳不在此拦截）。
+        {
+            let now = now_ns();
+            let age_ms = now.saturating_sub(request.requested_at_ns) / 1_000_000;
+            if age_ms > self.inner.context.policy.max_request_age_ms as i64 {
+                return Err(SubmitError::InvalidRequest {
+                    code: "REQUEST_TOO_OLD",
+                    message: format!(
+                        "请求年龄 {age_ms} ms 超过上限 {} ms，拒绝执行",
+                        self.inner.context.policy.max_request_age_ms
+                    ),
+                });
+            }
+        }
 
         // 2. 幂等登记（§80.1：下发前先持久化）。
         let key = IdempotencyKey {
@@ -350,14 +401,27 @@ impl ControlEngine {
                     error_code = "journal_insert_failed",
                     "幂等记录持久化失败: {e}"
                 );
-                // 已登记 active：由 reject_with_shared 结算 shared 并移除条目，
-                // 并发等待者获得一致的拒绝结果、不挂起。
+                if active_fresh {
+                    // 本请求创建了 active 条目：由 reject_with_shared 结算
+                    // shared 并移除条目，并发等待者获得一致的拒绝结果、不挂起。
+                    return Ok(self
+                        .reject_with_shared(
+                            &request,
+                            ctx,
+                            &key,
+                            &shared,
+                            "JOURNAL_UNAVAILABLE",
+                            "幂等记录持久化失败，控制请求被拒绝".to_owned(),
+                        )
+                        .await);
+                }
+                // 四审 P1：非 fresh——active 条目属于其他在途提交（可能正成为
+                // 执行者），不得写其 shared / 移除其登记。本请求既未持久化也
+                // 未下发，审计后直接以拒绝收据返回。
                 return Ok(self
-                    .reject_with_shared(
+                    .reject_unregistered(
                         &request,
                         ctx,
-                        &key,
-                        &shared,
                         "JOURNAL_UNAVAILABLE",
                         "幂等记录持久化失败，控制请求被拒绝".to_owned(),
                     )
@@ -372,14 +436,17 @@ impl ControlEngine {
                     "幂等命中，返回既有结果"
                 );
                 if let Some(result) = entry.result {
-                    // 已结算：active 中的条目是本请求刚登记的，无执行者会清理，
-                    // 立即移除避免残留。
-                    self.inner
-                        .context
-                        .active
-                        .lock()
-                        .expect("active 锁被毒化")
-                        .remove(&key);
+                    // 已结算：仅当 active 条目是本请求新建时才移除（无执行者
+                    // 会清理）；非 fresh 说明条目属于其他在途提交，由其自身
+                    // 终态路径清理，不得触碰（四审 P1）。
+                    if active_fresh {
+                        self.inner
+                            .context
+                            .active
+                            .lock()
+                            .expect("active 锁被毒化")
+                            .remove(&key);
+                    }
                     return Ok(ControlReceipt::ready(result));
                 }
                 if entry.status == ControlStatus::Running {
@@ -408,26 +475,31 @@ impl ControlEngine {
                     return Ok(ControlReceipt::ready(result));
                 }
                 // 防御分支（理论上不可达：插入必为 Running 且未结算）：结果不确定。
-                // 同上：先写 shared 再移除，防止并发等待者挂起。
+                // 同上：先写 shared 再移除，防止并发等待者挂起；非 fresh 不触碰
+                // 他人在途条目。
                 let result = interrupted_result(
                     &request,
                     "EXECUTION_INTERRUPTED",
                     "执行状态未知（进程可能已重启）",
                 );
-                shared.set(result.clone());
-                self.inner
-                    .context
-                    .active
-                    .lock()
-                    .expect("active 锁被毒化")
-                    .remove(&key);
+                if active_fresh {
+                    shared.set(result.clone());
+                    self.inner
+                        .context
+                        .active
+                        .lock()
+                        .expect("active 锁被毒化")
+                        .remove(&key);
+                }
                 return Ok(ControlReceipt::ready(result));
             }
             Ok(JournalDecision::Conflict { existing }) => {
-                // 已有条目已结算（非 Running）：active 中的条目是本请求刚登记的，
-                // 无执行者会清理，立即移除避免残留；已有条目 Running 说明执行者
-                // 仍在飞行，由其结算时清理。
-                if existing.status != ControlStatus::Running {
+                // 四审 P1：本请求未成为执行者。若 active 条目是本请求新建的，
+                // 必须立即移除——包括 existing 为 Running 的情形（如重启恢复的
+                // 未结算记录）：否则 stale 条目会让后续同 key 提交误判"命中
+                // 活跃执行"而永久挂起。非 fresh 时条目属于其他在途提交，由其
+                // 自身终态路径清理，不得触碰。
+                if active_fresh {
                     self.inner
                         .context
                         .active
@@ -517,21 +589,60 @@ impl ControlEngine {
                     }
                 };
                 // 前置条件（§85）：入队前检查，失败在 Driver 前拒绝。
-                if let Some(checker) = self.inner.context.policy.precondition_checker() {
-                    let ValidatedOperation::Execute { preconditions, .. } = &op else {
-                        unreachable!("CommandExecute 校验结果必为 Execute");
-                    };
-                    if let Err(e) = checker.check(&request.device_id, preconditions).await {
+                // 四审 P1：Profile 声明了前置条件但未配置检查器时必须
+                // fail-closed（静默跳过会让安全前置条件形同虚设）；
+                // 检查器卡死不得阻塞提交——单次检查受策略超时约束。
+                let ValidatedOperation::Execute { preconditions, .. } = &op else {
+                    unreachable!("CommandExecute 校验结果必为 Execute");
+                };
+                if !preconditions.is_empty() {
+                    let Some(checker) = self.inner.context.policy.precondition_checker() else {
                         return Ok(self
                             .reject_with_shared(
                                 &request,
                                 ctx,
                                 &key,
                                 &shared,
-                                "PRECONDITION_FAILED",
-                                e.message,
+                                "PRECONDITION_UNCONFIGURED",
+                                "命令声明了前置条件但引擎未配置前置条件检查器".to_owned(),
                             )
                             .await);
+                    };
+                    let check = checker.check(&request.device_id, preconditions);
+                    match tokio::time::timeout(
+                        Duration::from_millis(self.inner.context.policy.precondition_timeout_ms),
+                        check,
+                    )
+                    .await
+                    {
+                        Err(_) => {
+                            return Ok(self
+                                .reject_with_shared(
+                                    &request,
+                                    ctx,
+                                    &key,
+                                    &shared,
+                                    "PRECONDITION_TIMEOUT",
+                                    format!(
+                                        "前置条件检查超时（{} ms）",
+                                        self.inner.context.policy.precondition_timeout_ms
+                                    ),
+                                )
+                                .await);
+                        }
+                        Ok(Err(e)) => {
+                            return Ok(self
+                                .reject_with_shared(
+                                    &request,
+                                    ctx,
+                                    &key,
+                                    &shared,
+                                    "PRECONDITION_FAILED",
+                                    e.message,
+                                )
+                                .await);
+                        }
+                        Ok(Ok(())) => {}
                     }
                 }
                 op
@@ -627,9 +738,18 @@ impl ControlEngine {
 
     /// 取消请求（§87：cancel）。
     ///
-    /// 排队中的请求被标记取消，worker 以 `Cancelled` 结算；
-    /// 执行中的请求通过 `CancellationToken` 中止执行器调用。
-    pub async fn cancel(&self, key: &IdempotencyKey) -> Result<(), CancelError> {
+    /// 取消请求（§87：排队中 → `Cancelled`；执行中 → 中止执行器调用，
+    /// 以 `Indeterminate` 结算——驱动可能已下发）。
+    ///
+    /// 四审 P1：取消是控制面操作，必须携带授权上下文——调用者角色须达到
+    /// 被取消操作的风险等级要求角色（与提交该操作一致），防止低权限方
+    /// 绕行取消高权限动作。调用者必然已知 `request_id`（自己提交或合法
+    /// 获悉），故"未找到"不额外做存在性隐藏。
+    pub async fn cancel(
+        &self,
+        key: &IdempotencyKey,
+        ctx: &SubmitContext,
+    ) -> Result<(), CancelError> {
         if self.inner.closed.load(Ordering::SeqCst) {
             return Err(CancelError::EngineClosed);
         }
@@ -640,6 +760,21 @@ impl ControlEngine {
         let Some(queue) = queue else {
             return Err(CancelError::NotFound);
         };
+        // 授权（四审 P1）：按被取消操作的操作种类取要求角色。
+        let Some(kind) = queue.peek_kind(key) else {
+            return Err(CancelError::NotFound);
+        };
+        let required = self.inner.context.policy.required_role(kind);
+        if let Err(e) = self
+            .inner
+            .authorizer
+            .authorize(&ctx.subject, required, &key.device_id)
+        {
+            return Err(CancelError::Unauthorized {
+                code: e.code.to_owned(),
+                message: e.message,
+            });
+        }
         match queue.cancel(key) {
             CancelOutcome::Marked => {
                 self.notify_queue(key);
@@ -662,12 +797,34 @@ impl ControlEngine {
         }
     }
 
-    /// 查询既有结果（§77：异步控制轮询；§80.1 幂等查询）。
+    /// 查询请求状态（§77：异步控制轮询；§80.1 幂等查询）。
     ///
-    /// 只返回已结算的结果；未完成或未知请求返回 `None`。
+    /// 四审 P1：返回三态——`Unknown`（无记录）/`Running`（已接受未结算，
+    /// 含排队与执行中）/`Settled`（终态结果），"未知"与"正在执行"不再
+    /// 混淆。Journal 无记录但 active 注册表在途的提交同样报告 `Running`
+    /// （覆盖"已登记、幂等记录尚未落盘"的窗口）。
+    ///
+    /// 四审 P1：控制面查询需要授权——调用者角色须达到
+    /// [`ControlPolicy::control_status_required_role`]。
+    ///
     /// 三审 P2：过期清理与查询在阻塞线程池执行（受 Journal 并发闸门约束），
     /// 异步调用方不会在 Tokio worker 上做同步磁盘 I/O。
-    pub async fn status(&self, key: &IdempotencyKey) -> Option<ControlResult> {
+    pub async fn status(
+        &self,
+        key: &IdempotencyKey,
+        ctx: &SubmitContext,
+    ) -> Result<StatusQuery, StatusError> {
+        let required = self.inner.context.policy.control_status_required_role;
+        if let Err(e) = self
+            .inner
+            .authorizer
+            .authorize(&ctx.subject, required, &key.device_id)
+        {
+            return Err(StatusError::Unauthorized {
+                code: e.code.to_owned(),
+                message: e.message,
+            });
+        }
         let now = now_ns();
         let entry = crate::journal::purge_and_get(
             &self.inner.context.journal,
@@ -676,7 +833,26 @@ impl ControlEngine {
             now,
         )
         .await;
-        entry.and_then(|e| e.result)
+        match entry {
+            Some(entry) => match entry.result {
+                Some(result) => Ok(StatusQuery::Settled(result)),
+                None => Ok(StatusQuery::Running),
+            },
+            None => {
+                let in_flight = self
+                    .inner
+                    .context
+                    .active
+                    .lock()
+                    .expect("active 锁被毒化")
+                    .contains_key(key);
+                Ok(if in_flight {
+                    StatusQuery::Running
+                } else {
+                    StatusQuery::Unknown
+                })
+            }
+        }
     }
 
     /// 有序停机（§93 停机语义）。
@@ -718,9 +894,63 @@ impl ControlEngine {
             .clone()
     }
 
+    /// 拒绝收据（不触碰 shared/active/Journal）。
+    ///
+    /// 用于"本请求未创建 active 条目且未持久化"的路径（四审 P1：Journal
+    /// 插入失败且非 fresh）——条目属于其他在途提交，不得写其 shared 或
+    /// 移除其登记；仅审计后返回就绪收据。
+    async fn reject_unregistered(
+        &self,
+        request: &ControlRequest,
+        ctx: &SubmitContext,
+        code: &str,
+        message: String,
+    ) -> ControlReceipt {
+        let result = ControlResult {
+            request_id: request.request_id.clone(),
+            namespace: request.namespace.clone(),
+            device_id: request.device_id.clone(),
+            status: ControlStatus::Rejected,
+            started_at_ns: None,
+            completed_at_ns: Some(now_ns()),
+            result: None,
+            error: Some(ControlError {
+                code: code.to_owned(),
+                message,
+                details: None,
+            }),
+        };
+        // 审计（§90：每个反向控制必须记录）。四审 P2：有界超时，慢审计不阻塞。
+        let audit_meta = audit_meta_for(request, None);
+        crate::audit::record_bounded(
+            &self.inner.context.audit,
+            self.inner.context.policy.audit_timeout_ms,
+            crate::audit::build_event(
+                &ctx.subject,
+                &ctx.source,
+                &request.namespace,
+                &request.device_id,
+                &request.request_id,
+                audit_meta.operation,
+                &audit_meta.target,
+                &audit_meta.parameters,
+                None,
+                result.status,
+                result.error.as_ref().map(|e| e.code.clone()),
+                None,
+                0,
+                now_ns(),
+            ),
+        )
+        .await;
+        ControlReceipt::ready(result)
+    }
+
     /// 校验/授权/前置条件/队列满等 Driver 前的拒绝（§84、§85、§86）。
     ///
     /// 以 `Rejected` 结算：幂等 Journal 记录 + 审计（§90），并立即返回。
+    /// `shared` 必为已登记 active 的条目（三审 P1：active 在 Journal 插入前
+    /// 登记，拒绝路径结算 shared 并移除条目，并发等待者获得一致结果）。
     /// `shared` 必为已登记 active 的条目（三审 P1：active 在 Journal 插入前
     /// 登记，拒绝路径结算 shared 并移除条目，并发等待者获得一致结果）。
     async fn reject_with_shared(
@@ -774,24 +1004,29 @@ impl ControlEngine {
                 ..result
             };
         }
-        // 审计（§90：每个反向控制必须记录）。
+        // 审计（§90：每个反向控制必须记录）。四审 P2：有界超时，慢审计不阻塞。
         let audit_meta = audit_meta_for(request, None);
-        self.inner.context.audit.record(crate::audit::build_event(
-            &ctx.subject,
-            &ctx.source,
-            &request.namespace,
-            &request.device_id,
-            &request.request_id,
-            audit_meta.operation,
-            &audit_meta.target,
-            &audit_meta.parameters,
-            None,
-            result.status,
-            result.error.as_ref().map(|e| e.code.clone()),
-            None,
-            0,
-            now_ns(),
-        ));
+        crate::audit::record_bounded(
+            &self.inner.context.audit,
+            self.inner.context.policy.audit_timeout_ms,
+            crate::audit::build_event(
+                &ctx.subject,
+                &ctx.source,
+                &request.namespace,
+                &request.device_id,
+                &request.request_id,
+                audit_meta.operation,
+                &audit_meta.target,
+                &audit_meta.parameters,
+                None,
+                result.status,
+                result.error.as_ref().map(|e| e.code.clone()),
+                None,
+                0,
+                now_ns(),
+            ),
+        )
+        .await;
         // 结算共享结果并移除 active（P1-6：拒绝同样是终态，幂等等待者获得一致
         // 结果，不残留 stale 条目；shared 必为已登记 active 的条目）。
         self.inner

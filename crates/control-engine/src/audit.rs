@@ -82,16 +82,48 @@ pub enum AuditTarget<'a> {
 }
 
 /// 审计输出（§90，接口可替换）。
+///
+/// `async`（四审 P2）：实现可能涉及磁盘/网络写入；引擎侧以有界超时调用
+/// （[`crate::policy::ControlPolicy::audit_timeout_ms`]），超时放弃该条
+/// 审计并记录错误日志——慢审计不得阻塞控制 worker。实现方应尽量非阻塞
+/// （内部有界队列 + 后台落盘为推荐模式），且 `record` 被超时取消时不得
+/// 留下半写状态。
+#[async_trait::async_trait]
 pub trait AuditSink: Send + Sync {
-    fn record(&self, event: AuditEvent);
+    async fn record(&self, event: AuditEvent);
+}
+
+/// 带超时的审计写入（引擎统一入口，四审 P2）。
+///
+/// 超时放弃该条事件并记录 `audit_timeout` 错误日志：控制可用性优先于
+/// 单条审计完整性（阻塞控制 worker 的代价更高）；丢失会显式留痕。
+pub(crate) async fn record_bounded(
+    sink: &std::sync::Arc<dyn AuditSink>,
+    timeout_ms: u64,
+    event: AuditEvent,
+) {
+    if tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        sink.record(event),
+    )
+    .await
+    .is_err()
+    {
+        tracing::error!(
+            component = "control-engine",
+            error_code = "audit_timeout",
+            "审计写入超时，本条审计事件丢失（控制继续）"
+        );
+    }
 }
 
 /// 丢弃审计事件的输出（默认值）。
 #[derive(Debug, Default)]
 pub struct NoopAuditSink;
 
+#[async_trait::async_trait]
 impl AuditSink for NoopAuditSink {
-    fn record(&self, _event: AuditEvent) {}
+    async fn record(&self, _event: AuditEvent) {}
 }
 
 /// 内存收集审计输出（测试与进程内查看）。
@@ -120,8 +152,9 @@ impl MemoryAuditSink {
     }
 }
 
+#[async_trait::async_trait]
 impl AuditSink for MemoryAuditSink {
-    fn record(&self, event: AuditEvent) {
+    async fn record(&self, event: AuditEvent) {
         self.events
             .lock()
             .expect("MemoryAuditSink 锁被毒化")
@@ -178,10 +211,35 @@ fn numeric(kind: &'static str, summary: String) -> AuditParameter {
     }
 }
 
-/// 哈希摘要：只暴露长度与 SHA-256 前 12 位，绝不落完整内容。
+/// 进程级随机盐（四审 P2）：低熵密码/PIN 的普通 SHA-256 前缀可被攻击者
+/// 离线字典枚举；加盐后跨进程不可关联、不可预计算。盐来自 `RandomState`
+/// 的随机种子（std 无 OS 随机 API，该构造每实例产生不可预测的哈希密钥）。
+fn process_salt() -> &'static [u8; 32] {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+    static SALT: OnceLock<[u8; 32]> = OnceLock::new();
+    SALT.get_or_init(|| {
+        let mut salt = [0u8; 32];
+        for chunk in salt.chunks_mut(8) {
+            let v = std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish();
+            chunk.copy_from_slice(&v.to_le_bytes()[..chunk.len()]);
+        }
+        salt
+    })
+}
+
+/// 哈希摘要：只暴露长度与加盐 SHA-256 前 12 位，绝不落完整内容。
+///
+/// 四审 P2：盐为进程启动时随机生成——同一秘密在进程内前缀稳定（可做
+/// 关联分析），跨进程/重启不同，低熵凭据无法被预计算字典枚举。
 fn redact_hashed(kind: &'static str, data: &[u8]) -> AuditParameter {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(data);
+    let mut hasher = Sha256::new();
+    hasher.update(process_salt());
+    hasher.update(data);
+    let digest = hasher.finalize();
     let prefix = format!("{digest:x}");
     AuditParameter {
         name: "value".to_owned(),
@@ -338,8 +396,8 @@ mod tests {
         assert!(!summarized[1].summary.contains("hunter2"));
     }
 
-    #[test]
-    fn memory_sink_collects_events() {
+    #[tokio::test]
+    async fn memory_sink_collects_events() {
         let sink = MemoryAuditSink::new();
         let event = AuditEvent {
             user: "alice".to_owned(),
@@ -357,7 +415,7 @@ mod tests {
             duration_ms: 12,
             occurred_at_ns: 1_000,
         };
-        sink.record(event.clone());
+        sink.record(event.clone()).await;
         assert_eq!(sink.events(), vec![event]);
     }
 }

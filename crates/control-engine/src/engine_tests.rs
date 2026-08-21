@@ -20,7 +20,7 @@ use tokio::sync::watch;
 
 use crate::audit::{AuditOperation, MemoryAuditSink};
 use crate::catalog::{DeviceCatalog, MemoryDeviceCatalog, tests::profile_for_test};
-use crate::engine::{ControlEngine, ControlEngineConfig, SubmitContext, SubmitError};
+use crate::engine::{ControlEngine, ControlEngineConfig, StatusQuery, SubmitContext, SubmitError};
 use crate::executor::{ControlExecutor, ExecuteOutcome, WriteOutcome};
 use crate::journal::{ControlJournal, FileJournal, IdempotencyKey, InMemoryJournal, JournalError};
 use crate::policy::{CommandPriority, ControlPolicy, Priority};
@@ -38,6 +38,7 @@ struct MockExecutor {
     fail: RwLock<Option<DriverErrorInfo>>,
     indeterminate: RwLock<bool>,
     partial_fail: AtomicBool,
+    panic_once: AtomicBool,
     release: watch::Sender<bool>,
     _keep_rx: watch::Receiver<bool>,
 }
@@ -52,9 +53,15 @@ impl MockExecutor {
             fail: RwLock::new(None),
             indeterminate: RwLock::new(false),
             partial_fail: AtomicBool::new(false),
+            panic_once: AtomicBool::new(false),
             release,
             _keep_rx: rx,
         })
+    }
+
+    /// 下一次调用时 panic（四审 P2：worker panic 恢复测试用）。
+    fn set_panic_once(&self) {
+        self.panic_once.store(true, Ordering::SeqCst);
     }
 
     fn set_fail(&self, info: DriverErrorInfo) {
@@ -89,6 +96,9 @@ impl MockExecutor {
     /// 记录调用并（除非已 release）阻塞等待放行。
     async fn enter(&self, label: String) {
         self.calls.lock().expect("calls 锁被毒化").push(label);
+        if self.panic_once.swap(false, Ordering::SeqCst) {
+            panic!("模拟执行器 panic");
+        }
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_in_flight.fetch_max(now, Ordering::SeqCst);
         let mut rx = self.release.subscribe();
@@ -276,6 +286,65 @@ async fn wait_for_calls(executor: &MockExecutor, n: usize) {
     .expect("等待执行器调用超时");
 }
 
+/// 前置条件检查器：前 `pass_first` 次通过，其后失败（四审 P1 TOCTOU 测试）。
+struct CountingChecker {
+    remaining: AtomicUsize,
+}
+
+#[async_trait]
+impl PreconditionChecker for CountingChecker {
+    async fn check(
+        &self,
+        _device_id: &DeviceId,
+        _preconditions: &[observation_model::CommandPrecondition],
+    ) -> Result<(), PreconditionError> {
+        let prev = self.remaining.fetch_sub(1, Ordering::SeqCst);
+        if prev > 0 {
+            Ok(())
+        } else {
+            Err(PreconditionError {
+                message: "执行时前置条件不再满足".to_owned(),
+            })
+        }
+    }
+}
+
+/// 前置条件检查器：固定延迟后通过（四审 P1 超时测试）。
+struct SlowChecker {
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl PreconditionChecker for SlowChecker {
+    async fn check(
+        &self,
+        _device_id: &DeviceId,
+        _preconditions: &[observation_model::CommandPrecondition],
+    ) -> Result<(), PreconditionError> {
+        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+        Ok(())
+    }
+}
+
+/// 慢审计输出（四审 P2：审计超时不阻塞控制）。
+struct SlowAuditSink {
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl crate::audit::AuditSink for SlowAuditSink {
+    async fn record(&self, _event: crate::audit::AuditEvent) {
+        tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
+    }
+}
+
+fn context_for(subject: &str) -> SubmitContext {
+    SubmitContext {
+        subject: subject.to_owned(),
+        source: "rest:127.0.0.1:53211".to_owned(),
+    }
+}
+
 // ---- 装配辅助 ---------------------------------------------------------------
 
 const NS: &str = "plant-a";
@@ -301,7 +370,13 @@ fn authorizer(role: Role) -> Arc<MemoryAuthorizer> {
 }
 
 fn default_policy() -> Arc<ControlPolicy> {
-    Arc::new(ControlPolicy::default())
+    let mut policy = ControlPolicy::default();
+    // 测试 Profile 的命令声明了前置条件（§85）：fail-closed 语义下
+    // 未配置检查器会被拒绝，故默认挂载放行检查器；前置条件专项测试
+    // 自行覆盖（AlwaysFailChecker / 无检查器）。
+    policy.precondition_checker =
+        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
+    Arc::new(policy)
 }
 
 fn write_request(id: &str, path: &str, value: Value) -> ControlRequest {
@@ -631,12 +706,17 @@ async fn idempotent_duplicate_returns_existing_result() {
     assert_eq!(second.status, ControlStatus::Succeeded);
     assert_eq!(executor.call_count(), 1, "幂等命中不得重复执行");
 
-    // status() 查询（§77 轮询）。
+    // status() 查询（§77 轮询；四审 P1：三态区分）。
     let queried = engine
-        .status(&key("dup-1"))
+        .status(&key("dup-1"), &context())
         .await
         .expect("应可查询既有结果");
-    assert_eq!(queried.status, ControlStatus::Succeeded);
+    match queried {
+        StatusQuery::Settled(result) => {
+            assert_eq!(result.status, ControlStatus::Succeeded);
+        }
+        other => panic!("已结算请求应返回 Settled，实际 {other:?}"),
+    }
 }
 
 /// 幂等冲突：同 key + 不同 payload → SubmitError::Conflict（§80.1）。
@@ -820,7 +900,7 @@ async fn cancel_settles_cancelled() {
         .await
         .unwrap();
     wait_for_calls(&executor, 1).await; // 已进入执行器（运行中）
-    engine.cancel(&key("x-1")).await.unwrap();
+    engine.cancel(&key("x-1"), &context()).await.unwrap();
     let result = receipt.wait().await;
     assert_eq!(result.status, ControlStatus::Indeterminate);
     assert_eq!(result.error.unwrap().code, "CANCELLED");
@@ -836,7 +916,7 @@ async fn cancel_settles_cancelled() {
         .submit(command_request("x-3", true), &context())
         .await
         .unwrap();
-    engine.cancel(&key("x-3")).await.unwrap();
+    engine.cancel(&key("x-3"), &context()).await.unwrap();
     executor.release(); // x-2 完成 → worker 取 x-3（已取消 → Cancelled）
     let result = queued_receipt.wait().await;
     assert_eq!(result.status, ControlStatus::Cancelled);
@@ -844,7 +924,11 @@ async fn cancel_settles_cancelled() {
 
     // 已结算：再次取消 → NotFound。
     assert_eq!(
-        engine.cancel(&key("x-1")).await.unwrap_err().to_string(),
+        engine
+            .cancel(&key("x-1"), &context())
+            .await
+            .unwrap_err()
+            .to_string(),
         "请求不存在（已结算或未知）"
     );
     // 取消不存在的 key 不得误伤运行中的请求（P1-3）。
@@ -855,7 +939,7 @@ async fn cancel_settles_cancelled() {
     wait_for_calls(&executor, 3).await; // x-4 已进入执行器（阻塞中）
     assert_eq!(
         engine
-            .cancel(&key("x-nonexistent"))
+            .cancel(&key("x-nonexistent"), &context())
             .await
             .unwrap_err()
             .to_string(),
@@ -875,6 +959,9 @@ async fn priority_ordering() {
     let mut policy = ControlPolicy::default();
     policy.property_write_priority = Priority::Low;
     policy.command_priority = CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]);
+    // 命令声明了前置条件（§85）：fail-closed 下需挂载放行检查器。
+    policy.precondition_checker =
+        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
@@ -1038,7 +1125,7 @@ async fn shutdown_closes_engine() {
         Ok(_) => panic!("停机后不得接收新请求"),
     };
     assert!(matches!(err, SubmitError::EngineClosed));
-    assert!(engine.cancel(&key("sh-1")).await.is_err());
+    assert!(engine.cancel(&key("sh-1"), &context()).await.is_err());
 }
 
 /// P1-1：幂等记录插入失败 → 拒绝（JOURNAL_UNAVAILABLE），执行器零调用
@@ -1298,8 +1385,14 @@ async fn forced_abort_settles_abandoned_entries() {
 
     // Journal 不残留 Running（均已结算）。
     let key = key("ab-1");
-    let entry = engine.status(&key).await.expect("ab-1 应已结算");
-    assert_ne!(entry.status, ControlStatus::Running);
+    let entry = engine
+        .status(&key, &context())
+        .await
+        .expect("ab-1 应已结算");
+    assert!(
+        matches!(entry, StatusQuery::Settled(_)),
+        "已中止请求应返回终态，实际 {entry:?}"
+    );
 }
 
 /// P1-6：并发重复提交在首请求执行期间命中 active → 等待并共享同一结果，
@@ -1515,4 +1608,397 @@ async fn reject_path_settle_failure_downgrades_to_indeterminate() {
         "拒绝结算失败必须降级为 Indeterminate"
     );
     assert_eq!(executor.call_count(), 0);
+}
+
+/// 四审 P1：Profile 声明前置条件但未配置检查器 → fail-closed 拒绝
+/// （PRECONDITION_UNCONFIGURED），执行器零调用。
+#[tokio::test]
+async fn precondition_unconfigured_fails_closed() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut policy = ControlPolicy::default();
+    policy.precondition_checker = None; // 未配置检查器
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(policy),
+    );
+
+    let result = engine
+        .submit(command_request("pc-1", true), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Rejected);
+    assert_eq!(result.error.unwrap().code, "PRECONDITION_UNCONFIGURED");
+    assert_eq!(executor.call_count(), 0, "fail-closed 不得下发 Driver");
+}
+
+/// 四审 P1（TOCTOU）：提交时前置条件满足、执行时不再满足 → 在 Driver 前
+/// 以 Failed(PRECONDITION_FAILED) 结算，执行器零调用。
+#[tokio::test]
+async fn precondition_rechecked_at_execution_time() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut policy = ControlPolicy::default();
+    policy.precondition_checker = Some(Arc::new(CountingChecker {
+        remaining: AtomicUsize::new(1), // 提交期通过，执行期复查失败
+    }));
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(policy),
+    );
+
+    let result = engine
+        .submit(command_request("to-1", true), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Failed);
+    assert_eq!(result.error.unwrap().code, "PRECONDITION_FAILED");
+    assert_eq!(executor.call_count(), 0, "复查失败必须在 Driver 前拦截");
+}
+
+/// 四审 P1：前置条件检查器卡死 → 受策略超时约束，以
+/// PRECONDITION_TIMEOUT fail-closed 拒绝，不阻塞提交。
+#[tokio::test]
+async fn precondition_check_timeout_is_fail_closed() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut policy = ControlPolicy::default();
+    policy.precondition_timeout_ms = 50;
+    policy.precondition_checker = Some(Arc::new(SlowChecker { delay_ms: 5_000 }));
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(policy),
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        engine
+            .submit(command_request("pt-1", true), &context())
+            .await
+            .unwrap()
+            .wait()
+            .await
+    })
+    .await
+    .expect("检查超时必须及时返回");
+    assert_eq!(result.status, ControlStatus::Rejected);
+    assert_eq!(result.error.unwrap().code, "PRECONDITION_TIMEOUT");
+    assert_eq!(executor.call_count(), 0);
+}
+
+/// 四审 P1：status() 三态——执行中 Running / 未知 Unknown / 已结算 Settled。
+#[tokio::test]
+async fn status_distinguishes_running_unknown_settled() {
+    let executor = MockExecutor::new(); // 阻塞
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    engine
+        .submit(frequency_write("st-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    // 执行中：Running（不是 None/Unknown）。
+    match engine.status(&key("st-1"), &context()).await.unwrap() {
+        StatusQuery::Running => {}
+        other => panic!("执行中应返回 Running，实际 {other:?}"),
+    }
+    // 未知 key：Unknown。
+    match engine.status(&key("st-none"), &context()).await.unwrap() {
+        StatusQuery::Unknown => {}
+        other => panic!("未知请求应返回 Unknown，实际 {other:?}"),
+    }
+    executor.release();
+    let result = engine
+        .submit(frequency_write("st-1", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Succeeded);
+    match engine.status(&key("st-1"), &context()).await.unwrap() {
+        StatusQuery::Settled(r) => assert_eq!(r.status, ControlStatus::Succeeded),
+        other => panic!("已结算应返回 Settled，实际 {other:?}"),
+    }
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 四审 P1：cancel/status 需要授权上下文——低权限主体被拒绝。
+#[tokio::test]
+async fn cancel_and_status_require_authorization() {
+    let executor = MockExecutor::new(); // 阻塞制造排队窗口
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    let receipt = engine
+        .submit(frequency_write("au-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+
+    // 无角色主体：status 与 cancel 均拒绝。
+    let err = engine
+        .status(&key("au-1"), &context_for("mallory"))
+        .await
+        .unwrap_err();
+    match err {
+        crate::engine::StatusError::Unauthorized { code, .. } => {
+            assert_eq!(code, "INSUFFICIENT_ROLE")
+        }
+    }
+    let err = engine
+        .cancel(&key("au-1"), &context_for("mallory"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::engine::CancelError::Unauthorized { .. }),
+        "低权限取消应被拒绝，实际 {err:?}"
+    );
+
+    // 授权主体正常取消：取消令牌先触发，select! 以 Indeterminate 结算
+    // （先断言再放行执行器，避免两分支同时就绪的随机选择）。
+    engine.cancel(&key("au-1"), &context()).await.unwrap();
+    let result = receipt.wait().await;
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+    executor.release();
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 四审 P2：requested_at_ns 过旧的请求以 REQUEST_TOO_OLD 拒绝。
+#[tokio::test]
+async fn stale_request_rejected() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    let mut request = frequency_write("old-1", 10.0);
+    request.requested_at_ns = now_ns() - 10 * 60 * 1_000_000_000; // 10 分钟前
+    let err = match engine.submit(request, &context()).await {
+        Err(e) => e,
+        Ok(_) => panic!("过旧请求应被拒绝"),
+    };
+    match err {
+        SubmitError::InvalidRequest { code, .. } => assert_eq!(code, "REQUEST_TOO_OLD"),
+        other => panic!("应为 InvalidRequest，实际 {other:?}"),
+    }
+    assert_eq!(executor.call_count(), 0);
+}
+
+/// 四审 P2：worker panic 后队列自动恢复——遗留请求以 Indeterminate 结算，
+/// 新请求由重启的 worker 正常执行。
+#[tokio::test]
+async fn worker_panic_queue_recovers() {
+    let executor = MockExecutor::new();
+    executor.release();
+    executor.set_panic_once();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = in_memory_engine(executor.clone(), audit.clone());
+
+    // 首个请求触发执行器 panic → worker 任务终止（调用已计数）。
+    let first = engine
+        .submit(frequency_write("wp-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await; // 留出 panic 传播时间
+
+    // 后续请求触发 ensure_worker 重启：遗留请求先结算，再执行新请求。
+    let second = engine
+        .submit(frequency_write("wp-2", 20.0), &context())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), first.wait())
+        .await
+        .expect("panic 后收据不得永久挂起");
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+    assert_eq!(result.error.unwrap().code, "QUEUE_WORKER_ABORTED");
+    let second_result = tokio::time::timeout(Duration::from_secs(2), second.wait())
+        .await
+        .expect("重启后的 worker 应正常执行");
+    assert_eq!(second_result.status, ControlStatus::Succeeded);
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 四审 P2：慢审计不阻塞控制——审计写入超时后控制照常完成。
+#[tokio::test]
+async fn slow_audit_does_not_block_control() {
+    let executor = MockExecutor::new();
+    executor.release();
+    let mut policy = ControlPolicy::default();
+    policy.audit_timeout_ms = 20;
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        Arc::new(SlowAuditSink { delay_ms: 5_000 }),
+        Arc::new(policy),
+    );
+
+    let started = std::time::Instant::now();
+    let result = engine
+        .submit(frequency_write("sa-1", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(result.status, ControlStatus::Succeeded);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "慢审计不得阻塞控制（耗时 {:?}）",
+        started.elapsed()
+    );
+}
+
+/// 四审 P2：审计摘要加盐——同一秘密的哈希前缀不再是裸 SHA-256
+/// （低熵凭据无法离线字典枚举）。
+#[test]
+fn audit_secret_hash_is_salted() {
+    use sha2::{Digest, Sha256};
+    let secret = b"low-entropy-pin";
+    let summarized =
+        crate::audit::summarize_value(&Value::String(String::from_utf8(secret.to_vec()).unwrap()));
+    let plain = format!("{:x}", Sha256::digest(secret));
+    assert!(
+        !summarized.summary.contains(&plain[..12]),
+        "摘要不得等于裸 SHA-256 前缀（必须加盐）: {}",
+        summarized.summary
+    );
+}
+
+/// 四审 P2：优先级老化——低优先级请求排队超过阈值后晋升有效优先级，
+/// 先于后到的高基础优先级请求执行（防饿死）。
+#[tokio::test]
+async fn priority_aging_prevents_starvation() {
+    let executor = MockExecutor::new(); // 阻塞制造排队窗口
+    let audit = Arc::new(MemoryAuditSink::new());
+    let mut policy = ControlPolicy::default();
+    policy.priority_aging_ms = 60;
+    policy.property_write_priority = Priority::Low;
+    policy.command_priority = CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]);
+    policy.precondition_checker =
+        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(policy),
+    );
+
+    // 占用 worker（High，命令标签 cmd:...）。
+    let holder = engine
+        .submit(command_request("ag-h", true), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    // 低优先级写入排队并老化（250ms / 60ms → boost 3 → 有效 Critical）。
+    let aged = engine
+        .submit(frequency_write("ag-l", 10.0), &context())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    // 后到的高基础优先级命令（有效 High=2 < 老化后的 3）。
+    let challenger = engine
+        .submit(command_request("ag-m", false), &context())
+        .await
+        .unwrap();
+
+    executor.release();
+    wait_for_calls(&executor, 3).await;
+    executor.release();
+    let calls = executor.calls();
+    // 老化的 Low 写入先于后到的 High 命令执行。
+    assert!(
+        calls[1].starts_with("write:"),
+        "老化的低优先级写入应先执行: {calls:?}"
+    );
+    assert!(
+        calls[2].starts_with("cmd:"),
+        "后到的命令应后执行: {calls:?}"
+    );
+    let aged_result = tokio::time::timeout(Duration::from_secs(2), aged.wait())
+        .await
+        .expect("老化请求应完成");
+    let challenger_result = tokio::time::timeout(Duration::from_secs(2), challenger.wait())
+        .await
+        .expect("挑战请求应完成");
+    assert_eq!(aged_result.status, ControlStatus::Succeeded);
+    assert_eq!(challenger_result.status, ControlStatus::Succeeded);
+    assert_eq!(holder.wait().await.status, ControlStatus::Succeeded);
+}
+
+/// 四审 P1：同 key 异 payload 的 Conflict 不得留下无主 stale active 条目
+/// ——否则后续同 key 重复提交会误判"命中活跃执行"而永久挂起。
+#[tokio::test]
+async fn conflict_over_stale_running_record_leaves_no_stale_active() {
+    let journal = FailingJournal::new();
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    // 首个执行：结算落盘失败 → Journal 停留 Running、无活跃执行者。
+    journal.fail_settle(true);
+    let first = engine
+        .submit(command_request("cx-1", true), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(first.error.unwrap().code, "JOURNAL_SETTLE_FAILED");
+    journal.fail_settle(false);
+
+    // 同 key 异 payload：Conflict（existing Running）——不得残留 active。
+    let conflicted = engine
+        .submit(command_request("cx-1", false), &context())
+        .await;
+    assert!(conflicted.is_err(), "异 payload 应返回 Conflict");
+
+    // 同 key 同 payload 重提：必须立即返回 Indeterminate，不得挂起。
+    let result = tokio::time::timeout(Duration::from_secs(2), async {
+        engine
+            .submit(command_request("cx-1", true), &context())
+            .await
+            .unwrap()
+            .wait()
+            .await
+    })
+    .await
+    .expect("重提不得因 stale active 挂起");
+    assert_eq!(result.status, ControlStatus::Indeterminate);
+    assert_eq!(result.error.unwrap().code, "EXECUTION_INTERRUPTED");
+    assert_eq!(
+        executor.call_count(),
+        1,
+        "仅首个执行调用 Driver，重提不得重放"
+    );
+    engine.shutdown(Duration::from_millis(500)).await;
 }

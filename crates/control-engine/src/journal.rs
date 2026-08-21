@@ -340,6 +340,18 @@ impl FileJournal {
         out.sync_all()?;
         drop(out);
         std::fs::rename(&temp, &self.path)?;
+        // 四审 P2：rename 后 fsync 父目录——否则崩溃时目录项变更可能未落盘，
+        // 重启后文件回退到旧内容（已结算记录丢失 → 同请求可能重复执行）。
+        // Windows 不支持以 fsync 语义打开目录（句柄无 sync_all），其 NTFS
+        // 元数据日志已保证 rename 原子可见，此处仅对 POSIX 平台补齐。
+        #[cfg(unix)]
+        {
+            if let Some(parent) = self.path.parent() {
+                if let Ok(dir) = File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
         let file = OpenOptions::new().append(true).open(&self.path)?;
         inner.file = file;
         Ok(())

@@ -155,6 +155,25 @@ impl DeviceQueue {
         Ok(())
     }
 
+    /// 查找请求的操作种类（四审 P1：取消前授权用）。
+    ///
+    /// 扫描排队与运行中条目；未找到返回 `None`。
+    pub fn peek_kind(&self, key: &IdempotencyKey) -> Option<crate::policy::OperationKind> {
+        let inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+        for deque in inner.entries.values() {
+            for entry in deque.iter() {
+                if entry.key.namespace == key.namespace && entry.key.request_id == key.request_id {
+                    return Some(entry.operation.kind());
+                }
+            }
+        }
+        inner
+            .running
+            .as_ref()
+            .filter(|e| e.key.namespace == key.namespace && e.key.request_id == key.request_id)
+            .map(|e| e.operation.kind())
+    }
+
     /// 取消：标记排队中或执行中的请求（worker 统一结算 `Cancelled`）。
     pub fn cancel(&self, key: &IdempotencyKey) -> CancelOutcome {
         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
@@ -270,9 +289,13 @@ impl DeviceQueue {
     }
 
     /// 惰性启动 worker（每设备一个，串行执行，§87）。
+    ///
+    /// 四审 P2：worker 任务 panic 后句柄仍在但任务已死——`is_finished()`
+    /// 检测到已结束的 worker 时重新拉起，避免队列永久失活（排队请求无人
+    /// 处理、收据永久挂起）。
     fn ensure_worker(self: &Arc<Self>, ctx: &Arc<EngineContext>) {
         let mut worker = self.worker.lock().expect("DeviceQueue worker 锁被毒化");
-        if worker.is_none() {
+        if worker.as_ref().is_none_or(|h| h.is_finished()) {
             let this = self.clone();
             let ctx = ctx.clone();
             *worker = Some(tokio::spawn(async move {
@@ -282,6 +305,30 @@ impl DeviceQueue {
     }
 
     async fn worker_loop(self: &Arc<Self>, ctx: &Arc<EngineContext>) {
+        // 四审 P2：前一个 worker panic 遗留的"运行中"条目在此结算——
+        // 执行结果未知（Indeterminate），收据与 Journal 不残留。
+        let orphan = {
+            let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+            inner.running.take()
+        };
+        if let Some(entry) = orphan.filter(|e| !e.reply.is_set()) {
+            warn!(
+                component = "control-engine",
+                device_id = %self.device_id,
+                request_id = %entry.key.request_id,
+                error_code = "queue_worker_panic",
+                "检测到已终止 worker 的遗留请求，以 Indeterminate 结算"
+            );
+            settle_entry(
+                ctx,
+                entry,
+                RunResult::Indeterminate(
+                    "QUEUE_WORKER_ABORTED",
+                    "控制队列 worker 异常终止，执行结果未知",
+                ),
+            )
+            .await;
+        }
         loop {
             // 取最高优先级、FIFO 顺序的请求；已取消/已过期的就地弹出并结算。
             let picked: Option<Picked> = {
@@ -296,10 +343,34 @@ impl DeviceQueue {
                     return;
                 }
                 let mut picked = None;
-                for deque in inner.entries.values_mut().rev() {
-                    if deque.is_empty() {
+                // 四审 P2：优先级老化——低优先级请求排队超过阈值后按停留
+                // 时长逐级提升有效优先级（至 Critical），防止严格优先级调度
+                // 长期饿死低优先级队列（过期/取消条目直接取走结算，不参与
+                // 比较）。同级内仍保持 FIFO；同有效优先级时基础优先级高者
+                // 先行（降序遍历 + 严格大于实现）。
+                let aging_ms = ctx.policy.priority_aging_ms;
+                let now_ns = now_ns();
+                let mut best: Option<(i64, Priority)> = None;
+                for (prio, deque) in inner.entries.iter().rev() {
+                    let Some(front) = deque.front() else {
                         continue;
+                    };
+                    let ready = !front.is_cancelled() && Instant::now() < front.deadline;
+                    let base = *prio as i64;
+                    let boost = if aging_ms > 0 && ready {
+                        let waited_ms =
+                            now_ns.saturating_sub(front.audit_meta.queued_at_ns) / 1_000_000;
+                        (waited_ms / aging_ms as i64).clamp(0, 3 - base)
+                    } else {
+                        0
+                    };
+                    let eff = base + boost;
+                    if best.is_none_or(|(best_eff, _)| eff > best_eff) {
+                        best = Some((eff, *prio));
                     }
+                }
+                if let Some((_, prio)) = best {
+                    let deque = inner.entries.get_mut(&prio).expect("存在");
                     let front = deque.front().expect("非空");
                     let kind = if front.is_cancelled() {
                         PickedKind::Cancelled
@@ -311,7 +382,6 @@ impl DeviceQueue {
                     let entry = deque.pop_front().expect("front 非空");
                     inner.len -= 1;
                     picked = Some(Picked { entry, kind });
-                    break;
                 }
                 picked
             };
@@ -494,7 +564,56 @@ async fn run_operation(
                 },
             }
         }
-        ValidatedOperation::Execute { command, .. } => {
+        ValidatedOperation::Execute {
+            command,
+            preconditions,
+            risk_level: _,
+        } => {
+            // 四审 P1（TOCTOU）：入队前的前置条件检查通过不代表执行时仍满足
+            // ——设备状态可能在排队期间变化。Driver 调用前必须复查；此时
+            // 尚未下发，失败为确定性失败（`Failed`，非 Indeterminate）。
+            // 检查器缺失同样 fail-closed（与提交期语义一致）；单次检查受
+            // 策略超时约束，卡死的检查器不得占用设备 worker。
+            if !preconditions.is_empty() {
+                let failure = match ctx.policy.precondition_checker() {
+                    None => Some(observation_model::ControlError {
+                        code: "PRECONDITION_UNCONFIGURED".to_owned(),
+                        message: "命令声明了前置条件但引擎未配置前置条件检查器".to_owned(),
+                        details: None,
+                    }),
+                    Some(checker) => {
+                        let check = checker.check(device_id, preconditions);
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(ctx.policy.precondition_timeout_ms),
+                            check,
+                        )
+                        .await
+                        {
+                            Err(_) => Some(observation_model::ControlError {
+                                code: "PRECONDITION_TIMEOUT".to_owned(),
+                                message: format!(
+                                    "前置条件检查超时（{} ms）",
+                                    ctx.policy.precondition_timeout_ms
+                                ),
+                                details: None,
+                            }),
+                            Ok(Err(e)) => Some(observation_model::ControlError {
+                                code: "PRECONDITION_FAILED".to_owned(),
+                                message: e.message,
+                                details: None,
+                            }),
+                            Ok(Ok(())) => None,
+                        }
+                    }
+                };
+                if let Some(error) = failure {
+                    return ControlResult {
+                        status: observation_model::ControlStatus::Failed,
+                        error: Some(error),
+                        ..base
+                    };
+                }
+            }
             let outcome = ctx.executor.execute(device_id, command).await;
             match outcome {
                 crate::executor::ExecuteOutcome::Succeeded(raw) => {
@@ -628,31 +747,37 @@ async fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResu
         .remove(&entry.key);
 
     // 审计（§90：每个反向控制必须记录；含拒绝/超时/取消）。
+    // 四审 P2：有界超时，慢审计不阻塞设备 worker。
     let duration_ms = completed_at_ns
         .saturating_sub(entry.audit_meta.queued_at_ns)
         .max(0) as u64
         / 1_000_000;
-    ctx.audit.record(crate::audit::build_event(
-        &entry.subject,
-        &entry.source,
-        &entry.key.namespace,
-        &entry.key.device_id,
-        &entry.key.request_id,
-        entry.audit_meta.operation,
-        &entry.audit_meta.target,
-        &entry.audit_meta.parameters,
-        entry.audit_meta.risk_level,
-        result.status,
-        result.error.as_ref().map(|e| e.code.clone()),
-        result.result.as_ref().and_then(|r| match r {
-            observation_model::ControlPayloadResult::PropertyWrite(items) => {
-                items.iter().find_map(|i| i.protocol_code)
-            }
-            observation_model::ControlPayloadResult::Command(c) => c.device_code,
-        }),
-        duration_ms,
-        completed_at_ns,
-    ));
+    crate::audit::record_bounded(
+        &ctx.audit,
+        ctx.policy.audit_timeout_ms,
+        crate::audit::build_event(
+            &entry.subject,
+            &entry.source,
+            &entry.key.namespace,
+            &entry.key.device_id,
+            &entry.key.request_id,
+            entry.audit_meta.operation,
+            &entry.audit_meta.target,
+            &entry.audit_meta.parameters,
+            entry.audit_meta.risk_level,
+            result.status,
+            result.error.as_ref().map(|e| e.code.clone()),
+            result.result.as_ref().and_then(|r| match r {
+                observation_model::ControlPayloadResult::PropertyWrite(items) => {
+                    items.iter().find_map(|i| i.protocol_code)
+                }
+                observation_model::ControlPayloadResult::Command(c) => c.device_code,
+            }),
+            duration_ms,
+            completed_at_ns,
+        ),
+    )
+    .await;
 
     // 回传结果（§77 异步控制：提交后等待/轮询结果）。
     entry.reply.set(result);

@@ -107,6 +107,9 @@ pub enum ValidationError {
     /// 参数包含非有限浮点（NaN/±Inf，P1-C）——无法编码为合法协议值
     /// 且会破坏范围比较，拒绝（不得转为 JSON null 静默透传）。
     ParameterNotFinite { command: String, parameter: String },
+    /// 命令参数对整数类型不具可表示性（四审 P1/P2：如 `U16` 参数携带
+    /// `F64(1.5)` 或负数——无法无损编码为协议值，Driver 侧编码必然失真）。
+    ParameterNotRepresentable { command: String, parameter: String },
     /// 空写入请求（`items` 为空，P2）——没有任何语义操作，拒绝，
     /// 避免空写入被当作成功操作返回。
     EmptyWrite,
@@ -130,6 +133,7 @@ impl ValidationError {
             ValidationError::DuplicateParameter { .. } => "DUPLICATE_PARAMETER",
             ValidationError::ParameterOutOfRange { .. } => "PARAMETER_OUT_OF_RANGE",
             ValidationError::ParameterNotFinite { .. } => "PARAMETER_NOT_FINITE",
+            ValidationError::ParameterNotRepresentable { .. } => "PARAMETER_NOT_REPRESENTABLE",
             ValidationError::EmptyWrite => "EMPTY_WRITE",
             ValidationError::ProfileConfiguration { .. } => "PROFILE_CONFIGURATION",
         }
@@ -192,6 +196,12 @@ impl std::fmt::Display for ValidationError {
             }
             ValidationError::ParameterNotFinite { command, parameter } => {
                 write!(f, "命令 {command} 参数 {parameter} 不是有限数值（NaN/Inf）")
+            }
+            ValidationError::ParameterNotRepresentable { command, parameter } => {
+                write!(
+                    f,
+                    "命令 {command} 参数 {parameter} 对目标整数类型不具可表示性"
+                )
             }
             ValidationError::EmptyWrite => write!(f, "写入请求不包含任何属性项"),
             ValidationError::ProfileConfiguration { path, reason } => {
@@ -296,6 +306,15 @@ pub fn validate_command(
                 command: request.command.clone(),
                 parameter: param.name.clone(),
                 expected: desc.data_type.clone(),
+            });
+        }
+        // 四审 P1/P2：数值族互通的类型检查之上，整数类型参数必须可无损
+        // 表示——`U16` 参数不得携带 `F64(1.5)`、负数或超范围整数（Driver
+        // 侧编码必然失真或拒绝）。
+        if !value_representable(&param.value, &desc.data_type) {
+            return Err(ValidationError::ParameterNotRepresentable {
+                command: request.command.clone(),
+                parameter: param.name.clone(),
             });
         }
         if !param_within_range(&param.value, desc.min.as_ref(), desc.max.as_ref()) {
@@ -431,6 +450,74 @@ fn is_numeric_value(v: &Value) -> bool {
             | Value::F32(_)
             | Value::F64(_)
     )
+}
+
+fn is_integer_type(t: &DataType) -> bool {
+    matches!(
+        t,
+        DataType::I8
+            | DataType::I16
+            | DataType::I32
+            | DataType::I64
+            | DataType::U8
+            | DataType::U16
+            | DataType::U32
+            | DataType::U64
+    )
+}
+
+/// 整数类型的取值范围（i128 精确承载，防 64 位边界经 f64 失真）。
+fn integer_range(t: &DataType) -> Option<std::ops::RangeInclusive<i128>> {
+    Some(match t {
+        DataType::I8 => i128::from(i8::MIN)..=i128::from(i8::MAX),
+        DataType::I16 => i128::from(i16::MIN)..=i128::from(i16::MAX),
+        DataType::I32 => i128::from(i32::MIN)..=i128::from(i32::MAX),
+        DataType::I64 => i128::from(i64::MIN)..=i128::from(i64::MAX),
+        DataType::U8 => 0..=i128::from(u8::MAX),
+        DataType::U16 => 0..=i128::from(u16::MAX),
+        DataType::U32 => 0..=i128::from(u32::MAX),
+        DataType::U64 => 0..=i128::from(u64::MAX),
+        _ => return None,
+    })
+}
+
+/// 数值可表示性（四审 P1/P2）：整数类型参数必须能无损承载。
+///
+/// - 整数值（`I8..U64`）：须落在目标整数类型范围内；
+/// - 浮点值（`F32/F64`）：必须是整数值（无小数部分），且在 `|f| < 2^53`
+///   内——超出后 f64 无法精确区分相邻整数、无法可靠判定可表示性，直接
+///   拒绝；再校验落在目标整数类型范围内；
+/// - 浮点目标类型接受任意有限数值（整数可无损升格为浮点）；
+/// - 复合类型（`Array`/`Struct`）递归校验元素/字段；非数值值不在此校验
+///   （由 [`value_matches_type`] 负责）。
+fn value_representable(value: &Value, data_type: &DataType) -> bool {
+    match (data_type, value) {
+        (DataType::Array(elem), Value::Array(items)) => {
+            items.iter().all(|v| value_representable(v, elem))
+        }
+        (DataType::Struct(fields), Value::Struct(values)) => fields.iter().all(|f| {
+            values
+                .iter()
+                .filter(|v| v.name == f.name)
+                .all(|v| value_representable(&v.value, &f.data_type))
+        }),
+        (t, v) if is_integer_type(t) && is_numeric_value(v) => {
+            let Some(range) = integer_range(t) else {
+                return true;
+            };
+            if let Some(i) = value_to_i128(v) {
+                range.contains(&i)
+            } else {
+                let Some(f) = value_to_f64(v) else {
+                    return true;
+                };
+                f.fract() == 0.0
+                    && f.abs() < 9_007_199_254_740_992.0
+                    && range.contains(&(f as i128))
+            }
+        }
+        _ => true,
+    }
 }
 
 /// 参数范围校验（§84）；整数走 `i128` 精确比较（防 64 位整数经 f64 失真），
@@ -878,8 +965,9 @@ mod tests {
                 min: None,
                 max: None,
             });
-        // U16 descriptor 接受任意数值变体（与写入语义一致）。
-        for value in [Value::U16(1), Value::I32(1), Value::F64(1.5)] {
+        // 四审 P1/P2：U16 descriptor 接受可无损表示的数值变体；
+        // 非整数浮点/负数/超范围值拒绝（PARAMETER_NOT_REPRESENTABLE）。
+        for value in [Value::U16(1), Value::I32(1), Value::F64(2.0)] {
             validate_command(
                 &profile,
                 &CommandRequest {
@@ -891,6 +979,29 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| panic!("数值变体 {value:?} 应被接受: {e}"));
+        }
+        for value in [
+            Value::F64(1.5),
+            Value::I32(-1),
+            Value::F64(-0.5),
+            Value::F64(70_000.0),
+        ] {
+            let err = validate_command(
+                &profile,
+                &CommandRequest {
+                    command: "drive.reset".to_owned(),
+                    parameters: vec![
+                        param("ack", Value::Bool(true)),
+                        param("level", value.clone()),
+                    ],
+                },
+            )
+            .expect_err("不可表示的数值变体应被拒绝");
+            assert_eq!(
+                err.code(),
+                "PARAMETER_NOT_REPRESENTABLE",
+                "{value:?} 应判定为不可表示"
+            );
         }
     }
 
