@@ -98,6 +98,14 @@ struct QueueInner {
     /// 正在执行的请求条目（§87 cancel：运行中的请求也须可取消；
     /// 保存完整条目以便强制中止时结算，且取消按幂等键匹配防止误取消）。
     running: Option<QueuedEntry>,
+    /// 已脱离 `entries`、正在等待/处于结算中的条目（五审回归 P1）。
+    ///
+    /// 共享可见不变量：任何条目在 `reply.is_set()` 之前必须始终可从共享
+    /// 状态（`entries`/`running`/`draining`）到达——worker 只能在
+    /// `settle_entry` 完成后才把它从共享结构移除。否则强制中止落在结算
+    /// await 点时，条目随 worker 本地状态一起丢失，收据永久挂起且 Journal
+    /// 残留 Running（`settle_abandoned` 无法接管）。
+    draining: VecDeque<QueuedEntry>,
     /// 不确定结果冷却期截止时刻（五审 P1）：底层物理动作可能仍在进行，
     /// 冷却期内 worker 不启动新动作。
     cooldown_until: Option<Instant>,
@@ -131,6 +139,7 @@ impl DeviceQueue {
                 closed: false,
                 len: 0,
                 running: None,
+                draining: VecDeque::new(),
                 cooldown_until: None,
             }),
             closed_flag,
@@ -144,6 +153,34 @@ impl DeviceQueue {
     pub fn in_cooldown(&self) -> bool {
         let inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
         inner.cooldown_until.is_some_and(|t| t > Instant::now())
+    }
+
+    /// 结算一个已脱离 `entries` 的条目，期间保持共享可见（五审回归 P1）。
+    ///
+    /// 条目先登记进共享 `inner.draining`，`settle_entry` 完成后才从共享
+    /// 结构移除——强制中止无论落在哪个 await 点，[`Self::settle_abandoned`]
+    /// 都能从 `draining` 接管收据未写的条目（收据不永久挂起、Journal 不
+    /// 残留 Running）。移除时顺带清理 `draining` 队头所有已写收据的条目
+    /// （含此前结算完未及移除的残留克隆）。
+    async fn settle_tracked(
+        self: &Arc<Self>,
+        ctx: &Arc<EngineContext>,
+        entry: QueuedEntry,
+        run: RunResult,
+    ) {
+        {
+            let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+            inner.draining.push_back(entry.clone());
+        }
+        settle_entry(ctx, entry, run, None).await;
+        let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
+        while inner
+            .draining
+            .front()
+            .is_some_and(|front| front.reply.is_set())
+        {
+            inner.draining.pop_front();
+        }
     }
 
     /// 入队（有界）。成功时确保 worker 已启动（惰性，每设备一个）。
@@ -286,9 +323,15 @@ impl DeviceQueue {
     /// 形成"最后写者胜出"——Journal 终态不确定，但收据方向安全（至多
     /// Indeterminate，绝不向调用方宣称成功；§80.1 本就禁止对 Indeterminate
     /// 盲目重放）。
+    ///
+    /// 五审回归 P1：接管范围含共享 `draining`——排空/拾取取消路径的在途条目
+    /// 登记其中，强制中止落在 worker 结算 await 点时由此结算（收据不永久
+    /// 挂起、Journal 不残留 Running）。`draining` 中已写收据的条目（worker
+    /// 结算完未及移除的克隆）跳过，避免重复结算。
     async fn settle_abandoned(&self, ctx: &Arc<EngineContext>, budget: std::time::Duration) {
         let running: Option<QueuedEntry>;
         let mut queued: Vec<QueuedEntry> = Vec::new();
+        let mut draining: Vec<QueuedEntry> = Vec::new();
         let mut taken: usize = 0;
         {
             let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
@@ -299,6 +342,9 @@ impl DeviceQueue {
                     taken += 1;
                     queued.push(entry);
                 }
+            }
+            while let Some(entry) = inner.draining.pop_front() {
+                draining.push(entry);
             }
             inner.len = inner.len.saturating_sub(taken);
         }
@@ -311,18 +357,16 @@ impl DeviceQueue {
                     "QUEUE_WORKER_ABORTED",
                     "控制队列强制中止，执行结果未知（驱动可能已下发）",
                 ),
-                Some(deadline.saturating_duration_since(Instant::now())),
+                Some(deadline),
             )
             .await;
         }
-        for entry in queued {
-            settle_entry(
-                ctx,
-                entry,
-                RunResult::Cancelled,
-                Some(deadline.saturating_duration_since(Instant::now())),
-            )
-            .await;
+        for entry in queued
+            .into_iter()
+            .chain(draining)
+            .filter(|e| !e.reply.is_set())
+        {
+            settle_entry(ctx, entry, RunResult::Cancelled, Some(deadline)).await;
         }
     }
 
@@ -379,9 +423,12 @@ impl DeviceQueue {
         let ctx = self.ctx.clone();
         // 四审 P2：前一个 worker panic 遗留的"运行中"条目在此结算——
         // 执行结果未知（Indeterminate），收据与 Journal 不残留。
-        let orphan = {
+        // 五审回归 P1：遗留的 `draining` 条目（排空/拾取取消路径在途）一并
+        // 收养（从未下发 → Cancelled）；两者均经 `settle_tracked` 结算，
+        // 本 worker 自身被中止时仍保持共享可见。
+        let (orphan, orphan_draining) = {
             let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
-            inner.running.take()
+            (inner.running.take(), std::mem::take(&mut inner.draining))
         };
         if let Some(entry) = orphan.filter(|e| !e.reply.is_set()) {
             warn!(
@@ -391,20 +438,29 @@ impl DeviceQueue {
                 error_code = "queue_worker_panic",
                 "检测到已终止 worker 的遗留请求，以 Indeterminate 结算"
             );
-            settle_entry(
+            self.settle_tracked(
                 &ctx,
                 entry,
                 RunResult::Indeterminate(
                     "QUEUE_WORKER_ABORTED",
                     "控制队列 worker 异常终止，执行结果未知",
                 ),
-                None,
             )
             .await;
         }
+        for entry in orphan_draining {
+            if entry.reply.is_set() {
+                continue;
+            }
+            self.settle_tracked(&ctx, entry, RunResult::Cancelled).await;
+        }
         loop {
             // ---- 阶段 A：停机排空（独立锁作用域，await 不持有队列锁）----
-            let drained: Option<(Vec<QueuedEntry>, bool)> = {
+            // 五审回归 P1：排队条目移入共享 `draining`（而非 worker 本地
+            // 容器）后逐条结算队头——强制中止无论落在哪个结算 await 点，
+            // `settle_abandoned` 都能从 `draining` 接管，条目不随 worker
+            // 本地状态丢失。
+            let drain_front: Option<QueuedEntry> = {
                 let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                 // P1-A：引擎已停机时关闭本队列——排空后 worker 退出，即使队列
                 // 在停机排空后被重建（enqueue 已拒绝，不会再有新条目），
@@ -412,33 +468,37 @@ impl DeviceQueue {
                 if self.closed_flag.load(Ordering::SeqCst) {
                     inner.closed = true;
                 }
-                if !(inner.closed && inner.len > 0) {
-                    if inner.closed && inner.running.is_none() {
-                        return;
-                    }
+                if !inner.closed {
                     None
                 } else {
-                    // 五审 P1：停机后不得启动新动作——排队条目就地以
-                    // `Cancelled` 结算；仅允许已在执行的条目自然完成（受 join
-                    // grace 约束），完成后下一轮循环退出。
-                    let mut cancelled = Vec::new();
-                    for deque in inner.entries.values_mut() {
-                        while let Some(entry) = deque.pop_front() {
-                            cancelled.push(entry);
+                    // 五审 P1：停机后不得启动新动作——排队条目移入 `draining`
+                    // 就地以 `Cancelled` 结算；仅允许已在执行的条目自然完成
+                    // （受 join grace 约束），完成后下一轮循环退出。
+                    if inner.len > 0 {
+                        let mut moved: Vec<QueuedEntry> = Vec::with_capacity(inner.len);
+                        for deque in inner.entries.values_mut() {
+                            while let Some(entry) = deque.pop_front() {
+                                moved.push(entry);
+                            }
                         }
+                        for entry in moved {
+                            inner.draining.push_back(entry);
+                        }
+                        inner.len = 0;
                     }
-                    inner.len = 0;
-                    let running_active = inner.running.is_some();
-                    Some((cancelled, running_active))
+                    if inner.draining.is_empty() {
+                        if inner.running.is_none() {
+                            return;
+                        }
+                        None
+                    } else {
+                        // 队头克隆结算（settle_tracked 完成后才真正移除）。
+                        inner.draining.front().cloned()
+                    }
                 }
             };
-            if let Some((cancelled, running_active)) = drained {
-                for entry in cancelled {
-                    settle_entry(&ctx, entry, RunResult::Cancelled, None).await;
-                }
-                if !running_active {
-                    return;
-                }
+            if let Some(entry) = drain_front {
+                self.settle_tracked(&ctx, entry, RunResult::Cancelled).await;
                 continue;
             }
 
@@ -516,10 +576,15 @@ impl DeviceQueue {
 
             match picked.kind {
                 PickedKind::Cancelled => {
-                    settle_entry(&ctx, picked.entry, RunResult::Cancelled, None).await;
+                    // 五审回归 P1：结算期间登记共享 `draining`——强制中止落在
+                    // 结算 await 点时 settle_abandoned 可接管（与排空路径同一
+                    // 共享可见不变量）。
+                    self.settle_tracked(&ctx, picked.entry, RunResult::Cancelled)
+                        .await;
                 }
                 PickedKind::Expired => {
-                    settle_entry(&ctx, picked.entry, RunResult::Timeout, None).await;
+                    self.settle_tracked(&ctx, picked.entry, RunResult::Timeout)
+                        .await;
                 }
                 PickedKind::Ready => {
                     let entry = picked.entry;
@@ -800,15 +865,16 @@ async fn run_operation(
 
 /// 结算：补全时间戳 → 幂等 Journal → 审计 → 回传结果（§80.1、§89、§90）。
 ///
-/// `journal_timeout`（五审 S5）：`None` 正常落盘；`Some(d)` 且 `d > 0` 时
-/// Journal 结算受超时约束（超时跳过落盘，收据照常回填）；`Some(0)` 直接
-/// 跳过落盘——仅用于停机结算预算耗尽的兜底路径（Journal 停留 Running，
-/// 重启恢复为 Indeterminate，语义一致）。
+/// `deadline`（五审 S5 + 五审回归）：可选结算总预算截止时刻，Journal 与
+/// 审计共享同一预算——`None` 正常落盘/审计；`Some(dl)` 时两者各自受剩余
+/// 预算约束，预算耗尽跳过该步骤（Journal 停留 Running 由重启恢复为
+/// Indeterminate；审计丢弃并显式留痕），收据照常回填，停机总时长严格
+/// 有界。仅停机结算路径传入。
 async fn settle_entry(
     ctx: &Arc<EngineContext>,
     entry: QueuedEntry,
     run: RunResult,
-    journal_timeout: Option<std::time::Duration>,
+    deadline: Option<Instant>,
 ) {
     let completed_at_ns = now_ns();
     let mut result = match run {
@@ -863,8 +929,9 @@ async fn settle_entry(
 
     // 幂等结算（§80.1：下发前已持久化，完成后更新状态与结果）。
     // P2-H：磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
-    // 五审 S5：停机预算耗尽（Some(0)）或单次落盘超时（Some(d) 超时）时跳过
-    // Journal 更新——收据照常回填，Journal 停留 Running 由重启恢复兜底。
+    // 五审 S5：停机预算耗尽（剩余 0）或单次落盘超时时跳过 Journal 更新——
+    // 收据照常回填，Journal 停留 Running 由重启恢复兜底。
+    let journal_timeout = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
     let skip_journal = journal_timeout.is_some_and(|d| d.is_zero());
     let settle_result = {
         let settle =
@@ -922,36 +989,52 @@ async fn settle_entry(
 
     // 审计（§90：每个反向控制必须记录；含拒绝/超时/取消）。
     // 四审 P2：有界超时，慢审计不阻塞设备 worker。
+    // 五审回归：审计与 Journal 共享停机结算总预算——预算耗尽跳过本条审计
+    // 并显式留痕（§90"必审计"与"有界停机"冲突时，停机路径选择丢弃）；
+    // 正常路径传 None，维持单条 audit_timeout_ms 上界语义。
     let duration_ms = completed_at_ns
         .saturating_sub(entry.audit_meta.queued_at_ns)
         .max(0) as u64
         / 1_000_000;
-    crate::audit::record_bounded(
-        &ctx.audit,
-        ctx.policy.audit_timeout_ms,
-        crate::audit::build_event(
-            &entry.subject,
-            &entry.source,
-            &entry.key.namespace,
-            &entry.key.device_id,
-            &entry.key.request_id,
-            entry.audit_meta.operation,
-            &entry.audit_meta.target,
-            &entry.audit_meta.parameters,
-            entry.audit_meta.risk_level,
-            result.status,
-            result.error.as_ref().map(|e| e.code.clone()),
-            result.result.as_ref().and_then(|r| match r {
-                observation_model::ControlPayloadResult::PropertyWrite(items) => {
-                    items.iter().find_map(|i| i.protocol_code)
-                }
-                observation_model::ControlPayloadResult::Command(c) => c.device_code,
-            }),
-            duration_ms,
-            completed_at_ns,
-        ),
-    )
-    .await;
+    let audit_budget_exhausted = deadline
+        .map(|dl| dl.saturating_duration_since(Instant::now()).is_zero())
+        .unwrap_or(false);
+    if audit_budget_exhausted {
+        warn!(
+            component = "control-engine",
+            request_id = %entry.key.request_id,
+            error_code = "audit_skipped_shutdown_budget",
+            "停机结算预算耗尽，跳过审计写入"
+        );
+    } else {
+        crate::audit::record_bounded(
+            &ctx.audit,
+            ctx.policy.audit_timeout_ms,
+            deadline,
+            crate::audit::build_event(
+                &entry.subject,
+                &entry.source,
+                &entry.key.namespace,
+                &entry.key.device_id,
+                &entry.key.request_id,
+                entry.audit_meta.operation,
+                &entry.audit_meta.target,
+                &entry.audit_meta.parameters,
+                entry.audit_meta.risk_level,
+                result.status,
+                result.error.as_ref().map(|e| e.code.clone()),
+                result.result.as_ref().and_then(|r| match r {
+                    observation_model::ControlPayloadResult::PropertyWrite(items) => {
+                        items.iter().find_map(|i| i.protocol_code)
+                    }
+                    observation_model::ControlPayloadResult::Command(c) => c.device_code,
+                }),
+                duration_ms,
+                completed_at_ns,
+            ),
+        )
+        .await;
+    }
 
     // 回传结果（§77 异步控制：提交后等待/轮询结果）。
     entry.reply.set(result);

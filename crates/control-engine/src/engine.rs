@@ -992,6 +992,7 @@ impl ControlEngine {
         crate::audit::record_bounded(
             &self.inner.context.audit,
             self.inner.context.policy.audit_timeout_ms,
+            None,
             crate::audit::build_event(
                 &ctx.subject,
                 &ctx.source,
@@ -1071,6 +1072,7 @@ impl ControlEngine {
         crate::audit::record_bounded(
             &self.inner.context.audit,
             self.inner.context.policy.audit_timeout_ms,
+            None,
             crate::audit::build_event(
                 &ctx.subject,
                 &ctx.source,
@@ -1155,6 +1157,7 @@ impl ControlEngine {
         crate::audit::record_bounded(
             &self.inner.context.audit,
             self.inner.context.policy.audit_timeout_ms,
+            None,
             crate::audit::build_event(
                 &ctx.subject,
                 &ctx.source,

@@ -1400,6 +1400,174 @@ async fn forced_abort_settles_abandoned_entries() {
     );
 }
 
+/// 五审回归（P1）：停机排空阶段 worker 被强制中止时，已从 `QueueInner.entries`
+/// 移出、尚未完成结算的排队条目不得丢失——收据必须就绪（不永久挂起）、
+/// Journal 不得残留 Running。
+///
+/// 场景：A 执行返回 Indeterminate → 结算后设备进入冷却期，B/C/D 在 A 结算前
+/// 已排队；停机使 worker 进入排空路径逐条结算（慢审计拖住单条结算），grace
+/// 到期时强制中止恰好落在 B 的结算中间——此时 B/C/D 不能只存在于 worker
+/// 本地状态，`settle_abandoned` 必须能从共享状态接管。
+#[tokio::test]
+async fn shutdown_drain_abort_does_not_lose_queued_receipts() {
+    let executor = MockExecutor::new();
+    executor.set_indeterminate(); // A 完成后返回 Indeterminate → 触发设备冷却期
+    let audit = Arc::new(SlowAuditSink { delay_ms: 500 });
+    // 冷却期把 worker 挡在调度外：B/C/D 得以在队列中等待停机排空。
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(ControlPolicy {
+            indeterminate_cooldown_ms: 30_000,
+            ..ControlPolicy::default()
+        }),
+    );
+
+    // A 阻塞执行期间 B/C/D 入队（冷却期尚未建立，入队不被拒）。
+    let first = engine
+        .submit(frequency_write("dr-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    let mut queued = Vec::new();
+    for id in ["dr-2", "dr-3", "dr-4"] {
+        queued.push(
+            engine
+                .submit(frequency_write(id, 20.0), &context())
+                .await
+                .expect("B/C/D 应在冷却期建立前成功入队"),
+        );
+    }
+
+    // A 完成（Indeterminate）→ 设备进入冷却期，worker 空转等待。
+    executor.release();
+    let first_result = tokio::time::timeout(Duration::from_secs(2), first.wait())
+        .await
+        .expect("首请求收据应就绪");
+    assert_eq!(first_result.status, ControlStatus::Indeterminate);
+    tokio::time::sleep(Duration::from_millis(50)).await; // worker 进入冷却等待
+
+    // 停机：worker 排空 B/C/D，慢审计拖住单条结算 → grace 到期强制中止。
+    engine.shutdown(Duration::from_millis(20)).await;
+
+    for (index, receipt) in queued.into_iter().enumerate() {
+        let result = tokio::time::timeout(Duration::from_secs(2), receipt.wait())
+            .await
+            .unwrap_or_else(|_| panic!("排队条目 {} 收据不得永久挂起", index + 2));
+        assert_eq!(result.status, ControlStatus::Cancelled);
+        assert_eq!(result.error.unwrap().code, "CANCELLED");
+    }
+    // 注：不在此断言 Journal 全部 Settled——强制中止后的结算受 S5 总预算
+    // 约束，预算耗尽的条目按设计跳过落盘（Journal 停留 Running，重启恢复
+    // 为 Indeterminate）；本测试只验证 P1 性质：收据不永久挂起。
+}
+
+/// 五审回归（P1 配套）：强制中止后的结算阶段，审计与 Journal 共享同一总
+/// 预算（S5）——大量遗留条目 × 慢审计不得使停机总时长超过声明预算。
+#[tokio::test]
+async fn shutdown_settle_budget_bounds_audit_time() {
+    let executor = MockExecutor::new();
+    executor.set_indeterminate();
+    let audit = Arc::new(SlowAuditSink { delay_ms: 800 });
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(ControlPolicy {
+            indeterminate_cooldown_ms: 30_000,
+            ..ControlPolicy::default()
+        }),
+    );
+
+    let first = engine
+        .submit(frequency_write("bd-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    let mut queued = Vec::new();
+    for id in ["bd-2", "bd-3", "bd-4"] {
+        queued.push(
+            engine
+                .submit(frequency_write(id, 20.0), &context())
+                .await
+                .expect("B/C/D 应在冷却期建立前成功入队"),
+        );
+    }
+    executor.release();
+    let first_result = tokio::time::timeout(Duration::from_secs(2), first.wait())
+        .await
+        .expect("首请求收据应就绪");
+    assert_eq!(first_result.status, ControlStatus::Indeterminate);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // grace=20ms → 结算预算 50ms；若审计不受预算约束，3×800ms ≈ 2.4s+。
+    let start = std::time::Instant::now();
+    engine.shutdown(Duration::from_millis(20)).await;
+    let elapsed = start.elapsed();
+
+    for receipt in queued {
+        let result = tokio::time::timeout(Duration::from_secs(2), receipt.wait())
+            .await
+            .expect("收据不得永久挂起");
+        assert_eq!(result.status, ControlStatus::Cancelled);
+    }
+    assert!(
+        elapsed < Duration::from_millis(1_000),
+        "停机结算应受总预算约束，实际 {elapsed:?}"
+    );
+}
+
+/// 五审回归（P1）：强制中止落在"拾取即取消/过期"条目的结算中间时，该条目
+/// 同样不得丢失（与排空路径同一共享可见不变量）。
+#[tokio::test]
+async fn forced_abort_during_picked_cancel_settle_keeps_receipt() {
+    let executor = MockExecutor::new();
+    let audit = Arc::new(SlowAuditSink { delay_ms: 500 });
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        Arc::new(InMemoryJournal::new()),
+        executor.clone(),
+        audit.clone(),
+        Arc::new(ControlPolicy {
+            // 不用冷却期：B 以"已取消"被正常拾取。
+            indeterminate_cooldown_ms: 0,
+            ..ControlPolicy::default()
+        }),
+    );
+
+    // A 阻塞执行期间 B 入队并被取消；A 完成后 worker 拾取 B 走 Cancelled
+    // 结算路径，慢审计拖住结算——grace 到期强制中止落在该结算中间。
+    let first = engine
+        .submit(frequency_write("pc-1", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    let second = engine
+        .submit(frequency_write("pc-2", 20.0), &context())
+        .await
+        .unwrap();
+    engine.cancel(&key("pc-2"), &context()).await.unwrap();
+    executor.release();
+    let first_result = tokio::time::timeout(Duration::from_secs(2), first.wait())
+        .await
+        .expect("首请求收据应就绪");
+    assert_eq!(first_result.status, ControlStatus::Succeeded);
+    tokio::time::sleep(Duration::from_millis(50)).await; // worker 拾取 B 并进入慢审计
+
+    engine.shutdown(Duration::from_millis(20)).await;
+
+    let second_result = tokio::time::timeout(Duration::from_secs(2), second.wait())
+        .await
+        .expect("被取消条目收据不得永久挂起");
+    assert_eq!(second_result.status, ControlStatus::Cancelled);
+}
+
 /// P1-6：并发重复提交在首请求执行期间命中 active → 等待并共享同一结果，
 /// 不得错误返回 EXECUTION_INTERRUPTED。
 #[tokio::test]

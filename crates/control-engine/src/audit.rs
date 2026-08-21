@@ -97,20 +97,33 @@ pub trait AuditSink: Send + Sync {
 ///
 /// 超时放弃该条事件并记录 `audit_timeout` 错误日志：控制可用性优先于
 /// 单条审计完整性（阻塞控制 worker 的代价更高）；丢失会显式留痕。
+///
+/// `deadline`（五审回归）：可选总预算截止时刻——每次尝试的耗时受
+/// `min(timeout_ms, 剩余预算)` 约束，预算耗尽立即放弃（不再重试）。
+/// 停机结算路径传入与 Journal 共享的同一 deadline，保证停机总时长
+/// 严格有界；正常控制路径传 `None`，维持"单条上界 2×timeout_ms"语义。
 pub(crate) async fn record_bounded(
     sink: &std::sync::Arc<dyn AuditSink>,
     timeout_ms: u64,
+    deadline: Option<std::time::Instant>,
     event: AuditEvent,
 ) {
-    // 五审 S4：超时不直接丢弃——重试一次（总耗时上界 2×timeout_ms），
-    // 仍失败才放弃并记录错误日志。
+    // 五审 S4：超时不直接丢弃——重试一次，仍失败才放弃并记录错误日志。
+    // 五审回归：重试受 deadline 约束，预算耗尽不再发起下一次尝试。
     for attempt in 0..2 {
-        if tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            sink.record(event.clone()),
-        )
-        .await
-        .is_ok()
+        let effective = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                std::time::Duration::from_millis(timeout_ms).min(remaining)
+            }
+            None => std::time::Duration::from_millis(timeout_ms),
+        };
+        if tokio::time::timeout(effective, sink.record(event.clone()))
+            .await
+            .is_ok()
         {
             return;
         }
