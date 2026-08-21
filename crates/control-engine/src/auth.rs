@@ -47,6 +47,10 @@ pub enum CredentialsError {
     SchemaMismatch(String),
     /// 同一 Token 出现多次。
     DuplicateToken,
+    /// 同一 subject 出现多次（评审修复：roles 二级索引按 subject 覆盖写入，
+    /// 若同名 subject 持有不同角色的多个 Token，低权 Token 认证后经引擎
+    /// role_of(subject) 重查会拿到高权角色——角色提升。fail-closed 禁止）。
+    DuplicateSubject,
     /// `subject` 为空。
     EmptySubject,
 }
@@ -67,6 +71,9 @@ impl fmt::Display for CredentialsError {
                 )
             }
             Self::DuplicateToken => write!(f, "凭据文件存在重复 Token"),
+            Self::DuplicateSubject => {
+                write!(f, "凭据文件存在重复 subject（同一身份只允许一个 Token，§90.2）")
+            }
             Self::EmptySubject => write!(f, "凭据条目 subject 为空"),
         }
     }
@@ -147,6 +154,7 @@ impl StaticTokenAuthorizer {
         }
         let mut entries = Vec::with_capacity(file.credentials.len());
         let mut seen: HashSet<String> = HashSet::new();
+        let mut subjects: HashSet<String> = HashSet::new();
         let mut roles = std::collections::HashMap::new();
         for raw in file.credentials {
             if raw.token.is_empty() {
@@ -157,6 +165,13 @@ impl StaticTokenAuthorizer {
             }
             if !seen.insert(raw.token.clone()) {
                 return Err(CredentialsError::DuplicateToken);
+            }
+            // 评审修复（P1）：同一 subject 只允许一个 Token——roles 二级索引
+            // 按 subject 写入，若同名 subject 持不同角色 Token，低权 Token 的
+            // 持有者经引擎 role_of(subject) 重查会获得高权角色（角色提升）。
+            // fail-closed：直接拒绝加载。
+            if !subjects.insert(raw.subject.clone()) {
+                return Err(CredentialsError::DuplicateSubject);
             }
             roles.insert(raw.subject.clone(), raw.role);
             entries.push(CredentialEntry {
@@ -271,6 +286,23 @@ mod tests {
         assert_eq!(
             StaticTokenAuthorizer::parse(json).unwrap_err(),
             CredentialsError::DuplicateToken
+        );
+    }
+
+    #[test]
+    fn duplicate_subject_fails_closed() {
+        // 评审回归（P1）：同名 subject 持不同角色 Token 会导致角色提升——
+        // 必须拒绝加载，而不是后者覆盖前者。
+        let json = r#"{
+            "schema": "forgelink.control.credentials.v1",
+            "credentials": [
+                { "token": "tok-viewer", "subject": "alice", "role": "viewer" },
+                { "token": "tok-admin", "subject": "alice", "role": "administrator" }
+            ]
+        }"#;
+        assert_eq!(
+            StaticTokenAuthorizer::parse(json).unwrap_err(),
+            CredentialsError::DuplicateSubject
         );
     }
 
