@@ -226,6 +226,17 @@ impl DeviceQueue {
     /// （与 P1-7 一致：执行器可能在飞行中，不得宣称未执行）；排队条目从未
     /// 执行 → `Cancelled`。结算在释放队列锁之后进行（`settle_entry` 会访问
     /// Journal/审计/active，不得持有队列锁）。
+    ///
+    /// 三审 P1：`running` 保留到 worker 结算完成才清除——若强制中止恰好发生在
+    /// worker 的异步 Journal 结算期间，`settle_abandoned` 仍能找到该条目并结算
+    /// （收据不永久挂起、Journal 不残留 Running）。已结算的条目（`reply` 已
+    /// 写入）跳过，避免重复结算。
+    ///
+    /// 已知竞态（可接受）：中止若落在 worker 的 `settle_record` 阻塞任务执行
+    /// 期间，被丢弃的任务仍可能写入真实结果，与本函数的 QUEUE_WORKER_ABORTED
+    /// 形成"最后写者胜出"——Journal 终态不确定，但收据方向安全（至多
+    /// Indeterminate，绝不向调用方宣称成功；§80.1 本就禁止对 Indeterminate
+    /// 盲目重放）。
     async fn settle_abandoned(&self, ctx: &Arc<EngineContext>) {
         let running: Option<QueuedEntry>;
         let mut queued: Vec<QueuedEntry> = Vec::new();
@@ -242,7 +253,7 @@ impl DeviceQueue {
             }
             inner.len = inner.len.saturating_sub(taken);
         }
-        if let Some(entry) = running {
+        if let Some(entry) = running.filter(|e| !e.reply.is_set()) {
             settle_entry(
                 ctx,
                 entry,
@@ -319,16 +330,20 @@ impl DeviceQueue {
                     settle_entry(ctx, picked.entry, RunResult::Timeout).await;
                 }
                 PickedKind::Ready => {
+                    let entry = picked.entry;
                     {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
-                        inner.running = Some(picked.entry.clone());
+                        inner.running = Some(entry.clone());
                     }
-                    let result = run_entry(ctx, &picked.entry).await;
+                    let result = run_entry(ctx, &entry).await;
+                    // 三审 P1：结算完成前不清除 running——否则强制中止恰好在
+                    // 异步 Journal 结算期间发生时，settle_abandoned 找不到该
+                    // 条目，收据会永久挂起且 Journal 残留 Running。
+                    settle_entry(ctx, entry, result).await;
                     {
                         let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
                         inner.running = None;
                     }
-                    settle_entry(ctx, picked.entry, result).await;
                 }
             }
         }
@@ -584,7 +599,9 @@ async fn settle_entry(ctx: &Arc<EngineContext>, entry: QueuedEntry, run: RunResu
 
     // 幂等结算（§80.1：下发前已持久化，完成后更新状态与结果）。
     // P2-H：磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
-    if let Err(e) = crate::journal::settle_record(&ctx.journal, &entry.key, &result).await {
+    if let Err(e) =
+        crate::journal::settle_record(&ctx.journal, &ctx.journal_io_gate, &entry.key, &result).await
+    {
         warn!(
             component = "control-engine",
             request_id = %entry.key.request_id,

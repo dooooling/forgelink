@@ -31,8 +31,16 @@ impl std::error::Error for PreconditionError {}
 ///
 /// 由上层实现（读取当前设备状态后判定）；本 crate 只定义接口并在
 /// [`ControlPolicy`](crate::ControlPolicy) 中挂载。`None` 时跳过检查。
+///
+/// `async`（P2）：检查器可能读取设备状态（网络/驱动 I/O），同步接口会在
+/// 异步 `submit` 中阻塞控制运行时。
+///
+/// 注意：引擎不对 `check` 施加超时——挂起的检查器会让对应请求停留在
+/// Running 并堆积并发等待者。实现方应自行限制单次检查耗时（如内部
+/// 超时/快速失败）；接入真实设备读取时可考虑在装配层包一层超时。
+#[async_trait::async_trait]
 pub trait PreconditionChecker: Send + Sync {
-    fn check(
+    async fn check(
         &self,
         device_id: &DeviceId,
         preconditions: &[CommandPrecondition],
@@ -44,8 +52,9 @@ pub trait PreconditionChecker: Send + Sync {
 /// 仅在明确"无状态依赖"的测试/演示场景使用；生产环境应提供真实检查器。
 pub struct PermissivePreconditionChecker;
 
+#[async_trait::async_trait]
 impl PreconditionChecker for PermissivePreconditionChecker {
-    fn check(
+    async fn check(
         &self,
         _device_id: &DeviceId,
         _preconditions: &[CommandPrecondition],
@@ -62,8 +71,9 @@ pub struct PatternPreconditionChecker {
     pub fail_if: Vec<String>,
 }
 
+#[async_trait::async_trait]
 impl PreconditionChecker for PatternPreconditionChecker {
-    fn check(
+    async fn check(
         &self,
         _device_id: &DeviceId,
         preconditions: &[CommandPrecondition],

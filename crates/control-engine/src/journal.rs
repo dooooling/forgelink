@@ -205,6 +205,10 @@ impl FileJournal {
     /// [`JournalError::Corrupt`]。
     pub fn open(path: &Path, now_ns: TimestampNs) -> Result<Self, JournalError> {
         let mut entries: HashMap<IdempotencyKey, JournalEntry> = HashMap::new();
+        // 因过期被跳过的 Insert 的 key：其后续 Settle 同样跳过（正常生命周期，
+        // 触发压缩即可），不得误判为孤立 Settle（三审回归修复）。
+        let mut expired_keys: std::collections::HashSet<IdempotencyKey> =
+            std::collections::HashSet::new();
         let mut need_compact = false;
 
         if path.exists() {
@@ -229,6 +233,7 @@ impl FileJournal {
                     } => {
                         if expires_at_ns < now_ns {
                             // 过期记录直接丢弃（触发压缩）。
+                            expired_keys.insert(key);
                             need_compact = true;
                             continue;
                         }
@@ -245,10 +250,18 @@ impl FileJournal {
                         );
                     }
                     Record::Settle { key, result } => {
-                        let Some(entry) = entries.get_mut(&key) else {
-                            need_compact = true;
-                            continue;
-                        };
+                        // 三审 P1：Settle 缺少对应 Insert 时不得静默跳过——若 Insert
+                        // 因损坏丢失，静默跳过会让重启后同一请求再次执行，破坏
+                        // 幂等安全（§80.1）。按 Corrupt fail-closed。
+                        // 例外：Insert 因过期被跳过时，其 Settle 属正常生命周期，
+                        // 一并跳过（触发压缩），不算孤立。
+                        if !entries.contains_key(&key) {
+                            if expired_keys.remove(&key) {
+                                continue;
+                            }
+                            return Err(JournalError::Corrupt { line: line_no });
+                        }
+                        let entry = entries.get_mut(&key).expect("已确认存在");
                         entry.status = result.status;
                         entry.result = Some(result.clone());
                     }
@@ -438,17 +451,28 @@ impl ControlJournal for FileJournal {
     }
 }
 
-/// 在阻塞线程池上执行幂等登记（P2-H：`write_all`/`flush`/`sync_all` 等磁盘 I/O
-/// 不占用 Tokio worker 线程；std Mutex 的等待也在阻塞线程上发生，不阻塞调度器）。
+/// Journal 磁盘 I/O 阻塞任务的全局并发上限（三审 P2）：有界并发，防止大量
+/// 请求同时堆积阻塞任务（项目要求的有界并发、背压优先）。
+pub(crate) const JOURNAL_IO_CONCURRENCY: usize = 8;
+
+/// 在阻塞线程池上执行幂等登记（P2-H：`write_all`/`flush`/`sync_all` 等磁盘
+/// I/O 不占用 Tokio worker 线程；std Mutex 的等待也在阻塞线程上发生，不阻塞
+/// 调度器）。`gate` 限制同时执行的 Journal 阻塞任务数（三审 P2）。
 pub(crate) async fn insert_record(
     journal: &Arc<dyn ControlJournal>,
+    gate: &Arc<tokio::sync::Semaphore>,
     key: &IdempotencyKey,
     payload_hash: String,
     created_at_ns: TimestampNs,
     expires_at_ns: TimestampNs,
 ) -> Result<JournalDecision, JournalError> {
     let journal = journal.clone();
+    let gate = gate.clone();
     let key = key.clone();
+    let _permit = gate
+        .acquire_owned()
+        .await
+        .expect("Journal 并发闸门不应被关闭");
     tokio::task::spawn_blocking(move || {
         journal.try_insert(&key, payload_hash, created_at_ns, expires_at_ns)
     })
@@ -459,15 +483,44 @@ pub(crate) async fn insert_record(
 /// 在阻塞线程池上执行幂等结算（P2-H，同上）。
 pub(crate) async fn settle_record(
     journal: &Arc<dyn ControlJournal>,
+    gate: &Arc<tokio::sync::Semaphore>,
     key: &IdempotencyKey,
     result: &ControlResult,
 ) -> Result<(), JournalError> {
     let journal = journal.clone();
+    let gate = gate.clone();
     let key = key.clone();
     let result = result.clone();
+    let _permit = gate
+        .acquire_owned()
+        .await
+        .expect("Journal 并发闸门不应被关闭");
     tokio::task::spawn_blocking(move || journal.settle(&key, &result))
         .await
         .expect("Journal 阻塞任务不可取消")
+}
+
+/// 在阻塞线程池上执行过期清理 + 查询（三审 P2：`status()` 等异步调用点的
+/// 同步磁盘 I/O 移出 Tokio worker，并受同一并发闸门约束）。
+pub(crate) async fn purge_and_get(
+    journal: &Arc<dyn ControlJournal>,
+    gate: &Arc<tokio::sync::Semaphore>,
+    key: &IdempotencyKey,
+    now_ns: TimestampNs,
+) -> Option<JournalEntry> {
+    let journal = journal.clone();
+    let gate = gate.clone();
+    let key = key.clone();
+    let _permit = gate
+        .acquire_owned()
+        .await
+        .expect("Journal 并发闸门不应被关闭");
+    tokio::task::spawn_blocking(move || {
+        let _ = journal.purge_expired(now_ns);
+        journal.get(&key)
+    })
+    .await
+    .expect("Journal 阻塞任务不可取消")
 }
 
 /// 日志记录（JSONL 行的种类）。
@@ -718,6 +771,38 @@ mod tests {
             assert!(journal.get(&key("cmd-2")).is_some());
             // purge 无残留。
             assert_eq!(journal.purge_expired(1_000_000), 0);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_journal_settle_after_expired_insert_not_corrupt() {
+        // 三审回归：Insert 过期被跳过后，其 Settle 属正常生命周期（已结算
+        // 请求自然老化），必须随压缩一并跳过，不得误判为孤立 Settle 而
+        // Corrupt——否则重启后 Journal 永久无法打开。
+        let dir = std::env::temp_dir().join(format!(
+            "forge-control-journal-{}-expired-settle",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("journal.jsonl");
+
+        {
+            let journal = FileJournal::open(&path, 1_000).unwrap();
+            let k = key("cmd-1");
+            journal.try_insert(&k, "hash-a".to_owned(), 0, 500).unwrap(); // 早期过期
+            journal
+                .settle(&k, &result_for("cmd-1", ControlStatus::Succeeded))
+                .unwrap();
+        }
+        {
+            // now=1_000_000：Insert 已过期，Settle 不得触发 Corrupt。
+            let journal = FileJournal::open(&path, 1_000_000)
+                .expect("过期 Insert 的 Settle 不应判定为孤立记录");
+            assert!(journal.get(&key("cmd-1")).is_none());
+            // 压缩后文件不再含过期记录：重新打开仍成功。
+            drop(journal);
+            FileJournal::open(&path, 1_000_000).unwrap();
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }

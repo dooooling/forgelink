@@ -115,12 +115,29 @@ impl ControlPolicy {
     /// 校验策略配置（§80.1：幂等保留期下限 24h；装配引擎时调用，fail-fast）。
     ///
     /// 保留期过短会放大"进程崩溃后重复执行/结果错配"的风险，须在装配期拒绝。
+    /// 零队列容量会让所有请求静默变成 `QUEUE_FULL`，零超时会让请求立即超时
+    /// （P2）——同样属于配置错误，装配期 fail-fast。
     pub fn validate(&self) -> Result<(), String> {
         if self.idempotency_retention < Duration::from_secs(24 * 3600) {
             return Err(format!(
                 "idempotency_retention 不得低于 24 小时（当前 {:?}）",
                 self.idempotency_retention
             ));
+        }
+        if self.queue_capacity == 0 {
+            return Err(
+                "queue_capacity 必须大于 0（0 会让所有请求静默变成 QUEUE_FULL）".to_owned(),
+            );
+        }
+        if self.property_write_timeout_ms == 0 {
+            return Err("property_write_timeout_ms 必须大于 0".to_owned());
+        }
+        for (risk, ms) in &self.command_timeout_ms {
+            if *ms == 0 {
+                return Err(format!(
+                    "command_timeout_ms[{risk:?}] 必须大于 0（0 会让请求立即超时）"
+                ));
+            }
         }
         Ok(())
     }

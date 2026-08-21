@@ -253,8 +253,9 @@ impl ControlJournal for FailingJournal {
     }
 }
 
+#[async_trait::async_trait]
 impl PreconditionChecker for AlwaysFailChecker {
-    fn check(
+    async fn check(
         &self,
         _device_id: &DeviceId,
         _preconditions: &[observation_model::CommandPrecondition],
@@ -631,7 +632,10 @@ async fn idempotent_duplicate_returns_existing_result() {
     assert_eq!(executor.call_count(), 1, "幂等命中不得重复执行");
 
     // status() 查询（§77 轮询）。
-    let queried = engine.status(&key("dup-1")).expect("应可查询既有结果");
+    let queried = engine
+        .status(&key("dup-1"))
+        .await
+        .expect("应可查询既有结果");
     assert_eq!(queried.status, ControlStatus::Succeeded);
 }
 
@@ -1112,6 +1116,70 @@ async fn journal_settle_failure_downgrades_to_indeterminate() {
     assert_eq!(executor.call_count(), 1, "Indeterminate 不得重放执行");
 }
 
+/// 三审回归：Journal 仍为 Running 但无活跃执行者（结算落盘失败）时，
+/// 并发重复提交不得挂起——新建 shared 的请求立即返回 EXECUTION_INTERRUPTED
+/// 且必须先写入 shared 再移除 active，命中已有登记的等待者从 shared 取得
+/// 同一结果（否则后者永久挂起）。
+#[tokio::test]
+async fn concurrent_duplicates_over_stale_running_record_resolve() {
+    let journal = FailingJournal::new();
+    let executor = MockExecutor::new();
+    executor.release();
+    let audit = Arc::new(MemoryAuditSink::new());
+    let engine = engine_with(
+        catalog(),
+        authorizer(Role::Operator),
+        journal.clone(),
+        executor.clone(),
+        audit.clone(),
+        default_policy(),
+    );
+
+    // 首个执行：执行器成功但结算落盘失败 → Journal 停留在 Running、无活跃执行者。
+    journal.fail_settle(true);
+    let first = engine
+        .submit(frequency_write("cd-1", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(first.status, ControlStatus::Indeterminate);
+    assert_eq!(first.error.unwrap().code, "JOURNAL_SETTLE_FAILED");
+
+    // 两个并发重复提交：一个新建 shared（fresh 分支），另一个命中已有登记
+    // （pending 分支）——两条路径都必须有界完成。
+    journal.fail_settle(false);
+    let e2 = engine.clone();
+    let e3 = engine.clone();
+    let (r2, r3) = tokio::time::timeout(Duration::from_secs(5), async move {
+        tokio::join!(
+            async move {
+                e2.submit(frequency_write("cd-1", 10.0), &context())
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+            },
+            async move {
+                e3.submit(frequency_write("cd-1", 10.0), &context())
+                    .await
+                    .unwrap()
+                    .wait()
+                    .await
+            },
+        )
+    })
+    .await
+    .expect("并发重复提交不得挂起");
+    for r in [r2, r3] {
+        assert_eq!(r.status, ControlStatus::Indeterminate);
+        assert_eq!(r.error.unwrap().code, "EXECUTION_INTERRUPTED");
+    }
+    assert_eq!(executor.call_count(), 1, "Indeterminate 不得重放执行");
+
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
 /// P2-12：批量写入部分失败 → 顶层 Failed（北向状态自洽），逐项结果保留。
 #[tokio::test]
 async fn partial_write_failure_marks_top_level_failed() {
@@ -1230,7 +1298,7 @@ async fn forced_abort_settles_abandoned_entries() {
 
     // Journal 不残留 Running（均已结算）。
     let key = key("ab-1");
-    let entry = engine.status(&key).expect("ab-1 应已结算");
+    let entry = engine.status(&key).await.expect("ab-1 应已结算");
     assert_ne!(entry.status, ControlStatus::Running);
 }
 

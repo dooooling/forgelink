@@ -19,7 +19,7 @@ use std::time::Duration;
 use observation_model::{
     ControlError, ControlOperation, ControlRequest, ControlResult, ControlStatus, DeviceId,
 };
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -36,6 +36,8 @@ use crate::validate::{ValidatedOperation, validate_command, validate_property_wr
 pub(crate) struct EngineContext {
     pub executor: Arc<dyn ControlExecutor>,
     pub journal: Arc<dyn ControlJournal>,
+    /// Journal 磁盘 I/O 阻塞任务的有界并发闸门（三审 P2）。
+    pub journal_io_gate: Arc<tokio::sync::Semaphore>,
     pub audit: Arc<dyn crate::audit::AuditSink>,
     pub policy: Arc<ControlPolicy>,
     /// 活跃（未结算）请求的共享结果：幂等 Duplicate 时等待首个请求的最终结果。
@@ -163,39 +165,54 @@ impl ControlReceipt {
 }
 
 /// 可共享的最终结果（首个请求的 worker 写入；幂等 Duplicate 的等待者共享）。
+///
+/// 基于 `watch` 通道：`wait` 先 `borrow_and_update` 再 `changed().await`，
+/// 该模式对"set 发生在检查与注册之间"的丢失唤醒是安全的（watch 的版本号
+/// 保证值变更可被观察到）——三审 P1：收据等待不得因竞态永久挂起。
+///
+/// 注意：`watch::Sender::send` 在**没有任何接收者**时会返回错误并丢弃本次
+/// 写入（值不落库、版本不递增）。`SharedResult` 自身持有一个永不消费的
+/// 接收者 `_keep_alive`，保证 `send` 始终成功——否则"结算完成后才调用
+/// `wait()`"的晚到等待者将永远看不到结果（三审回归修复）。
 #[derive(Debug)]
 pub(crate) struct SharedResult {
-    state: std::sync::Mutex<Option<ControlResult>>,
-    notify: Notify,
+    value: watch::Sender<Option<ControlResult>>,
+    _keep_alive: watch::Receiver<Option<ControlResult>>,
 }
 
 impl SharedResult {
     pub fn new() -> Self {
+        let (tx, rx) = watch::channel(None);
         Self {
-            state: std::sync::Mutex::new(None),
-            notify: Notify::new(),
+            value: tx,
+            _keep_alive: rx,
         }
     }
 
     /// 写入最终结果并唤醒所有等待者（在幂等结算之后调用）。
     pub fn set(&self, result: ControlResult) {
-        *self.state.lock().expect("SharedResult 锁被毒化") = Some(result);
-        self.notify.notify_waiters();
+        let _ = self.value.send(Some(result));
     }
 
     /// 是否已写入最终结果（P1-6：入队后检查，避免快速完成时残留 stale active 条目）。
     pub fn is_set(&self) -> bool {
-        self.state.lock().expect("SharedResult 锁被毒化").is_some()
+        self.value.borrow().is_some()
     }
 
     /// 等待最终结果。
     pub async fn wait(&self) -> ControlResult {
+        let mut rx = self.value.subscribe();
         loop {
-            let notified = self.notify.notified();
-            if let Some(result) = self.state.lock().expect("SharedResult 锁被毒化").clone() {
+            if let Some(result) = rx.borrow_and_update().clone() {
                 return result;
             }
-            notified.await;
+            if rx.changed().await.is_err() {
+                // 发送端被丢弃：不可达（SharedResult 自身持有 Sender）。
+                if let Some(result) = rx.borrow_and_update().clone() {
+                    return result;
+                }
+                unreachable!("SharedResult 发送端被丢弃");
+            }
         }
     }
 }
@@ -230,6 +247,9 @@ impl ControlEngine {
         let context = Arc::new(EngineContext {
             executor: config.executor,
             journal: config.journal,
+            journal_io_gate: Arc::new(tokio::sync::Semaphore::new(
+                crate::journal::JOURNAL_IO_CONCURRENCY,
+            )),
             audit: config.audit,
             policy: config.policy,
             active: Mutex::new(HashMap::new()),
@@ -290,9 +310,30 @@ impl ControlEngine {
                 .as_nanos()
                 .min(i64::MAX as u128) as i64,
         );
+
+        // 三审 P1：active 在 Journal 插入前登记（`or_insert_with` 不覆盖已有
+        // 条目）。并发重复提交无论以何种顺序交错，都拿到同一 Arc（首个登记
+        // 请求创建的），从根上消除"Journal 已提交但 active 未登记"的窗口——
+        // Duplicate 请求不会再错误返回 EXECUTION_INTERRUPTED。
+        // 需要区分"本次新建"与"命中已有活跃执行"：若 Journal 仍为 Running
+        // 但本 key 无活跃执行者（首个执行已结束但结算落盘失败，active 已移除），
+        // 本次新建的 shared 永远不会被写入，需立即返回 Indeterminate 而非挂起。
+        let (shared, active_fresh) = {
+            let mut active = self.inner.context.active.lock().expect("active 锁被毒化");
+            match active.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(o) => (o.get().clone(), false),
+                std::collections::hash_map::Entry::Vacant(v) => {
+                    let s = Arc::new(SharedResult::new());
+                    v.insert(s.clone());
+                    (s, true)
+                }
+            }
+        };
+
         // P2-H：幂等登记的磁盘 I/O 在阻塞线程池执行，不占用 Tokio worker。
         match crate::journal::insert_record(
             &self.inner.context.journal,
+            &self.inner.context.journal_io_gate,
             &key,
             hash.clone(),
             now,
@@ -309,11 +350,14 @@ impl ControlEngine {
                     error_code = "journal_insert_failed",
                     "幂等记录持久化失败: {e}"
                 );
+                // 已登记 active：由 reject_with_shared 结算 shared 并移除条目，
+                // 并发等待者获得一致的拒绝结果、不挂起。
                 return Ok(self
-                    .reject(
+                    .reject_with_shared(
                         &request,
                         ctx,
                         &key,
+                        &shared,
                         "JOURNAL_UNAVAILABLE",
                         "幂等记录持久化失败，控制请求被拒绝".to_owned(),
                     )
@@ -328,44 +372,73 @@ impl ControlEngine {
                     "幂等命中，返回既有结果"
                 );
                 if let Some(result) = entry.result {
+                    // 已结算：active 中的条目是本请求刚登记的，无执行者会清理，
+                    // 立即移除避免残留。
+                    self.inner
+                        .context
+                        .active
+                        .lock()
+                        .expect("active 锁被毒化")
+                        .remove(&key);
                     return Ok(ControlReceipt::ready(result));
                 }
-                // 首个请求仍在执行：共享其最终结果。
-                if let Some(shared) = self
-                    .inner
+                if entry.status == ControlStatus::Running {
+                    if !active_fresh {
+                        // 执行中：共享首请求的最终结果（命中已有活跃执行）。
+                        return Ok(ControlReceipt::pending(shared));
+                    }
+                    // 首个执行已结束但结算落盘失败（Journal 仍 Running，active
+                    // 已被首个执行移除），本次新建的 shared 无执行者会写入：
+                    // 立即返回 Indeterminate 并清理刚登记的条目。
+                    // 必须先写入 shared 再移除——并发重复提交可能在本请求登记
+                    // 之后、移除之前拿到同一 Arc 并走 pending 分支，不写入会
+                    // 永久挂起（三审回归修复）。
+                    let result = interrupted_result(
+                        &request,
+                        "EXECUTION_INTERRUPTED",
+                        "执行状态未知（进程可能已重启或结算失败）",
+                    );
+                    shared.set(result.clone());
+                    self.inner
+                        .context
+                        .active
+                        .lock()
+                        .expect("active 锁被毒化")
+                        .remove(&key);
+                    return Ok(ControlReceipt::ready(result));
+                }
+                // 防御分支（理论上不可达：插入必为 Running 且未结算）：结果不确定。
+                // 同上：先写 shared 再移除，防止并发等待者挂起。
+                let result = interrupted_result(
+                    &request,
+                    "EXECUTION_INTERRUPTED",
+                    "执行状态未知（进程可能已重启）",
+                );
+                shared.set(result.clone());
+                self.inner
                     .context
                     .active
                     .lock()
                     .expect("active 锁被毒化")
-                    .get(&key)
-                    .cloned()
-                {
-                    return Ok(ControlReceipt::pending(shared));
-                }
-                // 防御分支（理论上不可达：未结算则 active 必在）：结果不确定。
-                return Ok(ControlReceipt::ready(interrupted_result(
-                    &request,
-                    "EXECUTION_INTERRUPTED",
-                    "执行状态未知（进程可能已重启）",
-                )));
+                    .remove(&key);
+                return Ok(ControlReceipt::ready(result));
             }
             Ok(JournalDecision::Conflict { existing }) => {
+                // 已有条目已结算（非 Running）：active 中的条目是本请求刚登记的，
+                // 无执行者会清理，立即移除避免残留；已有条目 Running 说明执行者
+                // 仍在飞行，由其结算时清理。
+                if existing.status != ControlStatus::Running {
+                    self.inner
+                        .context
+                        .active
+                        .lock()
+                        .expect("active 锁被毒化")
+                        .remove(&key);
+                }
                 return Err(SubmitError::Conflict { existing });
             }
-            Ok(JournalDecision::Inserted) => {}
+            Ok(JournalDecision::Inserted) => {} // 本请求成为执行者。
         }
-
-        // P1-6：active 在幂等登记后立即登记（在任何校验/入队之前）——并发
-        // 重复提交在提交全程都能命中 shared 等待首个请求的结果，而非落入
-        // EXECUTION_INTERRUPTED 窗口。后续所有拒绝路径都会结算 shared 并
-        // 移除该条目，不会残留。
-        let shared = Arc::new(SharedResult::new());
-        self.inner
-            .context
-            .active
-            .lock()
-            .expect("active 锁被毒化")
-            .insert(key.clone(), shared.clone());
 
         // 3. 设备存在且已启用（§4.2）。
         let Some(device_info) = self.inner.catalog.device(&request.device_id) else {
@@ -374,7 +447,7 @@ impl ControlEngine {
                     &request,
                     ctx,
                     &key,
-                    Some(&shared),
+                    &shared,
                     "DEVICE_NOT_FOUND",
                     format!("设备 {} 不存在", request.device_id),
                 )
@@ -386,7 +459,7 @@ impl ControlEngine {
                     &request,
                     ctx,
                     &key,
-                    Some(&shared),
+                    &shared,
                     "DEVICE_DISABLED",
                     format!("设备 {} 已禁用", request.device_id),
                 )
@@ -404,7 +477,7 @@ impl ControlEngine {
             .authorize(&ctx.subject, required, &request.device_id)
         {
             return Ok(self
-                .reject_with_shared(&request, ctx, &key, Some(&shared), e.code, e.message)
+                .reject_with_shared(&request, ctx, &key, &shared, e.code, e.message)
                 .await);
         }
 
@@ -419,7 +492,7 @@ impl ControlEngine {
                                 &request,
                                 ctx,
                                 &key,
-                                Some(&shared),
+                                &shared,
                                 e.code(),
                                 e.to_string(),
                             )
@@ -436,7 +509,7 @@ impl ControlEngine {
                                 &request,
                                 ctx,
                                 &key,
-                                Some(&shared),
+                                &shared,
                                 e.code(),
                                 e.to_string(),
                             )
@@ -448,13 +521,13 @@ impl ControlEngine {
                     let ValidatedOperation::Execute { preconditions, .. } = &op else {
                         unreachable!("CommandExecute 校验结果必为 Execute");
                     };
-                    if let Err(e) = checker.check(&request.device_id, preconditions) {
+                    if let Err(e) = checker.check(&request.device_id, preconditions).await {
                         return Ok(self
                             .reject_with_shared(
                                 &request,
                                 ctx,
                                 &key,
-                                Some(&shared),
+                                &shared,
                                 "PRECONDITION_FAILED",
                                 e.message,
                             )
@@ -511,7 +584,7 @@ impl ControlEngine {
                         &request,
                         ctx,
                         &key,
-                        Some(&shared),
+                        &shared,
                         "QUEUE_FULL",
                         format!("设备控制队列已满（容量 {capacity}）"),
                     )
@@ -525,8 +598,13 @@ impl ControlEngine {
                     interrupted_result(&request, "QUEUE_CLOSED", "引擎停机中，请求未能入队执行");
                 // P2-H：结算落盘在阻塞线程池执行；失败只记日志（结果本就是
                 // Indeterminate，重启恢复语义一致，无需再次降级）。
-                if let Err(e) =
-                    crate::journal::settle_record(&self.inner.context.journal, &key, &result).await
+                if let Err(e) = crate::journal::settle_record(
+                    &self.inner.context.journal,
+                    &self.inner.context.journal_io_gate,
+                    &key,
+                    &result,
+                )
+                .await
                 {
                     tracing::warn!(
                         component = "control-engine",
@@ -587,10 +665,18 @@ impl ControlEngine {
     /// 查询既有结果（§77：异步控制轮询；§80.1 幂等查询）。
     ///
     /// 只返回已结算的结果；未完成或未知请求返回 `None`。
-    pub fn status(&self, key: &IdempotencyKey) -> Option<ControlResult> {
+    /// 三审 P2：过期清理与查询在阻塞线程池执行（受 Journal 并发闸门约束），
+    /// 异步调用方不会在 Tokio worker 上做同步磁盘 I/O。
+    pub async fn status(&self, key: &IdempotencyKey) -> Option<ControlResult> {
         let now = now_ns();
-        let _ = self.inner.context.journal.purge_expired(now);
-        self.inner.context.journal.get(key).and_then(|e| e.result)
+        let entry = crate::journal::purge_and_get(
+            &self.inner.context.journal,
+            &self.inner.context.journal_io_gate,
+            key,
+            now,
+        )
+        .await;
+        entry.and_then(|e| e.result)
     }
 
     /// 有序停机（§93 停机语义）。
@@ -635,26 +721,14 @@ impl ControlEngine {
     /// 校验/授权/前置条件/队列满等 Driver 前的拒绝（§84、§85、§86）。
     ///
     /// 以 `Rejected` 结算：幂等 Journal 记录 + 审计（§90），并立即返回。
-    async fn reject(
-        &self,
-        request: &ControlRequest,
-        ctx: &SubmitContext,
-        key: &IdempotencyKey,
-        code: &str,
-        message: String,
-    ) -> ControlReceipt {
-        self.reject_with_shared(request, ctx, key, None, code, message)
-            .await
-    }
-
-    /// 与 [`Self::reject`] 相同，但额外写入 shared（供已登记的 active 等待者
-    /// 获得一致的拒绝结果，不永久挂起；§87 队列满场景）。
+    /// `shared` 必为已登记 active 的条目（三审 P1：active 在 Journal 插入前
+    /// 登记，拒绝路径结算 shared 并移除条目，并发等待者获得一致结果）。
     async fn reject_with_shared(
         &self,
         request: &ControlRequest,
         ctx: &SubmitContext,
         key: &IdempotencyKey,
-        shared: Option<&Arc<SharedResult>>,
+        shared: &Arc<SharedResult>,
         code: &str,
         message: String,
     ) -> ControlReceipt {
@@ -673,8 +747,13 @@ impl ControlEngine {
             }),
         };
         // 幂等结算（§80.1：拒绝同样是终态）。P2-H：落盘在阻塞线程池执行。
-        if let Err(e) =
-            crate::journal::settle_record(&self.inner.context.journal, key, &result).await
+        if let Err(e) = crate::journal::settle_record(
+            &self.inner.context.journal,
+            &self.inner.context.journal_io_gate,
+            key,
+            &result,
+        )
+        .await
         {
             tracing::warn!(
                 component = "control-engine",
@@ -713,17 +792,15 @@ impl ControlEngine {
             0,
             now_ns(),
         ));
-        if let Some(shared) = shared {
-            // 结算共享结果并移除 active（P1-6：拒绝同样是终态，
-            // 幂等等待者获得一致结果，不残留 stale 条目）。
-            self.inner
-                .context
-                .active
-                .lock()
-                .expect("active 锁被毒化")
-                .remove(key);
-            shared.set(result.clone());
-        }
+        // 结算共享结果并移除 active（P1-6：拒绝同样是终态，幂等等待者获得一致
+        // 结果，不残留 stale 条目；shared 必为已登记 active 的条目）。
+        self.inner
+            .context
+            .active
+            .lock()
+            .expect("active 锁被毒化")
+            .remove(key);
+        shared.set(result.clone());
         ControlReceipt::ready(result)
     }
 }

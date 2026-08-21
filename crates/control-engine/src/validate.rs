@@ -107,6 +107,9 @@ pub enum ValidationError {
     /// 参数包含非有限浮点（NaN/±Inf，P1-C）——无法编码为合法协议值
     /// 且会破坏范围比较，拒绝（不得转为 JSON null 静默透传）。
     ParameterNotFinite { command: String, parameter: String },
+    /// 空写入请求（`items` 为空，P2）——没有任何语义操作，拒绝，
+    /// 避免空写入被当作成功操作返回。
+    EmptyWrite,
     /// Profile 缩放配置非法（加载时已拦截，防御性路径）。
     ProfileConfiguration { path: PropertyPath, reason: String },
 }
@@ -127,6 +130,7 @@ impl ValidationError {
             ValidationError::DuplicateParameter { .. } => "DUPLICATE_PARAMETER",
             ValidationError::ParameterOutOfRange { .. } => "PARAMETER_OUT_OF_RANGE",
             ValidationError::ParameterNotFinite { .. } => "PARAMETER_NOT_FINITE",
+            ValidationError::EmptyWrite => "EMPTY_WRITE",
             ValidationError::ProfileConfiguration { .. } => "PROFILE_CONFIGURATION",
         }
     }
@@ -189,6 +193,7 @@ impl std::fmt::Display for ValidationError {
             ValidationError::ParameterNotFinite { command, parameter } => {
                 write!(f, "命令 {command} 参数 {parameter} 不是有限数值（NaN/Inf）")
             }
+            ValidationError::EmptyWrite => write!(f, "写入请求不包含任何属性项"),
             ValidationError::ProfileConfiguration { path, reason } => {
                 write!(f, "属性 {path} 的 Profile 配置非法: {reason}")
             }
@@ -206,6 +211,10 @@ pub fn validate_property_write(
     profile: &DeviceProfile,
     request: &PropertyWriteRequest,
 ) -> Result<ValidatedOperation, ValidationError> {
+    // P2：空写入请求没有任何语义操作，拒绝（避免空写入被当作成功操作返回）。
+    if request.items.is_empty() {
+        return Err(ValidationError::EmptyWrite);
+    }
     let mut items = Vec::with_capacity(request.items.len());
     let mut paths = Vec::with_capacity(request.items.len());
     for (index, item) in request.items.iter().enumerate() {
