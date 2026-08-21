@@ -1994,6 +1994,8 @@ GET  /api/v1/control-requests/{request_id}
 
 Property Write 与 Command Execute 都使用 `/controls`，通过 `kind` 区分，且都进入 Control Engine。
 
+控制端点必须经过 §90.2 认证（Bearer Token）；未认证请求一律 `401`。
+
 ## 31.6 REST Error Model
 
 ```json
@@ -5225,6 +5227,45 @@ edge build: control endpoint disabled until TLS + auth configured
 TLS -> Authentication -> Authorization -> Validation
     -> Policy -> Durable Control Journal -> Queue -> Driver
 ```
+
+# 90.2 REST 控制面认证（Normative）
+
+启用 Control 能力时，REST 控制 API（§31.5 `POST /api/v1/devices/{device_id}/controls`、`GET /api/v1/control-requests/{request_id}`）必须启用认证。MVP 采用静态 Bearer Token 方案；mTLS 客户端证书认证留给 Edge/Manager 阶段扩展。
+
+## 凭据形态
+
+- 客户端每次请求携带 `Authorization: Bearer <token>` 头。
+- Token 必须为高熵随机串（建议 ≥ 32 字节的 base64/hex 编码）；禁止低熵口令。
+- 凭据文件（JSON，schema 显式版本化）：
+
+```json
+{
+  "schema": "forgelink.control.credentials.v1",
+  "credentials": [
+    { "token": "<高熵随机串>", "subject": "alice", "role": "operator" },
+    { "token": "<高熵随机串>", "subject": "bob", "role": "viewer" }
+  ]
+}
+```
+
+- 主配置（YAML）只允许配置凭据文件**路径**，禁止内联 Token（§90.1：Token 禁止进入普通明文配置）。
+- 凭据文件权限：Linux/Unix 必须为 `0600`（启动时校验，过宽拒绝启动）；Windows 使用服务账户 ACL 保护（MVP 不做 ACL 强校验）。
+- `subject`/`role` 语义见 §83 角色模型；REST 层只负责**认证**（Token → subject/role 上下文），**授权**由 Control Engine 的 Authorizer 执行（§81、§83）。
+
+## 认证行为
+
+- Token 比较必须使用常量时间比较，防止时序侧信道枚举。
+- 缺失头、格式非法、未知 Token → `401`（`forgelink.error.v1`，code `UNAUTHENTICATED`）。
+- 已认证但角色不足 → 由 Control Engine 授权拒绝映射为 `403`（`INSUFFICIENT_ROLE`）。
+- 凭据文件缺失、权限校验失败、解析失败、schema 不符 → **启动失败**（fail-closed，§90.1），不得降级为无认证运行。
+- 同一 Token 重复出现、`subject` 为空、非法角色值 → 启动失败（fail-closed）。
+- Token、`Authorization` 头与凭据文件内容禁止进入日志与诊断（§6 脱敏兜底，不记录敏感字段优先）。
+
+## 认证范围
+
+- **控制路由必须认证**：无有效凭据一律 `401`，loopback 监听亦不豁免（fail-closed）。
+- 只读管理接口（§31.5 GET 端点）MVP 维持现状（不强制认证，依赖 loopback 默认与 §90.1 网络边界）；后续版本再统一收紧。
+- 远程（非 loopback）监听必须同时满足 §90.1 的 TLS 要求；TLS 终止前的明文控制请求不得放行。
 
 ---
 
