@@ -1992,6 +1992,30 @@ GET  /api/v1/control-requests/{request_id}
 }
 ```
 
+`GET /api/v1/control-requests/{request_id}` 返回请求当前状态（§77 异步控制三态）：
+
+```json
+{
+  "schema": "forgelink.control.status.v1",
+  "request_id": "cmd-...",
+  "state": "unknown | running | settled",
+  "result": {
+    "request_id": "cmd-...",
+    "namespace": "plant-a",
+    "device_id": "dev-1",
+    "status": "succeeded | failed | timeout | cancelled | indeterminate | rejected",
+    "started_at_ns": 0,
+    "completed_at_ns": 0,
+    "result": {},
+    "error": { "code": "...", "message": "...", "details": {} }
+  }
+}
+```
+
+- `state = unknown`：引擎无该 request_id 记录（`result` 缺省）；
+- `state = running`：已受理尚未结算（`result` 缺省）；
+- `state = settled`：终态，`result` 为 §80.1 `ControlResult` 完整载荷。
+
 Property Write 与 Command Execute 都使用 `/controls`，通过 `kind` 区分，且都进入 Control Engine。
 
 控制端点必须经过 §90.2 认证（Bearer Token）；未认证请求一律 `401`。
