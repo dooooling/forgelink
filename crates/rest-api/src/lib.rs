@@ -49,7 +49,10 @@
 //! # 安全边界（§90.1/§90.2）
 //!
 //! - 服务器**默认不启动**（`listen = None`）；启用必须显式配置，默认
-//!   绑定 `127.0.0.1` / `::1`（loopback）。
+//!   绑定 `127.0.0.1` / `::1`（loopback）。控制装配
+//!   （[`RestApiServer::spawn_with_control`]）强制 loopback 监听——非
+//!   loopback 返回配置错误（§90.2 MVP 控制面仅允许 loopback 直连，远程
+//!   访问须经 TLS 反向代理转发；评审二轮 P2 纵深防御）。
 //! - 控制端点要求 `Authorization: Bearer <token>`（§90.2
 //!   [`control_engine::StaticTokenAuthorizer`] 常量时间比较）；缺失/
 //!   非法/未知 Token 一律 401，Token 明文不进日志与错误信息。

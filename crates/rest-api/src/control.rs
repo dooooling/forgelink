@@ -29,11 +29,11 @@
 //! | 就绪拒绝收据 `INSUFFICIENT_ROLE`（§83） | 403 | `INSUFFICIENT_ROLE` |
 //! | 就绪拒绝收据 `DEVICE_NOT_FOUND` | 404 | `DEVICE_NOT_FOUND` |
 //! | `DEVICE_DISABLED` / `IDEMPOTENCY_RACE` / 幂等冲突 | 409 | 引擎稳定码 |
-//! | 同 request_id 不同完整幂等键（REST 台账准入，§80.1） | 409 | `IDEMPOTENCY_CONFLICT` |
 //! | `SubmitError::InvalidRequest` 信封/时效类 | 400 | 引擎稳定码 |
 //! | `InvalidRequest` 语义类（`PARAMETER_*`/`EMPTY_WRITE`/`PRECONDITION_*`）与其余校验类拒绝收据 | 422 | 引擎稳定码 |
 //! | `QUEUE_FULL` / `JOURNAL_UNAVAILABLE` / `DEVICE_COOLDOWN` / 引擎停机 | 503 | 引擎稳定码或 `SERVICE_UNAVAILABLE` |
-//! | 台账被未结算请求占满（REST 台账准入） | 503 | `LEDGER_FULL` |
+//! | 台账被未结算与歧义条目占满（提交预检，非键敏感） | 503 | `LEDGER_FULL` |
+//! | 状态查询：同 request_id 绑定多个完整幂等键（歧义，评审二轮 P2） | 409 | `AMBIGUOUS_REQUEST_ID` |
 //!
 //! 控制链路的信封 `code` 透传引擎稳定错误码（§80.1 `ControlError.code`），
 //! HTTP 状态按上表映射；message 使用引擎文案（引擎侧已保证不含敏感细节，
@@ -54,37 +54,52 @@
 //! # request_id → 幂等键台账
 //!
 //! 引擎状态查询需要完整幂等键 `(namespace, device_id, request_id)`
-//! （§80.1），而 REST 只有 request_id：[`EngineControlAdapter`] 在提交前
-//! 把映射登记进有界台账（`RequestLedger`，容量
-//! `REQUEST_LEDGER_CAPACITY`），并在请求结算时补记最终结果。状态查询
-//! 直接由台账回答三态：
+//! （§80.1），而 REST 只有 request_id：[`EngineControlAdapter`] 在**引擎
+//! 受理之后**把映射登记进有界台账（`RequestLedger`，容量
+//! `REQUEST_LEDGER_CAPACITY`），并在请求结算时补记最终结果。主存储以
+//! 完整幂等键为键，二级索引 request_id → 关联键集合。状态查询由台账
+//! 回答：
 //!
 //! - 无条目 → `unknown`（未知 request_id、settled 条目已被淘汰或**进程
 //!   重启后台账丢失**）；
-//! - 有条目无结果 → `running`（已受理未结算）；
-//! - 有结果 → `settled`（终态，含完整 `ControlResult`）。
+//! - 恰一个关联键 → 该键条目的状态：无结果 `running`，有结果 `settled`
+//!   （含完整 `ControlResult`）；
+//! - 多个关联键（同 request_id 提交到不同 namespace/device_id）→ 409
+//!   `AMBIGUOUS_REQUEST_ID`（歧义，评审二轮 P2）：放行任一状态都会绕过
+//!   引擎幂等键语义（§80.1），且无法判定客户端所指请求——这是**授权后
+//!   用户自己制造**的可判定状态，不泄露他人信息。
+//!
+//! **登记时序即安全边界（评审二轮 P1-A）**：授权成功之前，REST 层不得
+//! 执行任何以 request_id/full-key 为键的读改写。提交预检只做非键敏感的
+//! 计数；键敏感的登记一律发生在引擎 `submit` 返回 `Ok`（已完成 §83 授权
+//! 与 §84 校验）之后；授权失败的拒绝收据（`INSUFFICIENT_ROLE` /
+//! `UNKNOWN_SUBJECT`）不登记任何条目——未授权用户既无法借 409-vs-403
+//! 差异探测 request_id 存在性，也无法污染他人在途请求的状态。
 //!
 //! **`unknown` 不构成"可安全重试"的依据**（§80.1：不得盲目重放未确定
 //! 动作）：对已提交过的请求，旧物理动作可能仍在执行——换用新 request_id
 //! 重试会绕过引擎幂等键导致**重复执行**。客户端应沿用原 request_id 查询，
 //! 或经人工确认后再决定后续动作。
 //!
-//! # 台账淘汰与提交准入（评审 P1）
+//! # 台账淘汰与提交准入（评审二轮 P1）
 //!
-//! - **running 永不淘汰**：淘汰扫描只移除 settled 条目（FIFO 取最早插入
-//!   的 settled）。running 条目的物理动作可能仍在执行，淘汰会让其状态
-//!   永久不可查。
-//! - **容量被 running 占满 → 拒绝新请求**：submit 在引擎提交前做台账
-//!   准入；无 settled 可淘汰时返回 503 `LEDGER_FULL`（消息说明存在大量
-//!   未结算请求），避免受理后状态不可查。
-//! - **同 request_id 不同完整幂等键 → 409**：request_id 已登记但
-//!   `(namespace, device_id)` 不同——放行会绕过引擎幂等键导致同一逻辑
-//!   请求重复执行（§80.1），直接以 `IDEMPOTENCY_CONFLICT` 拒绝。
+//! - **running 与歧义条目永不淘汰**：淘汰扫描只移除最早插入的 settled
+//!   条目（FIFO）。running 条目的物理动作可能仍在执行，淘汰会让其状态
+//!   永久不可查；歧义条目的 409 答案必须稳定。
+//! - **提交预检只计数（非键敏感）**：submit 在引擎提交前仅检查"占用
+//!   条目数（running + 歧义）≥ 容量"→ 503 `LEDGER_FULL`；不查不写任何
+//!   request_id/key。
+//! - **同 request_id 不同完整幂等键 → 歧义而非提交期 409**：提交期
+//!   冲突检查属于授权前的键敏感读（可探测 request_id 存在性），已删除；
+//!   改为授权后登记时把该 request_id 标记为歧义。
 //!
 //! 结算结果的获取方式：受理路径由适配器派生的后台等待者持有收据等待
 //! 终态（每个在途请求恰好一个等待者，随结算终止——任务数与在途控制请求
 //! 同阶，有界；收据由引擎保证不永久挂起）。引擎 Err 路径（信封非法/
-//! 冲突/停机）回滚 running 占位，不留永久不可结算条目。
+//! 冲突/停机）不做任何回滚——本流程从未登记过任何条目，回滚反而会误删
+//! 同 request_id 其他完整键的在途记录（评审二轮 P1-B 结构性消失）。
+//! 登记时的竞态窗口（预检通过但登记时满员）允许暂时超限并记 warn 日志：
+//! 容量是有界内存/抗 DoS 的启发式，正确性（已受理请求状态可查）优先。
 //!
 //! # 安全边界（§90.2）
 //!
@@ -96,7 +111,7 @@
 //!   在引擎内完成（§83），查询链路在 REST 层完成。
 //! - Token 明文**永不**进入日志与错误信息（认证失败只记固定文案）。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -145,10 +160,11 @@ const ACCEPTED_STATUS: &str = "accepted";
 /// request_id 台账容量（有界：满时淘汰最早插入，内存有界）。
 const REQUEST_LEDGER_CAPACITY: usize = 10_000;
 
-/// 状态查询三态（§77/§80.1）。
+/// 状态查询三态（§77/§80.1）+ 歧义（评审二轮 P2）。
 ///
 /// 引擎 `StatusQuery` 的同构镜像（该类型当前未从 control-engine 根导出，
-/// rest-api 无法命名；变体一一对应，引擎导出后可原样替换）。
+/// rest-api 无法命名；三态变体一一对应，引擎导出后可原样替换），外加
+/// REST 台账自身的歧义项。
 #[derive(Debug, Clone)]
 pub enum ControlStatusQuery {
     /// 无该请求的任何记录（未知 request_id、已淘汰或进程重启后台账丢失）。
@@ -157,6 +173,10 @@ pub enum ControlStatusQuery {
     Running,
     /// 已有终态结果。
     Settled(Box<ControlResult>),
+    /// 同 request_id 绑定了多个不同的完整幂等键（不同 namespace/device_id，
+    /// 授权后用户自造的歧义）：无法判定客户端所指请求，状态查询一律 409
+    /// `AMBIGUOUS_REQUEST_ID`——不放行任何一个键的状态（评审二轮 P2）。
+    Ambiguous,
 }
 
 /// 状态查询失败（§83 授权不足）。
@@ -181,21 +201,21 @@ pub enum Submission {
     Ready(Box<ControlResult>),
 }
 
-/// 控制提交错误：引擎 [`SubmitError`] + REST 台账准入层的自身拒绝
-/// （评审 P1：running 永不淘汰带来的两个新拒绝路径）。
+/// 控制提交错误：引擎 [`SubmitError`] + REST 提交预检拒绝（评审二轮 P1）。
+///
+/// 旧实现的"同 request_id 不同完整幂等键 → 409 `IDEMPOTENCY_CONFLICT`"
+/// 准入拒绝已删除：那是授权前的键敏感读（未授权用户可借它与 403 的差异
+/// 探测 request_id 存在性）。现改为授权后登记时把该 request_id 标记为
+/// 歧义，状态查询返回 409 `AMBIGUOUS_REQUEST_ID`（模块文档"request_id →
+/// 幂等键台账"）。
 #[derive(Debug)]
 pub enum ControlSubmitError {
     /// 引擎提交错误（信封非法/幂等冲突/停机，§80.1）。Box 削减枚举
     /// 尺寸（`SubmitError::Conflict` 内嵌 `JournalEntry`，远大于其余
     /// 单元变体——热路径上频繁按值传递）。
     Engine(Box<SubmitError>),
-    /// 同 request_id 已登记但完整幂等键 `(namespace, device_id)` 不同：
-    /// 放行会绕过引擎幂等键导致同一逻辑请求重复执行（§80.1）→ 409
-    /// `IDEMPOTENCY_CONFLICT`。
-    IdempotencyConflict,
-    /// 台账被未结算（running）请求占满且无 settled 可淘汰：拒绝新请求
-    /// → 503 `LEDGER_FULL`（running 永不淘汰，见模块文档"台账淘汰与
-    /// 提交准入"）。
+    /// 提交预检（非键敏感）：台账被未结算（running）与歧义条目占满
+    /// → 503 `LEDGER_FULL`（模块文档"台账淘汰与提交准入"）。
     LedgerFull,
 }
 
@@ -242,6 +262,9 @@ pub trait ControlAdapter: Send + Sync {
     /// 提交控制请求（§81 统一链路入口：认证后的 subject 与来源进入
     /// 授权与审计，§83/§90）。
     ///
+    /// 实现必须保证：授权成功之前不执行任何以 request_id/full-key 为键
+    /// 的读改写（评审二轮 P1，模块文档"request_id → 幂等键台账"）。
+    ///
     /// 返回 [`Submission`]：即时拒绝与幂等命中为就绪终态
     /// （[`Submission::Ready`]，提交即结算）；否则已入队待执行
     /// （[`Submission::Accepted`]，客户端轮询状态）。
@@ -249,10 +272,9 @@ pub trait ControlAdapter: Send + Sync {
     /// # Errors
     ///
     /// 信封非法/幂等冲突/引擎停机（[`ControlSubmitError::Engine`]）、
-    /// REST 台账准入拒绝（同 request_id 不同完整幂等键 →
-    /// [`ControlSubmitError::IdempotencyConflict`]；台账被未结算请求
-    /// 占满 → [`ControlSubmitError::LedgerFull`]，见模块文档"台账淘汰
-    /// 与提交准入"）时返回错误。
+    /// 提交预检发现台账被未结算与歧义条目占满
+    /// （[`ControlSubmitError::LedgerFull`]，见模块文档"台账淘汰与提交
+    /// 准入"）时返回错误。
     async fn submit(
         &self,
         request: ControlRequest,
@@ -343,44 +365,43 @@ impl ControlAdapter for EngineControlAdapter {
             device_id: request.device_id.clone(),
             request_id: request.request_id.clone(),
         };
-        // 台账准入先于引擎提交（评审 P1，模块文档"台账淘汰与提交准入"）：
-        // - 同 request_id 不同完整幂等键 → 409（放行会绕过引擎幂等键，
-        //   同一逻辑请求重复执行）；
-        // - 容量被 running 占满 → 503（避免受理后状态不可查）；
-        // - 否则占位 running 条目（淘汰只针对 settled，见 `admit`）。
-        match self.ledger.admit(&key) {
-            Ok(_) => {}
-            Err(AdmissionError::Conflict) => {
-                return Err(ControlSubmitError::IdempotencyConflict);
-            }
-            Err(AdmissionError::Full) => return Err(ControlSubmitError::LedgerFull),
+        // 1. 提交预检（评审二轮 P1，非键敏感）：仅统计占用条目数
+        //    （running + 歧义），满员 → 503。此处不查不写任何
+        //    request_id/key——授权之前 REST 层不得以它们为键读改写
+        //    （模块文档"登记时序即安全边界"）。
+        if !self.ledger.has_capacity() {
+            return Err(ControlSubmitError::LedgerFull);
         }
-        let receipt = match self
+        // 2. 引擎提交：授权（§83）与校验（§84）先于任何键敏感操作。
+        // 3. Err → 直接映射返回，**不做任何回滚**：本流程从未登记过任何
+        //    条目；回滚反而会误删同 request_id 其他完整键的在途记录
+        //    （评审二轮 P1-B 结构性消失）。
+        let receipt = self
             .engine
             .submit(request, &SubmitContext { subject, source })
             .await
-        {
-            Ok(receipt) => receipt,
-            Err(e) => {
-                // 引擎未受理（信封非法/冲突/停机）：回滚 running 占位，
-                // 不留永久不可结算条目（状态查询回到 unknown）。
-                self.ledger.rollback(&key.request_id);
-                return Err(ControlSubmitError::Engine(Box::new(e)));
-            }
-        };
+            .map_err(Box::new)
+            .map_err(ControlSubmitError::Engine)?;
+        // 4. Ok：已通过引擎授权与校验，执行登记（模块文档"request_id →
+        //    幂等键台账"）。同 request_id 不同完整键在此标记歧义。
         if receipt.is_ready() {
             // 就绪收据（提交即终态）：即时拒绝或幂等命中已结算。
             let result = receipt.wait().await;
-            self.ledger.record(key, Some(result.clone()));
+            if is_authorization_rejection(&result) {
+                // 授权失败的拒绝收据（§83）：授权未成功，键敏感登记被
+                // 禁止——不污染同 request_id 其他完整键的既有记录。
+                return Ok(Submission::Ready(Box::new(result)));
+            }
+            self.ledger.register(key, Some(result.clone()));
             Ok(Submission::Ready(Box::new(result)))
         } else {
-            self.ledger.record(key.clone(), None);
+            self.ledger.register(key.clone(), None);
             // 已受理：派生后台等待者持有收据等待终态并补记台账（模块文档：
             // 任务数与在途请求同阶，随结算终止；收据保证不永久挂起）。
             let ledger = Arc::clone(&self.ledger);
             tokio::spawn(async move {
                 let result = receipt.wait().await;
-                ledger.record(key, Some(result));
+                ledger.register(key, Some(result));
             });
             Ok(Submission::Accepted)
         }
@@ -393,31 +414,19 @@ impl ControlAdapter for EngineControlAdapter {
     }
 }
 
-/// 台账准入结果（引擎提交前的占位，评审 P1）。
-#[derive(Debug, PartialEq, Eq)]
-enum Admission {
-    /// 新条目已登记为 running 占位；引擎 Err 路径须 [`RequestLedger::rollback`]。
-    Admitted,
-    /// 同 request_id 已有登记且完整幂等键一致（幂等重试路径），无需新槽位。
-    Existing,
-}
-
-/// 台账准入失败（REST 层拒绝，先于引擎提交）。
-#[derive(Debug, PartialEq, Eq)]
-enum AdmissionError {
-    /// 同 request_id 已登记但 `(namespace, device_id)` 不同：放行会绕过
-    /// 引擎幂等键导致同一逻辑请求重复执行（§80.1）→ 409。
-    Conflict,
-    /// 容量被未结算（running）请求占满且无 settled 可淘汰 → 503。
-    Full,
-}
-
 /// request_id → 幂等键/结果的有界台账。
 ///
-/// 淘汰规则（评审 P1，模块文档"台账淘汰与提交准入"）：**running 永不
-/// 淘汰**——淘汰扫描只移除最早插入的 settled 条目；容量被 running 占满时
-/// 新请求被拒绝（[`RequestLedger::admit`] 返回 [`AdmissionError::Full`]），
-/// 而不是淘汰 running 让其状态永久不可查。
+/// 结构（评审二轮 P1 重写）：主存储以**完整幂等键**（§80.1 三元组）为键，
+/// 二级索引 request_id → 关联键集合（长度 ≥ 2 即歧义）。同 request_id 的
+/// 不同完整键不再在提交期拒绝（那是授权前的键敏感读，且引擎 Err 路径的
+/// 回滚会误删他人在途记录），而是授权后登记时标记歧义，状态查询一律 409
+/// `AMBIGUOUS_REQUEST_ID`。
+///
+/// 淘汰规则（模块文档"台账淘汰与提交准入"）：**running 与歧义条目永不
+/// 淘汰**——淘汰扫描只移除最早插入的 settled 条目。容量被占用条目
+/// （running + 歧义）占满时提交预检拒绝新请求
+/// （[`RequestLedger::has_capacity`]）；登记路径的竞态窗口允许暂时超限
+/// 并记 warn（正确性优先）。
 ///
 /// 标准互斥锁短临界区（纯内存操作、无 await），锁中毒时取回内部数据
 /// 继续工作（生产路径禁 panic）。
@@ -429,18 +438,16 @@ struct RequestLedger {
 
 #[derive(Debug, Default)]
 struct LedgerInner {
-    entries: HashMap<String, LedgerEntry>,
-    /// 插入顺序（FIFO 淘汰依据；淘汰时跳过 running 条目）。
-    order: VecDeque<String>,
+    /// 主存储：完整幂等键（§80.1 三元组）→ 条目。
+    entries: HashMap<IdempotencyKey, LedgerEntry>,
+    /// 二级索引：request_id → 关联完整幂等键集合（长度 ≥ 2 即歧义）。
+    by_request_id: HashMap<String, HashSet<IdempotencyKey>>,
+    /// 插入顺序（FIFO 淘汰依据；淘汰跳过 running 与歧义条目）。
+    order: VecDeque<IdempotencyKey>,
 }
 
 #[derive(Debug)]
 struct LedgerEntry {
-    /// 完整幂等键（§80.1 三元组）：准入时校验同 request_id 的
-    /// `(namespace, device_id)` 一致性（跨设备复用 → 409）；状态查询
-    /// 直接由缓存结果回答——control-engine 导出 `StatusQuery` 后，running
-    /// 态可回退引擎 Journal 查询（`request_id` → key → `engine.status`）。
-    key: IdempotencyKey,
     /// 结算结果（`None` = 已受理未结算，即 running）。
     result: Option<ControlResult>,
 }
@@ -457,118 +464,131 @@ impl RequestLedger {
         }
     }
 
-    /// 提交准入（先于引擎提交调用）：同 request_id 校验完整幂等键一致性；
-    /// 新 request_id 占位 running 条目，满员时只淘汰 settled 条目，无
-    /// settled 可淘汰（容量被 running 占满）则拒绝。
-    fn admit(&self, key: &IdempotencyKey) -> Result<Admission, AdmissionError> {
-        let mut inner = self
+    /// 提交预检（非键敏感，先于引擎调用）：仅统计占用条目数（running +
+    /// 歧义），满员返回 `false` → 503 `LEDGER_FULL`。只看计数，不读取
+    /// 任何具体 request_id/幂等键的值——授权之前 REST 层不得以它们为键
+    /// 读改写（模块文档"登记时序即安全边界"）。
+    fn has_capacity(&self) -> bool {
+        let inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match inner.entries.get(&key.request_id) {
-            Some(entry) => {
-                if entry.key.namespace != key.namespace || entry.key.device_id != key.device_id {
-                    return Err(AdmissionError::Conflict);
-                }
-                Ok(Admission::Existing)
-            }
-            None => {
-                while inner.order.len() >= self.capacity {
-                    if !Self::evict_oldest_settled(&mut inner) {
-                        // 全是 running：宁可拒绝新请求也不淘汰在途条目。
-                        return Err(AdmissionError::Full);
-                    }
-                }
-                let request_id = key.request_id.clone();
-                inner.entries.insert(
-                    request_id.clone(),
-                    LedgerEntry {
-                        key: key.clone(),
-                        result: None,
-                    },
-                );
-                inner.order.push_back(request_id);
-                Ok(Admission::Admitted)
-            }
-        }
+        Self::occupied_count(&inner) < self.capacity
     }
 
-    /// 引擎 Err 路径回滚 running 占位：仅移除仍为 running 的条目（已被
-    /// 并发路径结算的终态保留），状态查询回到 unknown。
-    fn rollback(&self, request_id: &str) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if inner
+    /// 占用条目数：running 条目 + 歧义条目。后者即使已结算也不可淘汰
+    /// （409 答案必须稳定），故始终计入容量。
+    fn occupied_count(inner: &LedgerInner) -> usize {
+        inner
             .entries
-            .get(request_id)
-            .is_some_and(|entry| entry.result.is_none())
-        {
-            inner.entries.remove(request_id);
-            if let Some(position) = inner.order.iter().position(|id| id == request_id) {
-                inner.order.remove(position);
-            }
-        }
+            .iter()
+            .filter(|(key, entry)| {
+                entry.result.is_none() || Self::is_ambiguous(inner, &key.request_id)
+            })
+            .count()
     }
 
-    /// 淘汰最早插入的 **settled** 条目（跳过 running——物理动作可能仍在
-    /// 执行，见模块文档）。无可淘汰对象时返回 `false`。
+    /// request_id 是否歧义（绑定 ≥ 2 个完整幂等键）。
+    fn is_ambiguous(inner: &LedgerInner, request_id: &str) -> bool {
+        inner
+            .by_request_id
+            .get(request_id)
+            .is_some_and(|keys| keys.len() > 1)
+    }
+
+    /// 授权后登记（引擎 `submit` 返回 `Ok` 之后调用；评审二轮 P1：键敏感
+    /// 操作一律后置于此）：
+    ///
+    /// - 同 full key 已登记（幂等重试 / 等待者补记终态）：保留既有条目，
+    ///   仅补结果（`Some` 覆盖、`None` 不动），不刷新插入序；
+    /// - 新 full key 且 request_id 已关联其他键 → 该 request_id 自此
+    ///   **歧义**（二级索引键集合长度 ≥ 2），状态查询一律 409；
+    /// - 满员时先淘汰最早插入的 settled 非歧义条目腾位；无可淘汰对象
+    ///   （预检与登记之间的竞态窗口）照常插入并记 warn——请求已通过引擎
+    ///   授权（可能已持久化、正在执行），此刻放弃登记会让已受理请求的
+    ///   状态永久不可查。容量是有界内存/抗 DoS 的启发式，正确性优先
+    ///   （模块文档"台账淘汰与提交准入"），暂时超限随 settled 淘汰回落。
+    fn register(&self, key: IdempotencyKey, result: Option<ControlResult>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = inner.entries.get_mut(&key) {
+            if result.is_some() {
+                entry.result = result;
+            }
+            return;
+        }
+        while inner.entries.len() >= self.capacity {
+            if !Self::evict_oldest_settled(&mut inner) {
+                warn!(
+                    component = "rest-api",
+                    request_id = %key.request_id,
+                    "控制台账满员（预检与登记竞态），允许暂时超限"
+                );
+                break;
+            }
+        }
+        let request_id = key.request_id.clone();
+        inner.entries.insert(key.clone(), LedgerEntry { result });
+        inner
+            .by_request_id
+            .entry(request_id)
+            .or_default()
+            .insert(key.clone());
+        inner.order.push_back(key);
+    }
+
+    /// 淘汰最早插入的 **settled 且非歧义** 条目（跳过 running 与歧义，
+    /// 见模块文档）。无可淘汰对象时返回 `false`。
     fn evict_oldest_settled(inner: &mut LedgerInner) -> bool {
         for index in 0..inner.order.len() {
-            let Some(entry) = inner.entries.get(&inner.order[index]) else {
+            let Some(key) = inner.order.get(index) else {
                 continue; // 防御：order 与 entries 失配时跳过
             };
-            if entry.result.is_some() {
-                let request_id = inner.order.remove(index).expect("index 取自当前长度范围内");
-                inner.entries.remove(&request_id);
-                return true;
+            let Some(entry) = inner.entries.get(key) else {
+                continue; // 防御：order 与 entries 失配时跳过
+            };
+            if entry.result.is_none() || Self::is_ambiguous(inner, &key.request_id) {
+                continue;
             }
+            let key = inner.order.remove(index).expect("index 取自当前长度范围内");
+            // 歧义条目不会被淘汰，被淘汰条目的 request_id 必然只关联此
+            // 一个键；仍按集合语义移除（防御失配）。
+            if let Some(keys) = inner.by_request_id.get_mut(&key.request_id) {
+                keys.remove(&key);
+                if keys.is_empty() {
+                    inner.by_request_id.remove(&key.request_id);
+                }
+            }
+            inner.entries.remove(&key);
+            return true;
         }
         false
     }
 
-    /// 登记条目。已存在时仅补结果（同 request_id 幂等重试/结算回填不刷新
-    /// 插入序）；不存在时插入（防御路径：正常流经 [`Self::admit`] 占位）
-    /// 并在满员时只淘汰 settled 条目，无 settled 可淘汰则放弃登记。
-    fn record(&self, key: IdempotencyKey, result: Option<ControlResult>) {
-        let mut inner = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match inner.entries.get_mut(&key.request_id) {
-            Some(entry) => {
-                if result.is_some() {
-                    entry.result = result;
-                }
-            }
-            None => {
-                while inner.order.len() >= self.capacity {
-                    if !Self::evict_oldest_settled(&mut inner) {
-                        return;
-                    }
-                }
-                let request_id = key.request_id.clone();
-                inner
-                    .entries
-                    .insert(request_id.clone(), LedgerEntry { key, result });
-                inner.order.push_back(request_id);
-            }
-        }
-    }
-
-    /// 三态查询（模块文档"request_id → 幂等键台账"）。
+    /// 状态查询（模块文档"request_id → 幂等键台账"）：无记录 unknown；
+    /// 多个关联键 → [`ControlStatusQuery::Ambiguous`]；恰一个关联键按其
+    /// 条目回答 running/settled。
     fn query(&self, request_id: &str) -> ControlStatusQuery {
         let inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match inner.entries.get(request_id) {
-            None => ControlStatusQuery::Unknown,
+        let Some(keys) = inner.by_request_id.get(request_id) else {
+            return ControlStatusQuery::Unknown;
+        };
+        if keys.len() > 1 {
+            return ControlStatusQuery::Ambiguous;
+        }
+        let key = keys.iter().next().expect("非空集合");
+        match inner.entries.get(key) {
             Some(entry) => match &entry.result {
                 Some(result) => ControlStatusQuery::Settled(Box::new(result.clone())),
                 None => ControlStatusQuery::Running,
             },
+            // 防御：索引与主存储失配时不虚构状态。
+            None => ControlStatusQuery::Unknown,
         }
     }
 }
@@ -977,12 +997,32 @@ async fn control_status(
     let _permit = acquire(&state.concurrency, &id).await?;
 
     match state.gateway.adapter.status(&request_id).await {
+        // 歧义（评审二轮 P2）：同 request_id 绑定多个完整幂等键——409
+        // 而非任一状态，放行任一键的状态都会绕过 §80.1 幂等键语义。
+        Ok(ControlStatusQuery::Ambiguous) => {
+            warn!(
+                component = "rest-api",
+                request_id = %id,
+                "状态查询命中歧义 request_id（绑定多个完整幂等键）"
+            );
+            Err(ApiErrorResponse(
+                id,
+                ApiError::control(
+                    ErrorCode::StateConflict,
+                    "AMBIGUOUS_REQUEST_ID",
+                    "同 request_id 已绑定多个不同的完整幂等键\
+                     （不同 namespace/device_id），无法确定所指请求；\
+                     请更换新的 request_id 提交",
+                ),
+            ))
+        }
         Ok(query) => Ok(Json(match query {
             ControlStatusQuery::Unknown => ControlStatusResponse::unknown(request_id),
             ControlStatusQuery::Running => ControlStatusResponse::running(request_id),
             ControlStatusQuery::Settled(result) => {
                 ControlStatusResponse::settled(request_id, *result)
             }
+            ControlStatusQuery::Ambiguous => unreachable!("上方分支已处理 Ambiguous"),
         })),
         Err(e) => Err(ApiErrorResponse(
             id,
@@ -999,17 +1039,23 @@ fn is_semantic_validation_code(code: &str) -> bool {
     code.starts_with("PARAMETER_") || code == "EMPTY_WRITE" || code.starts_with("PRECONDITION_")
 }
 
+/// 就绪拒绝收据是否为授权失败（§83）：授权未成功——REST 层不得执行任何
+/// 键敏感登记（模块文档"登记时序即安全边界"），否则未授权方可借提交
+/// 污染/探测同 request_id 的他人在途记录。`UNKNOWN_SUBJECT` 是授权器的
+/// 另一稳定码（REST 层已先行 401 认证，正常流不可达，防御性覆盖）。
+fn is_authorization_rejection(result: &ControlResult) -> bool {
+    result.status == ControlStatus::Rejected
+        && result
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == "INSUFFICIENT_ROLE" || e.code == "UNKNOWN_SUBJECT")
+}
+
 /// `ControlSubmitError` → §31.6 错误（信封 code 透传引擎稳定码或台账
-/// 准入稳定码）。
+/// 预检稳定码）。
 fn map_submit_error(err: &ControlSubmitError) -> ApiError {
     match err {
         ControlSubmitError::Engine(engine) => map_engine_submit_error(engine),
-        ControlSubmitError::IdempotencyConflict => ApiError::control(
-            ErrorCode::StateConflict,
-            "IDEMPOTENCY_CONFLICT",
-            "同 request_id 已绑定不同的 namespace/device_id（§80.1 幂等键不一致）：\
-             复用将绕过引擎幂等保护导致重复执行，请更换 request_id",
-        ),
         ControlSubmitError::LedgerFull => ApiError::control(
             ErrorCode::ServiceUnavailable,
             "LEDGER_FULL",
@@ -1183,6 +1229,8 @@ mod tests {
 
     const NS: &str = "plant-a";
     const DEV: &str = "vfd-01";
+    /// 第二台启用设备（跨设备同 request_id 场景）。
+    const DEV2: &str = "vfd-02";
     const DEV_DISABLED: &str = "vfd-off";
 
     /// 测试凭据（§90.2 格式；`parse` 不做文件权限校验，跨平台可用）：
@@ -1301,6 +1349,7 @@ mod tests {
         let profile = test_profile();
         let mut catalog = MemoryDeviceCatalog::new();
         catalog.insert_profile(DEV.to_owned(), profile.clone());
+        catalog.insert_profile(DEV2.to_owned(), profile.clone());
         catalog.insert_disabled(DEV_DISABLED.to_owned(), profile);
         let authorizer =
             Arc::new(StaticTokenAuthorizer::parse(CREDENTIALS_JSON).expect("凭据合法"));
@@ -1602,6 +1651,60 @@ mod tests {
         server.shutdown().await;
     }
 
+    // ---- spawn_with_control 的 loopback 校验（评审二轮 P2，§90.2）-----------
+
+    #[tokio::test]
+    async fn spawn_with_control_rejects_non_loopback_listen() {
+        // §90.2：远程（非 loopback）必须 TLS，MVP 无原生 TLS——控制面仅
+        // 允许 loopback 直连（IPv4 127.0.0.0/8、IPv6 ::1）。collector 配置
+        // 层已先行校验；spawn_with_control 对直接构造的 RestConfig 兜底
+        // 拒绝（纵深防御），fail-fast 而非静默对外暴露控制端点。
+        let gateway = control_gateway_with(GateExecutor::new(), |_| {}, REQUEST_LEDGER_CAPACITY);
+        let result = crate::server::RestApiServer::spawn_with_control(
+            Arc::new(EmptyState),
+            gateway,
+            crate::server::RestConfig {
+                listen: "192.168.1.10:8080".parse().expect("静态地址合法"),
+                max_concurrency: 8,
+            },
+        )
+        .await;
+        let err = match result {
+            Ok(_) => panic!("非 loopback 监听必须拒绝"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let text = err.to_string();
+        assert!(
+            text.contains("loopback"),
+            "错误应说明仅允许 loopback: {text}"
+        );
+        assert!(
+            text.contains("TLS"),
+            "错误应引用 §90.2 TLS 反向代理约束: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_with_control_allows_loopback_listen_ipv4_and_ipv6() {
+        // IPv4 127.0.0.0/8 与 IPv6 ::1 均为 loopback，允许启动（§90.2）。
+        for listen in ["127.0.0.1:0", "127.9.9.9:0", "[::1]:0"] {
+            let gateway =
+                control_gateway_with(GateExecutor::new(), |_| {}, REQUEST_LEDGER_CAPACITY);
+            let server = crate::server::RestApiServer::spawn_with_control(
+                Arc::new(EmptyState),
+                gateway,
+                crate::server::RestConfig {
+                    listen: listen.parse().expect("静态地址合法"),
+                    max_concurrency: 8,
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{listen} 应允许启动: {e}"));
+            server.shutdown().await;
+        }
+    }
+
     // ---- 提交成功路径 -------------------------------------------------------
 
     #[tokio::test]
@@ -1874,7 +1977,7 @@ mod tests {
         assert_eq!(body["status"], "accepted");
     }
 
-    // ---- 台账准入的 HTTP 映射（评审 P1-A）-----------------------------------
+    // ---- 提交预检的 HTTP 映射（评审二轮 P1：非键敏感计数）------------------
 
     #[tokio::test]
     async fn ledger_full_rejects_new_submissions_and_keeps_running_queryable() {
@@ -1931,8 +2034,14 @@ mod tests {
         assert_eq!(body["state"], "unknown");
     }
 
+    // ---- 授权先于幂等状态（评审二轮 P1-A/P1-B 回归）-------------------------
+
     #[tokio::test]
-    async fn cross_device_same_request_id_maps_to_409_idempotency_conflict() {
+    async fn unauthorized_submit_with_existing_other_device_request_id_gets_403_not_409() {
+        // P1-A：授权先于任何键敏感操作。设备 A 上 r1 在跑时，viewer 对
+        // 设备 B 复用 r1 必须得到引擎授权拒绝（403 INSUFFICIENT_ROLE），
+        // 而不是 REST 台账准入冲突（409）——后者向未授权方泄露 r1 已
+        // 存在，且在台账留下状态。
         let executor = GateExecutor::new(); // 阻塞首条保持 running
         let app = control_app(executor.clone(), |_| {});
 
@@ -1940,29 +2049,152 @@ mod tests {
             app.clone(),
             Some(TOKEN_OPERATOR),
             DEV,
-            &write_body("xd-1", 10.0),
+            &write_body("ua-1", 10.0),
         )
         .await;
         assert_eq!(first, StatusCode::ACCEPTED);
         wait_for_calls(&executor, 1).await;
 
-        // 同 request_id 提交到不同设备：完整幂等键不同——放行会绕过引擎
-        // 幂等键导致同一逻辑请求重复执行（§80.1），REST 层直接 409。
+        let (second, body) = post_control(
+            app.clone(),
+            Some(TOKEN_VIEWER),
+            DEV2,
+            &write_body("ua-1", 10.0),
+        )
+        .await;
+        assert_eq!(second, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "INSUFFICIENT_ROLE", "绝不能 409: {body}");
+
+        // 未授权请求不登记任何条目：原 r1 记录不受污染，仍 running 可查。
+        let (_, body) = get_status(app.clone(), Some(TOKEN_OPERATOR), "ua-1").await;
+        assert_eq!(body["state"], "running");
+
+        executor.release();
+    }
+
+    #[tokio::test]
+    async fn idempotency_conflict_keeps_original_running_record_queryable() {
+        // P1-B：引擎 Err 路径不做任何回滚（本流程从未登记过任何东西）。
+        // 旧实现在引擎 Conflict 后无条件 rollback(request_id)，会把同
+        // request_id 的在途记录删掉，使原始请求状态不可查。
+        let executor = GateExecutor::new(); // 阻塞首条保持 running
+        let app = control_app(executor.clone(), |_| {});
+
+        // A(r1, X)：受理并保持 running。
+        let (first, _) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV,
+            &write_body("ic-1", 10.0),
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        wait_for_calls(&executor, 1).await;
+
+        // 再提交 A(r1, Y)：同完整幂等键不同 payload → 引擎 §80.1
+        // Conflict → 409，且不回滚任何台账条目。
         let (second, body) = post_control(
             app.clone(),
             Some(TOKEN_OPERATOR),
-            DEV_DISABLED,
-            &write_body("xd-1", 10.0),
+            DEV,
+            &write_body("ic-1", 20.0),
         )
         .await;
         assert_eq!(second, StatusCode::CONFLICT);
         assert_eq!(body["code"], "IDEMPOTENCY_CONFLICT");
 
-        // 原请求状态不受影响。
-        let (_, body) = get_status(app.clone(), Some(TOKEN_OPERATOR), "xd-1").await;
+        // 原 r1 记录仍 running 可查（上一轮漏测的点）。
+        let (_, body) = get_status(app.clone(), Some(TOKEN_OPERATOR), "ic-1").await;
         assert_eq!(body["state"], "running");
 
         executor.release();
+    }
+
+    #[tokio::test]
+    async fn cross_device_same_request_id_status_query_returns_409_ambiguous() {
+        // 两次授权提交同一 request_id 到不同设备都成功（各自完整幂等键
+        // 独立合法）→ 该 request_id 歧义，状态查询一律 409
+        // AMBIGUOUS_REQUEST_ID（放行任一状态都会绕过 §80.1 幂等键语义；
+        // 这是授权后用户自己制造的可判定状态，不泄露他人信息）。
+        let executor = GateExecutor::new(); // 阻塞保持 running 窗口
+        let app = control_app(executor.clone(), |_| {});
+
+        let (first, _) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV,
+            &write_body("am-1", 10.0),
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        wait_for_calls(&executor, 1).await;
+        let (second, _) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV2,
+            &write_body("am-1", 10.0),
+        )
+        .await;
+        assert_eq!(second, StatusCode::ACCEPTED);
+
+        // GET r1 → 409 AMBIGUOUS_REQUEST_ID（而非任一设备的 running）。
+        let (status, body) = get_status(app.clone(), Some(TOKEN_OPERATOR), "am-1").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "AMBIGUOUS_REQUEST_ID");
+        assert_eq!(body["schema"], "forgelink.error.v1");
+
+        executor.release();
+    }
+
+    #[tokio::test]
+    async fn ledger_full_precheck_rejects_before_engine_and_registers_nothing() {
+        // 提交预检只计数（非键敏感），满员 503 且引擎零参与、台账零登记。
+        let executor = GateExecutor::new(); // 阻塞：首个请求保持 running
+        let app = control_app_with_ledger(executor.clone(), |_| {}, 1);
+
+        // pf-1 受理并占满容量 1（执行器被调用一次后阻塞）。
+        let (first, _) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV,
+            &write_body("pf-1", 10.0),
+        )
+        .await;
+        assert_eq!(first, StatusCode::ACCEPTED);
+        wait_for_calls(&executor, 1).await;
+
+        // pf-2：预检满员 → 503 LEDGER_FULL。
+        let (second, body) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV,
+            &write_body("pf-2", 20.0),
+        )
+        .await;
+        assert_eq!(second, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["code"], "LEDGER_FULL");
+
+        // 引擎零参与：执行器调用数不变（pf-2 从未入队执行）。
+        assert_eq!(executor.call_count(), 1, "预检拒绝必须发生在引擎之前");
+        // 台账零登记：pf-2 状态查询为 unknown。
+        let (_, body) = get_status(app.clone(), Some(TOKEN_OPERATOR), "pf-2").await;
+        assert_eq!(body["state"], "unknown");
+
+        // pf-1 结算让位后，pf-2 以同 id 同 payload 重提可正常受理并成功
+        // ——证明被拒时引擎从未持久化 pf-2（否则命中 §80.1 Duplicate/
+        // Conflict 残留）。
+        executor.release();
+        wait_until_settled(&app, "pf-1").await;
+        let (third, _) = post_control(
+            app.clone(),
+            Some(TOKEN_OPERATOR),
+            DEV,
+            &write_body("pf-2", 20.0),
+        )
+        .await;
+        assert_eq!(third, StatusCode::ACCEPTED);
+        let settled = wait_until_settled(&app, "pf-2").await;
+        assert_eq!(settled["result"]["status"], "succeeded");
     }
 
     // ---- 状态查询三态（§31.5/§77）-------------------------------------------
@@ -2138,11 +2370,9 @@ mod tests {
         )));
         assert_eq!(closed.code.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        // REST 台账层拒绝（评审 P1-A）：跨完整幂等键冲突 → 409；
-        // 台账被未结算请求占满 → 503 LEDGER_FULL。
-        let cross_key = map_submit_error(&ControlSubmitError::IdempotencyConflict);
-        assert_eq!(cross_key.code.status(), StatusCode::CONFLICT);
-        assert_eq!(cross_key.code_text(), "IDEMPOTENCY_CONFLICT");
+        // REST 提交预检拒绝（评审二轮 P1）：台账被未结算与歧义条目占满
+        // → 503 LEDGER_FULL（同 request_id 跨完整键已改为歧义语义，不再
+        // 有提交期 409）。
         let full = map_submit_error(&ControlSubmitError::LedgerFull);
         assert_eq!(full.code.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(full.code_text(), "LEDGER_FULL");
@@ -2177,26 +2407,29 @@ mod tests {
     }
 
     #[test]
-    fn request_ledger_is_bounded_fifo_and_tracks_settlement() {
+    fn request_ledger_registers_after_accept_backfills_and_evicts_settled_fifo() {
         let ledger = RequestLedger::with_capacity(3);
         let key = |rid: &str| ledger_key(NS, DEV, rid);
 
+        // 三个 running 占满容量 → 预检无容量。
         for rid in ["r1", "r2", "r3"] {
-            ledger.admit(&key(rid)).expect("准入");
+            ledger.register(key(rid), None);
         }
         assert!(matches!(ledger.query("r1"), ControlStatusQuery::Running));
         assert!(matches!(
             ledger.query("no-such"),
             ControlStatusQuery::Unknown
         ));
+        assert!(!ledger.has_capacity(), "running 满容量必须拒绝新请求");
 
-        // 全部结算后才有可淘汰对象（running 永不淘汰）。
+        // 全部结算 → 可淘汰，预检恢复容量（running 永不淘汰）。
         for rid in ["r1", "r2", "r3"] {
-            ledger.record(key(rid), Some(rejected_result("QUEUE_FULL")));
+            ledger.register(key(rid), Some(rejected_result("QUEUE_FULL")));
         }
+        assert!(ledger.has_capacity(), "settled 可淘汰，预检恢复容量");
 
-        // 满员插入 → 只淘汰最早插入的 **settled** 条目 r1。
-        ledger.admit(&key("r4")).expect("有 settled 可淘汰");
+        // 满员登记 → 只淘汰最早插入的 **settled** 条目 r1。
+        ledger.register(key("r4"), None);
         assert!(
             matches!(ledger.query("r1"), ControlStatusQuery::Unknown),
             "最早插入的 settled 条目应被淘汰"
@@ -2206,23 +2439,49 @@ mod tests {
         assert!(matches!(ledger.query("r4"), ControlStatusQuery::Running));
 
         // 结算回填（条目已存在）→ settled，且不刷新插入序：
-        // 再插入 r5 → 淘汰插入序次早的 r2。
-        ledger.record(key("r4"), Some(rejected_result("QUEUE_FULL")));
-        ledger.admit(&key("r5")).expect("有 settled 可淘汰");
+        // 再登记 r5 → 淘汰插入序次早的 r2。
+        ledger.register(key("r4"), Some(rejected_result("QUEUE_FULL")));
+        ledger.register(key("r5"), None);
         assert!(matches!(ledger.query("r2"), ControlStatusQuery::Unknown));
         assert!(matches!(ledger.query("r3"), ControlStatusQuery::Settled(_)));
         assert!(matches!(ledger.query("r4"), ControlStatusQuery::Settled(_)));
         assert!(matches!(ledger.query("r5"), ControlStatusQuery::Running));
 
         // 被淘汰的 request_id 再次登记（携带结果）→ 重新可见（有界语义内）。
-        ledger.record(key("r1"), Some(rejected_result("DEVICE_NOT_FOUND")));
+        ledger.register(key("r1"), Some(rejected_result("DEVICE_NOT_FOUND")));
         let ControlStatusQuery::Settled(result) = ledger.query("r1") else {
             panic!("r1 应已重新登记并结算");
         };
         assert_eq!(result.error.expect("含错误").code, "DEVICE_NOT_FOUND");
     }
 
-    // ---- 台账准入与淘汰（评审 P1-A：running 永不淘汰）-----------------------
+    #[test]
+    fn request_ledger_single_key_lifecycle_running_then_settled() {
+        let ledger = RequestLedger::with_capacity(8);
+        ledger.register(ledger_key(NS, DEV, "s1"), None);
+        assert!(matches!(ledger.query("s1"), ControlStatusQuery::Running));
+        assert!(matches!(
+            ledger.query("no-such"),
+            ControlStatusQuery::Unknown
+        ));
+
+        // 同 full key 结算回填：保留既有条目，仅补结果。
+        ledger.register(
+            ledger_key(NS, DEV, "s1"),
+            Some(rejected_result("DEVICE_NOT_FOUND")),
+        );
+        let ControlStatusQuery::Settled(result) = ledger.query("s1") else {
+            panic!("s1 应为 settled");
+        };
+        assert_eq!(result.error.expect("含错误").code, "DEVICE_NOT_FOUND");
+
+        // running 占位不被回填覆盖（`None` 不动已有状态——此处已 settled，
+        // 再以 `None` 登记不得退回 running）。
+        ledger.register(ledger_key(NS, DEV, "s1"), None);
+        assert!(matches!(ledger.query("s1"), ControlStatusQuery::Settled(_)));
+    }
+
+    // ---- 台账登记、歧义与淘汰（评审二轮 P1/P2）------------------------------
 
     fn ledger_key(namespace: &str, device_id: &str, request_id: &str) -> IdempotencyKey {
         IdempotencyKey {
@@ -2233,89 +2492,75 @@ mod tests {
     }
 
     #[test]
-    fn request_ledger_running_never_evicted_and_full_capacity_rejects() {
-        let ledger = RequestLedger::with_capacity(2);
-        ledger.admit(&ledger_key(NS, DEV, "r1")).expect("r1 准入");
-        ledger.admit(&ledger_key(NS, DEV, "r2")).expect("r2 准入");
-
-        // 容量被 running 占满：拒绝新请求（LEDGER_FULL 语义），原请求仍可查。
-        assert!(
-            matches!(
-                ledger.admit(&ledger_key(NS, DEV, "r3")),
-                Err(AdmissionError::Full)
-            ),
-            "running 满容量必须拒绝新请求"
-        );
+    fn request_ledger_same_request_id_different_full_keys_marks_ambiguous() {
+        let ledger = RequestLedger::with_capacity(8);
+        ledger.register(ledger_key(NS, DEV, "r1"), None);
         assert!(matches!(ledger.query("r1"), ControlStatusQuery::Running));
-        assert!(matches!(ledger.query("r2"), ControlStatusQuery::Running));
 
-        // r1 结算后：淘汰最早插入的 settled（r1），r3 得以准入；running 的
-        // r2 存活（淘汰扫描跳过 running）。
-        ledger.record(
+        // 同 request_id、不同 device_id：登记为歧义（评审二轮 P2——提交期
+        // 409 属授权前键敏感读，已删除），状态查询一律 Ambiguous。
+        ledger.register(ledger_key(NS, "other-device", "r1"), None);
+        assert!(matches!(ledger.query("r1"), ControlStatusQuery::Ambiguous));
+        // 不同 namespace 同理。
+        ledger.register(ledger_key("other-ns", DEV, "r1"), None);
+        assert!(matches!(ledger.query("r1"), ControlStatusQuery::Ambiguous));
+
+        // 同 full key 重复登记保留既有条目（仅补结果），不新增歧义键数。
+        ledger.register(
             ledger_key(NS, DEV, "r1"),
             Some(rejected_result("QUEUE_FULL")),
         );
-        ledger
-            .admit(&ledger_key(NS, DEV, "r3"))
-            .expect("结算后有空间");
-        assert!(
-            matches!(ledger.query("r1"), ControlStatusQuery::Unknown),
-            "settled 条目应被淘汰"
-        );
-        assert!(
-            matches!(ledger.query("r2"), ControlStatusQuery::Running),
-            "running 条目永不淘汰"
-        );
-        assert!(matches!(ledger.query("r3"), ControlStatusQuery::Running));
-    }
+        assert!(matches!(ledger.query("r1"), ControlStatusQuery::Ambiguous));
 
-    #[test]
-    fn request_ledger_admit_conflicts_on_same_request_id_different_full_key() {
-        let ledger = RequestLedger::with_capacity(8);
-        ledger.admit(&ledger_key(NS, DEV, "r1")).expect("首次准入");
-
-        // 同 request_id、不同 device_id → 冲突（放行会绕过引擎幂等键，
-        // 同一逻辑请求重复执行，§80.1）。
+        // 歧义不泄露任何单一键的状态：Ambiguous 优先于任一键的 running/
+        // settled（其余两个键仍 running）。
         assert!(matches!(
-            ledger.admit(&ledger_key(NS, "other-device", "r1")),
-            Err(AdmissionError::Conflict)
-        ));
-        // 不同 namespace 同理。
-        assert!(matches!(
-            ledger.admit(&ledger_key("other-ns", DEV, "r1")),
-            Err(AdmissionError::Conflict)
-        ));
-        // 完整幂等键一致 → 幂等重试，非冲突。
-        assert!(matches!(
-            ledger.admit(&ledger_key(NS, DEV, "r1")),
-            Ok(Admission::Existing)
+            ledger.query("no-such"),
+            ControlStatusQuery::Unknown
         ));
     }
 
     #[test]
-    fn request_ledger_rollback_removes_only_running_placeholder() {
-        let ledger = RequestLedger::with_capacity(4);
-        // 引擎 Err 路径回滚占位：不留永久 running（状态查询回到 unknown）。
-        ledger.admit(&ledger_key(NS, DEV, "r1")).expect("准入");
-        ledger.rollback("r1");
-        assert!(matches!(ledger.query("r1"), ControlStatusQuery::Unknown));
+    fn request_ledger_ambiguous_counts_toward_capacity_and_never_evicted() {
+        let ledger = RequestLedger::with_capacity(2);
+        // r1 双键（歧义）→ 占用 2，预检无容量（running 计数含歧义条目）。
+        ledger.register(ledger_key(NS, DEV, "r1"), None);
+        ledger.register(ledger_key(NS, "other-device", "r1"), None);
+        assert!(!ledger.has_capacity(), "歧义条目计入容量");
 
-        // 已结算条目不受回滚影响（终态保留）。
-        ledger.admit(&ledger_key(NS, DEV, "r2")).expect("准入");
-        ledger.record(
-            ledger_key(NS, DEV, "r2"),
-            Some(rejected_result("DEVICE_NOT_FOUND")),
+        // 双键全部结算仍歧义、仍占容量、不被淘汰（409 答案必须稳定）。
+        ledger.register(
+            ledger_key(NS, DEV, "r1"),
+            Some(rejected_result("QUEUE_FULL")),
         );
-        ledger.rollback("r2");
-        assert!(
-            matches!(ledger.query("r2"), ControlStatusQuery::Settled(_)),
-            "回滚不得删除已结算条目"
+        ledger.register(
+            ledger_key(NS, "other-device", "r1"),
+            Some(rejected_result("QUEUE_FULL")),
         );
+        assert!(matches!(ledger.query("r1"), ControlStatusQuery::Ambiguous));
+        assert!(!ledger.has_capacity(), "结算后的歧义条目仍占容量");
 
-        // 回滚后的 request_id 可重新准入。
-        assert!(matches!(
-            ledger.admit(&ledger_key(NS, DEV, "r1")),
-            Ok(Admission::Admitted)
-        ));
+        // 竞态窗口（预检通过但登记时满员）：照常插入并暂时超限，状态可查。
+        ledger.register(ledger_key(NS, DEV, "r2"), None);
+        assert!(matches!(ledger.query("r2"), ControlStatusQuery::Running));
+        let entries = ledger
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entries
+            .len();
+        assert_eq!(entries, 3, "容量 2，竞态窗口登记后允许暂时超限为 3");
+
+        // 超限随占用回落消除：歧义双键移除后，settled 的非歧义条目可淘汰。
+        let mut inner = ledger
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in inner.by_request_id.remove("r1").expect("r1 键集合") {
+            inner.entries.remove(&key);
+            inner.order.retain(|k| k != &key);
+        }
+        drop(inner);
+        assert!(ledger.has_capacity(), "歧义条目移除后恢复容量");
     }
 }

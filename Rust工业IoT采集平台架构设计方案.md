@@ -2012,7 +2012,7 @@ GET  /api/v1/control-requests/{request_id}
 }
 ```
 
-- `state = unknown`：引擎无该 request_id 记录（`result` 缺省）；
+- `state = unknown`：服务端当前无该 request_id 的可答记录（可能是从未提交，也可能因进程重启丢失内存台账——持久化 Journal 中或有记录；**unknown 不构成重试或任何后续动作的依据**，客户端应沿用原 request_id 或人工确认）；
 - `state = running`：已受理尚未结算（`result` 缺省）；
 - `state = settled`：终态，`result` 为 §80.1 `ControlResult` 完整载荷。
 

@@ -127,11 +127,15 @@ impl RestApiServer {
     ///
     /// 在只读路由之上合并控制路由（`POST /api/v1/devices/{device_id}/controls`
     /// 与 `GET /api/v1/control-requests/{request_id}`），共用同一并发门控；
-    /// 所有控制端点要求 Bearer 认证（§90.2）。
+    /// 所有控制端点要求 Bearer 认证（§90.2）。listen 地址必须为 **loopback**
+    /// （评审二轮 P2，[`Self::validate_config`] 之外的额外校验）。
     ///
     /// # Errors
     ///
-    /// 同 [`Self::spawn`]。
+    /// 同 [`Self::spawn`]；另：listen 非 loopback（§90.2 MVP 控制面仅允许
+    /// loopback 直连，远程访问须经 TLS 反向代理转发）时返回
+    /// `InvalidInput` 配置错误——collector 配置层已先行校验，此处对直接
+    /// 构造的 [`RestConfig`] 兜底拒绝（纵深防御）。
     #[cfg(feature = "control")]
     pub async fn spawn_with_control(
         state: Arc<dyn ApiState>,
@@ -139,6 +143,7 @@ impl RestApiServer {
         config: RestConfig,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
+        Self::validate_control_listen(config.listen)?;
         let listener = TcpListener::bind(config.listen).await?;
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
         let app = router_with_control(state, control, concurrency);
@@ -168,6 +173,27 @@ impl RestApiServer {
             ));
         }
         Ok(())
+    }
+
+    /// 控制装配的 listen 地址校验（评审二轮 P2，§90.2）：必须 loopback
+    /// （IPv4 `127.0.0.0/8`、IPv6 `::1`）。远程访问须经 TLS 反向代理转发，
+    /// 而 MVP 无原生 TLS——非 loopback 监听会让控制端点绕过该约束直接
+    /// 对外暴露。collector 配置层（启用 control 时）已先行校验，此处对
+    /// 直接构造的 [`RestConfig`] 兜底拒绝；只读 [`Self::spawn`] 不受此限
+    /// （§90.1 允许显式配置非 loopback 的只读接口）。
+    #[cfg(feature = "control")]
+    fn validate_control_listen(addr: SocketAddr) -> Result<(), std::io::Error> {
+        if addr.ip().is_loopback() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "控制端点仅允许 loopback 监听（当前 {addr}）：§90.2 MVP 控制面\
+                 仅允许 loopback 直连（IPv4 127.0.0.0/8、IPv6 ::1），远程访问\
+                 须经 TLS 反向代理转发"
+            ),
+        ))
     }
 
     /// 启动 serve 任务（绑定已完成；只读与控制装配共用此逻辑）。
@@ -1094,5 +1120,30 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_listen_validation_accepts_only_loopback() {
+        // 评审二轮 P2（§90.2）：控制装配仅允许 loopback——IPv4
+        // 127.0.0.0/8 与 IPv6 ::1；其余（含通配与私网）一律拒绝。
+        for addr in ["127.0.0.1:8080", "127.9.9.9:8080", "[::1]:8080"] {
+            RestApiServer::validate_control_listen(addr.parse().expect("静态地址合法"))
+                .unwrap_or_else(|e| panic!("{addr} 应通过: {e}"));
+        }
+        for addr in [
+            "0.0.0.0:8080",
+            "192.168.1.10:8080",
+            "[::]:8080",
+            "[fd00::1]:8080",
+        ] {
+            let err = RestApiServer::validate_control_listen(addr.parse().expect("静态地址合法"))
+                .expect_err("非 loopback 必须拒绝");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{addr}");
+            assert!(
+                err.to_string().contains("loopback"),
+                "错误应说明仅允许 loopback: {addr}"
+            );
+        }
     }
 }
