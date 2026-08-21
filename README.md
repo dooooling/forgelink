@@ -13,18 +13,18 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 - `diagnostics`：结构化日志、`RUST_LOG`、text/JSON 格式和脱敏
 - `profile-engine` / `domain-model`：Profile 校验与转换、领域路径和 Observation 映射
 - `poll-engine`：周期调度、超时、指数退避、取消和阻塞调用隔离
-- `drivers/modbus`：Modbus TCP/RTU、地址解析、批量读取、超时/断线重连和 Native Plugin C ABI
-- `device-manager`：设备实例注册、Driver/Profile 绑定校验、读取项生成与全链路数据映射
+- `drivers/modbus`：Modbus TCP/RTU、地址解析、批量读取、写功能 FC05/06/15/16（响应回显校验、精确相邻批量合并）、超时/断线重连和 Native Plugin C ABI
+- `device-manager`：设备实例注册、Driver/Profile 绑定校验、读取项生成与全链路数据映射；ControlExecutor 适配层（DriverSession 共享会话读写同锁互斥、保守 Indeterminate 映射）
+- `control-engine`：Control Engine 基础（§81-§90）——统一提交/取消/查询入口、幂等键去重、每设备有界队列与优先级、超时/取消 Indeterminate 结算、审计日志与 FileJournal
 - `data-pipeline`：Telemetry Batch 组包、按设备聚合、背压/取消/有界排空
 - `mqtt-client`：QoS 1 北向发布（rumqttc）、Topic 命名空间与 Status Envelope、断线重发与指数退避重连、LWT、TLS/mTLS、优雅停机排空
 - `local-buffer`：Local Buffer/WAL（SQLite Embedded DB）——以完整 ObservationBatch 为持久化单位、本地序号按序补传、message_id 幂等、PUBACK 后删除、容量背压/拒绝、崩溃恢复
 - `modbus-mock`：测试共用 Mock Modbus TCP server（非生产）
-- `rest-api`：REST v1 只读管理接口（§31.5/§31.6/§104）——设备/资源/属性查询、健康检查、`forgelink.error.v1` 错误模型、有界并发与优雅停机；已接入 `collector` 运行时
+- `rest-api`：REST v1 管理接口（§31.5/§31.6/§104）——只读：设备/资源/属性查询、健康检查、`forgelink.error.v1` 错误模型、有界并发与优雅停机；控制（control feature 门控）：`POST /api/v1/devices/{id}/controls`（202 + request_id 异步受理）、`GET /api/v1/control-requests/{request_id}`（三态查询）、Bearer 认证（§90.2）；已接入 `collector` 运行时
 
 仍在建设中的能力：
 
 - `edge-server`、`manager` 尚未开始运行时组装
-- REST 控制链路（Property Write / Command Execute / 认证授权）与 Control Engine 仍为占位
 - 尚未完成三平台真实部署、性能基准和长时间稳定性验收
 
 架构依据见：
@@ -119,7 +119,7 @@ rest:
 
 错误响应统一为 `forgelink.error.v1`，含 `code`/`message`/`request_id`；404 区分
 `DEVICE_NOT_FOUND`/`RESOURCE_NOT_FOUND`，405 为 `METHOD_NOT_ALLOWED`，非法请求
-400，并发超限 503，内部错误 500（401/403/409/422 留给控制链路）。
+400，并发超限 503，内部错误 500（401/403/409/422 由控制端点使用）。
 
 安全边界（§90.1）：
 
