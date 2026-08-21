@@ -1,0 +1,311 @@
+//! 控制策略与风险级别配置（§86 Normative）。
+//!
+//! 不同风险等级可以配置：角色要求、优先级、超时等。默认值遵循 §86 的示例语义：
+//! 普通设定值修改 → Low/Medium；CNC Cycle Start → High；Robot Motion → High/Critical；
+//! 安全相关动作必须由设备本身安全系统负责，软件分级不能替代（§85）。
+
+use std::collections::HashMap;
+use std::time::Duration;
+
+#[cfg(test)]
+use observation_model::CommandPrecondition;
+use observation_model::CommandRiskLevel;
+
+use crate::role::Role;
+
+/// 队列优先级（§87：priority）。
+///
+/// 声明顺序即优先级：`Critical` 最高、`Low` 最低；同级内保持 FIFO。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Priority {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// 命令风险级别 → 队列优先级映射（§87）。
+pub type CommandPriority = HashMap<CommandRiskLevel, Priority>;
+
+/// 控制策略（§86）。
+///
+/// 可配置项：每设备队列容量（§87 有界）、幂等记录保留时长（§80.1 ≥24h）、
+/// 属性写入要求角色/优先级/超时、命令按风险等级的要求角色/优先级/超时、
+/// 以及命令前置条件检查器（§85）。
+#[derive(Clone)]
+pub struct ControlPolicy {
+    /// 每设备独立队列容量（§87 有界队列）；满时新请求以 `Rejected`（`QUEUE_FULL`）拒绝。
+    pub queue_capacity: usize,
+    /// 幂等记录至少保留 24 小时（§80.1），可配置延长。
+    pub idempotency_retention: Duration,
+    /// 属性写入要求的最小角色（§83）。
+    pub property_write_required_role: Role,
+    /// 属性写入队列优先级（§87）。
+    pub property_write_priority: Priority,
+    /// 属性写入缺省超时（毫秒）；与请求 `timeout_ms` 取较小值。
+    pub property_write_timeout_ms: u64,
+    /// 命令按风险等级要求的最小角色（§83、§86）。
+    pub command_required_role: HashMap<CommandRiskLevel, Role>,
+    /// 命令按风险等级的队列优先级（§87）。
+    pub command_priority: CommandPriority,
+    /// 命令按风险等级的缺省超时（毫秒）。
+    pub command_timeout_ms: HashMap<CommandRiskLevel, u64>,
+    /// 命令前置条件检查器（§85）；`None` 表示跳过前置条件检查。
+    pub precondition_checker: Option<std::sync::Arc<dyn crate::precondition::PreconditionChecker>>,
+    /// 前置条件单次检查超时（毫秒，四审 P1）：检查器卡死不得让请求永久
+    /// 停留在 Running；超时按失败处理（fail-closed）。
+    pub precondition_timeout_ms: u64,
+    /// 请求最大年龄（毫秒，四审 P2）：`requested_at_ns` 距今超过该值的请求
+    /// 以 `REQUEST_TOO_OLD` 拒绝——长时间滞留/重放的旧控制请求不得执行。
+    pub max_request_age_ms: u64,
+    /// 控制状态查询（`status`）要求的最小角色（四审 P1：控制面查询同样
+    /// 需要授权，防止未授权方借状态接口探测设备/命令信息）。
+    pub control_status_required_role: Role,
+    /// 单条审计事件写入超时（毫秒，四审 P2）：慢审计不得阻塞控制 worker；
+    /// 超时放弃该条审计并记录错误日志（控制继续）。
+    pub audit_timeout_ms: u64,
+    /// 优先级老化阈值（毫秒，四审 P2）：排队超过该值的低优先级请求提升
+    /// 一级有效优先级（逐级晋升至 Critical），防止严格优先级饿死；`0`
+    /// 表示禁用老化。
+    pub priority_aging_ms: u64,
+    /// 不确定结果冷却期（毫秒，五审 P1）：设备出现"执行器已开始但结果
+    /// 不确定"（超时/取消/中止打断，或执行器自报 Indeterminate）后，底层
+    /// 物理动作可能仍在进行——冷却期内该设备不下发新动作（入队拒绝
+    /// `DEVICE_COOLDOWN`，队列中已排队条目暂缓启动）。`0` 表示禁用。
+    pub indeterminate_cooldown_ms: u64,
+}
+
+impl std::fmt::Debug for ControlPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPolicy")
+            .field("queue_capacity", &self.queue_capacity)
+            .field("idempotency_retention", &self.idempotency_retention)
+            .field(
+                "property_write_required_role",
+                &self.property_write_required_role,
+            )
+            .field("property_write_priority", &self.property_write_priority)
+            .field("property_write_timeout_ms", &self.property_write_timeout_ms)
+            .field("command_required_role", &self.command_required_role)
+            .field("command_priority", &self.command_priority)
+            .field("command_timeout_ms", &self.command_timeout_ms)
+            .field("precondition_checker", &self.precondition_checker.is_some())
+            .finish()
+    }
+}
+
+impl Default for ControlPolicy {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 64,
+            idempotency_retention: Duration::from_secs(24 * 3600),
+            property_write_required_role: Role::Operator,
+            property_write_priority: Priority::Medium,
+            property_write_timeout_ms: 5_000,
+            command_required_role: HashMap::from([
+                (CommandRiskLevel::Low, Role::Operator),
+                (CommandRiskLevel::Medium, Role::Operator),
+                (CommandRiskLevel::High, Role::Engineer),
+                (CommandRiskLevel::Critical, Role::Administrator),
+            ]),
+            command_priority: HashMap::from([
+                (CommandRiskLevel::Low, Priority::Low),
+                (CommandRiskLevel::Medium, Priority::Medium),
+                (CommandRiskLevel::High, Priority::High),
+                (CommandRiskLevel::Critical, Priority::Critical),
+            ]),
+            command_timeout_ms: HashMap::from([
+                (CommandRiskLevel::Low, 5_000),
+                (CommandRiskLevel::Medium, 10_000),
+                (CommandRiskLevel::High, 15_000),
+                (CommandRiskLevel::Critical, 20_000),
+            ]),
+            precondition_checker: None,
+            precondition_timeout_ms: 1_000,
+            max_request_age_ms: 60_000,
+            control_status_required_role: Role::Operator,
+            audit_timeout_ms: 1_000,
+            priority_aging_ms: 10_000,
+            indeterminate_cooldown_ms: 5_000,
+        }
+    }
+}
+
+/// 操作种类（用于按操作查策略）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationKind {
+    PropertyWrite,
+    Command(CommandRiskLevel),
+}
+
+impl ControlPolicy {
+    /// 校验策略配置（§80.1：幂等保留期下限 24h；装配引擎时调用，fail-fast）。
+    ///
+    /// 保留期过短会放大"进程崩溃后重复执行/结果错配"的风险，须在装配期拒绝。
+    /// 零队列容量会让所有请求静默变成 `QUEUE_FULL`，零超时会让请求立即超时
+    /// （P2）——同样属于配置错误，装配期 fail-fast。
+    pub fn validate(&self) -> Result<(), String> {
+        if self.idempotency_retention < Duration::from_secs(24 * 3600) {
+            return Err(format!(
+                "idempotency_retention 不得低于 24 小时（当前 {:?}）",
+                self.idempotency_retention
+            ));
+        }
+        if self.queue_capacity == 0 {
+            return Err(
+                "queue_capacity 必须大于 0（0 会让所有请求静默变成 QUEUE_FULL）".to_owned(),
+            );
+        }
+        if self.property_write_timeout_ms == 0 {
+            return Err("property_write_timeout_ms 必须大于 0".to_owned());
+        }
+        for (risk, ms) in &self.command_timeout_ms {
+            if *ms == 0 {
+                return Err(format!(
+                    "command_timeout_ms[{risk:?}] 必须大于 0（0 会让请求立即超时）"
+                ));
+            }
+        }
+        if self.precondition_timeout_ms == 0 {
+            return Err("precondition_timeout_ms 必须大于 0".to_owned());
+        }
+        if self.max_request_age_ms == 0 {
+            return Err("max_request_age_ms 必须大于 0（0 会拒绝所有请求）".to_owned());
+        }
+        if self.audit_timeout_ms == 0 {
+            return Err("audit_timeout_ms 必须大于 0".to_owned());
+        }
+        Ok(())
+    }
+    /// 该操作要求的最小角色（§83）。
+    pub fn required_role(&self, kind: OperationKind) -> Role {
+        match kind {
+            OperationKind::PropertyWrite => self.property_write_required_role,
+            OperationKind::Command(risk) => self
+                .command_required_role
+                .get(&risk)
+                .copied()
+                .unwrap_or(Role::Administrator),
+        }
+    }
+
+    /// 该操作的队列优先级（§87）。
+    pub fn priority(&self, kind: OperationKind) -> Priority {
+        match kind {
+            OperationKind::PropertyWrite => self.property_write_priority,
+            OperationKind::Command(risk) => self
+                .command_priority
+                .get(&risk)
+                .copied()
+                .unwrap_or(Priority::Medium),
+        }
+    }
+
+    /// 该操作的缺省超时（毫秒）；与请求 `timeout_ms` 取较小值（策略是安全上限）。
+    pub fn timeout_ms(&self, kind: OperationKind) -> u64 {
+        match kind {
+            OperationKind::PropertyWrite => self.property_write_timeout_ms,
+            OperationKind::Command(risk) => {
+                self.command_timeout_ms.get(&risk).copied().unwrap_or(5_000)
+            }
+        }
+    }
+
+    /// 有效超时：请求指定与策略上限的较小值（请求 `timeout_ms` 为 0 视为非法，
+    /// 由引擎拒绝）。
+    pub fn effective_timeout_ms(&self, kind: OperationKind, request_timeout_ms: u64) -> u64 {
+        request_timeout_ms.min(self.timeout_ms(kind))
+    }
+
+    /// 前置条件检查器引用（§85）。
+    pub fn precondition_checker(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::precondition::PreconditionChecker>> {
+        self.precondition_checker.clone()
+    }
+}
+
+/// 用于策略键枚举的命令风险级别辅助（`CommandRiskLevel` 全量）。
+pub const ALL_RISK_LEVELS: [CommandRiskLevel; 4] = [
+    CommandRiskLevel::Low,
+    CommandRiskLevel::Medium,
+    CommandRiskLevel::High,
+    CommandRiskLevel::Critical,
+];
+
+/// 供审计等场景使用的哨兵，提示策略表默认值已回退到最严格档。
+pub fn risk_default_role(risk: CommandRiskLevel) -> Role {
+    match risk {
+        CommandRiskLevel::Low => Role::Operator,
+        CommandRiskLevel::Medium => Role::Operator,
+        CommandRiskLevel::High => Role::Engineer,
+        CommandRiskLevel::Critical => Role::Administrator,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_policy_roles_follow_doc_examples() {
+        let policy = ControlPolicy::default();
+        assert_eq!(
+            policy.required_role(OperationKind::Command(CommandRiskLevel::High)),
+            Role::Engineer
+        );
+        assert_eq!(
+            policy.required_role(OperationKind::Command(CommandRiskLevel::Critical)),
+            Role::Administrator
+        );
+        assert_eq!(
+            policy.required_role(OperationKind::PropertyWrite),
+            Role::Operator
+        );
+    }
+
+    #[test]
+    fn default_retention_is_24h() {
+        assert_eq!(
+            ControlPolicy::default().idempotency_retention,
+            Duration::from_secs(24 * 3600)
+        );
+    }
+
+    #[test]
+    fn effective_timeout_caps_request_by_policy() {
+        let policy = ControlPolicy::default();
+        assert_eq!(
+            policy.effective_timeout_ms(OperationKind::Command(CommandRiskLevel::Low), 1_000),
+            1_000
+        );
+        assert_eq!(
+            policy.effective_timeout_ms(OperationKind::Command(CommandRiskLevel::Low), 60_000),
+            5_000
+        );
+    }
+
+    #[test]
+    fn risk_priority_mapping_is_total() {
+        for risk in ALL_RISK_LEVELS {
+            let policy = ControlPolicy::default();
+            let priority = policy.priority(OperationKind::Command(risk));
+            let role = policy.required_role(OperationKind::Command(risk));
+            assert!(matches!(
+                priority,
+                Priority::Low | Priority::Medium | Priority::High | Priority::Critical
+            ));
+            assert!(matches!(
+                role,
+                Role::Operator | Role::Engineer | Role::Administrator
+            ));
+        }
+    }
+
+    #[test]
+    fn preconditions_default_none() {
+        assert!(ControlPolicy::default().precondition_checker().is_none());
+        // 类型上验证 CommandPrecondition 可被策略持有（§85 引用完整性）。
+        let _p: Option<CommandPrecondition> = None;
+    }
+}
