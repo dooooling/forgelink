@@ -2020,6 +2020,8 @@ Property Write 与 Command Execute 都使用 `/controls`，通过 `kind` 区分�
 
 控制端点必须经过 §90.2 认证（Bearer Token）；未认证请求一律 `401`。
 
+`forgelink.control.request.v1` 不携带 `namespace`/`device_id`/`requested_at_ns`/`timeout_ms`：`device_id` 取自路径，`requested_at_ns` 由服务端生成，`timeout_ms` 与 `namespace` 由服务端配置提供（`namespace` 进入幂等键 §80.1，须在 Collector 配置中显式声明）。
+
 ## 31.6 REST Error Model
 
 ```json
