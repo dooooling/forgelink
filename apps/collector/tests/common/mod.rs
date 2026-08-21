@@ -198,6 +198,7 @@ impl Harness {
             },
             forward_poll_ms: 50,
             rest: Default::default(),
+            control: None,
         };
         Self {
             server,
@@ -205,6 +206,64 @@ impl Harness {
             config,
         }
     }
+}
+
+/// §90.2 测试凭据文件（alice=operator 可控制，bob=viewer 只读）。
+///
+/// Unix 下设置 0600 权限（`StaticTokenAuthorizer::from_file` 的
+/// fail-closed 权限校验要求）；Windows 无对应语义，跳过。
+#[cfg(feature = "control")]
+#[allow(dead_code)] // 仅 tests/control.rs 使用；其余测试二进制不引用
+pub fn write_credentials(dir: &Path) -> PathBuf {
+    let path = dir.join("control-credentials.json");
+    std::fs::write(
+        &path,
+        r#"{
+        "schema": "forgelink.control.credentials.v1",
+        "credentials": [
+            { "token": "token-alice-operator-0123456789abcdef", "subject": "alice", "role": "operator" },
+            { "token": "token-bob-viewer-0123456789abcdef00", "subject": "bob", "role": "viewer" }
+        ]
+    }"#,
+    )
+    .expect("写入凭据文件");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("设置凭据文件权限 0600");
+    }
+    path
+}
+
+/// control 段配置（凭据/Journal 均落在测试临时目录；Journal 走缺省路径
+/// `<buffer.db_path 父目录>/control-journal.jsonl`，供停机残留断言读取）。
+#[cfg(feature = "control")]
+#[allow(dead_code)] // 仅 tests/control.rs 使用；其余测试二进制不引用
+pub fn control_options(credentials: &Path) -> collector::config::ControlOptions {
+    collector::config::ControlOptions {
+        namespace: "plant-a".to_owned(),
+        credentials_file: credentials.to_path_buf(),
+        journal_path: None,
+        timeout_ms: 5_000,
+        queue_capacity: 16,
+        audit_timeout_ms: 1_000,
+        shutdown_grace_ms: 5_000,
+    }
+}
+
+/// 启用控制链路的 Harness：REST（随机端口）+ control 段。
+#[cfg(feature = "control")]
+#[allow(dead_code)] // 仅 tests/control.rs 使用；其余测试二进制不引用
+pub fn harness_control(broker_port: u16, behavior: MockBehavior) -> Harness {
+    let mut harness = Harness::new(behavior, broker_port);
+    let credentials = write_credentials(harness.temp.path());
+    harness.config.rest = collector::config::RestOptions {
+        listen: Some("127.0.0.1:0".to_owned()),
+        max_concurrency: 16,
+    };
+    harness.config.control = Some(control_options(&credentials));
+    harness
 }
 
 /// 解析 Telemetry Batch 载荷。

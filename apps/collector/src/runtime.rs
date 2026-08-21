@@ -15,7 +15,9 @@
 //! 停机编排（有序 + 有限排空）：
 //!
 //! ```text
-//! 信号 ──> PollScheduler.shutdown（停止采集）
+//! 信号 ──> REST 关闭（第 0 步：拒绝新连接与新控制请求）
+//!      ──> ControlEngine.shutdown（仅 control 构建：在途控制结算/中止）
+//!      ──> PollScheduler.shutdown（停止采集）
 //!      ──> pump join（剩余事件映射入管道）
 //!      ──> Pipeline.shutdown（组包排空到输出端）
 //!      ──> forward 排空（输出端收完 + WAL 能发的发完，期限内）
@@ -57,6 +59,10 @@ pub struct CollectorRuntime {
     /// REST v1 只读接口（§31.5；配置未启用时为 `None`）。`Arc` 允许
     /// 外部监督方持有句柄副本订阅异常退出通知（`exit_notified`）。
     rest: Option<Arc<rest_api::RestApiServer>>,
+    /// 控制引擎停机句柄（§81；仅 control feature 装配，停机第 0.5 步
+    /// 结算在途控制请求）。
+    #[cfg(feature = "control")]
+    control: Option<crate::control::ControlStack>,
     pump: tokio::task::JoinHandle<()>,
     // 内部 Result 上报永久性落盘错误等（评审 P1）。
     forward: tokio::task::JoinHandle<Result<(), CollectorError>>,
@@ -87,6 +93,23 @@ impl CollectorRuntime {
             session_id = %session_id,
             "Collector 启动"
         );
+
+        // 0) 控制链路静态装配（仅 control 构建）：`control` 段是启用开关
+        //    （与 `rest.listen` 启用 REST 同一模式）——段出现时加载凭据/
+        //    打开 Journal/校验策略（§90.2 fail-closed：同步文件 I/O 放在
+        //    任何采集组件启动之前，失败直接返回错误，无需回收组件）；段
+        //    缺省保持只读采集并告警提示（避免运维误以为控制已启用）。
+        #[cfg(feature = "control")]
+        let control_static = match config.control.as_ref() {
+            Some(_) => Some(crate::control::ControlStatic::load(&config)?),
+            None => {
+                warn!(
+                    component = "collector",
+                    "control 构建未配置 control 段，控制链路未启用（只读采集运行）"
+                );
+                None
+            }
+        };
 
         // 1) Load Profile（§38：Profile 不写死在主程序）。
         let mut registry = profile_engine::ProfileRegistry::new();
@@ -262,33 +285,80 @@ impl CollectorRuntime {
         let health = Arc::new(HealthState::default());
         health.started_at_ns.store(started_at_ns, Ordering::Relaxed);
 
-        // 8) REST v1 只读管理接口（§31.5/§104）：默认禁用，显式配置
+        let manager_arc = Arc::new(manager);
+
+        // 7.5) 控制链路装配（仅 control 构建，§81）：设备注册后、REST 启动
+        //      前完成阶段 B——设备目录/执行器/引擎/REST 网关（纯内存构造，
+        //      不再失败）。仅在 control 段配置时装配；网关于 REST 启动时
+        //      挂载为控制路由。
+        #[cfg(feature = "control")]
+        let (gateway, control_stack) = match control_static {
+            Some(statics) => {
+                let attachment = crate::control::assemble(statics, &manager_arc);
+                (Some(attachment.gateway), Some(attachment.stack))
+            }
+            None => (None, None),
+        };
+
+        // 8) REST v1 管理接口（§31.5/§104）：默认禁用，显式配置
         //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
         //    fail-fast（用户显式配置了端口而不可用，不静默降级），且
         //    必须先回收已启动组件——轮询任务/MQTT 客户端/管道/缓冲，
         //    不得遗留后台任务与阻塞 Driver 调用（评审 P2）。
-        //    设备元数据在 `manager` 移入 `manager_arc` 之前提取（注册后
-        //    静态不变，REST 快照的静态部分）。
+        //    control 段配置时经 `spawn_with_control` 挂载控制路由（§31.5）；
+        //    其余情形保持纯只读装配（控制路由不存在，404/405）。
         let rest = if let Some(listen) = &config.rest.listen {
             let listen = listen
                 .parse::<std::net::SocketAddr>()
                 .map_err(|e| CollectorError::Rest(format!("监听地址 {listen:?} 非法: {e}")))?;
-            let meta = crate::rest::extract_device_meta(&manager);
+            // 设备元数据在注册后提取一次（静态不变，REST 快照的静态部分）。
+            let meta = crate::rest::extract_device_meta(&manager_arc);
             let state = Arc::new(CollectorApiState::new(
                 Arc::clone(&health),
                 config.site_id.clone(),
                 session_id.clone(),
                 meta,
             ));
-            let server = match rest_api::RestApiServer::spawn(
-                state,
-                rest_api::RestConfig {
-                    listen,
-                    max_concurrency: config.rest.max_concurrency,
-                },
-            )
-            .await
-            {
+            let spawned = {
+                #[cfg(feature = "control")]
+                {
+                    match gateway {
+                        Some(gateway) => {
+                            rest_api::RestApiServer::spawn_with_control(
+                                state,
+                                gateway,
+                                rest_api::RestConfig {
+                                    listen,
+                                    max_concurrency: config.rest.max_concurrency,
+                                },
+                            )
+                            .await
+                        }
+                        None => {
+                            rest_api::RestApiServer::spawn(
+                                state,
+                                rest_api::RestConfig {
+                                    listen,
+                                    max_concurrency: config.rest.max_concurrency,
+                                },
+                            )
+                            .await
+                        }
+                    }
+                }
+                #[cfg(not(feature = "control"))]
+                {
+                    rest_api::RestApiServer::spawn(
+                        state,
+                        rest_api::RestConfig {
+                            listen,
+                            max_concurrency: config.rest.max_concurrency,
+                        },
+                    )
+                    .await
+                }
+            };
+            let server = match spawned {
                 Ok(server) => server,
                 Err(e) => {
                     // 启动失败收尾（评审 P2）：轮询任务可能正持有阻塞
@@ -300,6 +370,13 @@ impl CollectorRuntime {
                     scheduler
                         .shutdown_with_timeout(Duration::from_secs(5))
                         .await;
+                    // 控制引擎停机（仅 control 构建且已装配）：REST 绑定
+                    // 失败前未受理过任何请求，队列必空，shutdown 立即返回；
+                    // 统一走停机路径保证语义完整（不遗留引擎句柄）。
+                    #[cfg(feature = "control")]
+                    if let Some(stack) = &control_stack {
+                        stack.shutdown().await;
+                    }
                     if let Ok(mqtt) = Arc::try_unwrap(mqtt_arc)
                         && let Err(e) = mqtt.shutdown().await
                     {
@@ -331,14 +408,13 @@ impl CollectorRuntime {
             info!(
                 component = "collector",
                 addr = %server.addr,
-                "REST v1 只读管理接口已启用"
+                "REST v1 管理接口已启用"
             );
             Some(Arc::new(server))
         } else {
             None
         };
 
-        let manager_arc = Arc::new(manager);
         let pump = tokio::spawn(run_pump(
             events_rx,
             Arc::clone(&manager_arc),
@@ -372,6 +448,8 @@ impl CollectorRuntime {
             buffer,
             mqtt: Some(mqtt_arc),
             rest,
+            #[cfg(feature = "control")]
+            control: control_stack,
             pump,
             forward,
             forward_done: false,
@@ -548,6 +626,20 @@ impl CollectorRuntime {
         //    句柄时 REST 不得在采集/MQTT/WAL 关闭后继续监听并响应）。
         if let Some(rest) = self.rest.take() {
             rest.shutdown().await;
+        }
+
+        // 0.5) 控制引擎有序停机（仅 control 构建且 control 段已配置，
+        //      §81/§93）：REST 已关闭（第 0 步，不再受理新控制请求），
+        //      在途请求在宽限期内结算/强制中止。放在采集停止之前的理由：
+        //      - 在途控制动作可能正在写设备，优先收尾让设备在采集链路
+        //        停止前进入确定状态；
+        //      - Driver 会话由 DeviceManager 持有（执行器持有其 Arc），
+        //        生命周期覆盖整个停机流程，此时结算无需额外保活；
+        //      - 控制结果不经管道/MQTT（与采集排空无数据依赖），先结算
+        //        仅需容忍与轮询任务的会话锁争用（§82 串行化保证安全）。
+        #[cfg(feature = "control")]
+        if let Some(control) = self.control.take() {
+            control.shutdown().await;
         }
 
         // 1) 停止采集：轮询任务退出后事件通道关闭，pump 收 None 结束。

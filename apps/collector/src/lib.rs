@@ -2,13 +2,19 @@
 //!
 //! `collector` feature（默认）：只读采集链路——配置加载 → Driver/Profile
 //! → Device Manager → Poll Engine → Data Pipeline → Local Buffer/WAL →
-//! MQTT 输出（§100 启动顺序）。`control` feature 保持为空占位（§98：
-//! 接入控制链路后验证 `--no-default-features --features collector`
-//! 构建产物不含控制代码）。
+//! MQTT 输出（§100 启动顺序）。
+//!
+//! `control` feature：在只读链路之上叠加控制面（§98/§81/§90）——凭据
+//! 加载（fail-closed）、幂等 Journal、ControlEngine、DeviceControlExecutor
+//! 与 REST 控制路由。全部控制装配代码以 `#[cfg(feature = "control")]`
+//! 门控，只读构建（`--no-default-features --features collector`）的产物
+//! 不含控制代码。
 
 #![cfg(feature = "collector")]
 
 pub mod config;
+#[cfg(feature = "control")]
+mod control;
 pub mod error;
 pub mod health;
 pub mod rest;

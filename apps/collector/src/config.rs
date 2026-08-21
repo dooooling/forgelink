@@ -57,6 +57,16 @@ pub struct CollectorConfig {
     /// 配置 `listen`（默认只监听 loopback，非 loopback 绑定需显式写明）。
     #[serde(default)]
     pub rest: RestOptions,
+    /// 控制链路配置段（§81/§90；`Some` = 用户显式提供了 `control:` 段，
+    /// 即启用控制链路——与 `rest.listen` 启用 REST 同一模式）。
+    ///
+    /// 段与构建 feature 的一致性由 `validate` 强制：
+    /// - `control` feature 构建：段出现即装配控制链路（凭据/Journal 加载
+    ///   失败 fail-closed）；段缺省则保持只读采集（启动时告警提示，避免
+    ///   运维误以为控制已启用）；
+    /// - 只读构建：段**不得出现**——防止用户误以为控制已启用（fail-fast）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<ControlOptions>,
 }
 
 fn default_profiles_dir() -> PathBuf {
@@ -446,6 +456,101 @@ fn default_rest_concurrency() -> usize {
     64
 }
 
+/// 控制链路配置（§81/§90；仅 `control` feature 构建下生效）。
+///
+/// `namespace` 与 `credentials_file` 必填；策略覆盖项给合理默认（与
+/// `control_engine::ControlPolicy::default` 对齐），只列运维最常调整的
+/// 子集——角色门槛/优先级/幂等保留期等安全默认值不开放配置，避免误配
+/// 拉低 §86 基线。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlOptions {
+    /// 控制命名空间（§80.1 幂等键三元组之一；必填非空）。不同部署环境
+    /// 应使用不同 namespace，避免 Journal 记录跨环境串扰。
+    pub namespace: String,
+    /// §90.2 静态凭据文件路径（JSON，schema
+    /// `forgelink.control.credentials.v1`；Unix 要求 0600 权限）。
+    /// 加载失败即启动失败（fail-closed，§90.2）。
+    pub credentials_file: PathBuf,
+    /// 幂等 Journal 文件路径（JSONL，§80.1/§103）。缺省取
+    /// `<buffer.db_path 父目录>/control-journal.jsonl`——与 WAL 同一数据
+    /// 目录，崩溃恢复记录与采集数据同生命周期。父目录必须已存在
+    /// （与 `buffer.db_path` 约定一致）。
+    #[serde(default)]
+    pub journal_path: Option<PathBuf>,
+    /// REST 提交控制请求的默认超时（毫秒）；引擎按策略上限取较小值，
+    /// 默认 5000。
+    #[serde(default = "default_control_timeout_ms")]
+    pub timeout_ms: u64,
+    /// 每设备控制队列容量（§87 有界队列），默认 64。
+    #[serde(default = "default_control_queue_capacity")]
+    pub queue_capacity: usize,
+    /// 单条审计事件写入超时（毫秒），默认 1000（慢审计不得阻塞控制
+    /// worker，§90）。
+    #[serde(default = "default_control_audit_timeout_ms")]
+    pub audit_timeout_ms: u64,
+    /// 控制引擎停机宽限（毫秒）：在途请求的结算期限，超时强制中止并按
+    /// Indeterminate/Cancelled 结算（收据不永久挂起），默认 5000。
+    #[serde(default = "default_control_shutdown_grace_ms")]
+    pub shutdown_grace_ms: u64,
+}
+
+fn default_control_timeout_ms() -> u64 {
+    5_000
+}
+fn default_control_queue_capacity() -> usize {
+    64
+}
+fn default_control_audit_timeout_ms() -> u64 {
+    1_000
+}
+fn default_control_shutdown_grace_ms() -> u64 {
+    5_000
+}
+
+impl ControlOptions {
+    // 只读构建下本方法不被调用（段存在即在 validate 中被拒绝），
+    // 字段级校验仅在 control 构建生效。
+    #[cfg_attr(not(feature = "control"), allow(dead_code))]
+    fn validate(&self) -> Result<(), CollectorError> {
+        if self.namespace.is_empty() {
+            return Err(ConfigError::invalid("control.namespace", "控制命名空间不能为空").into());
+        }
+        if self.namespace.chars().any(char::is_control) {
+            return Err(
+                ConfigError::invalid("control.namespace", "控制命名空间不能含控制字符").into(),
+            );
+        }
+        if self.credentials_file.as_os_str().is_empty() {
+            return Err(
+                ConfigError::invalid("control.credentials_file", "凭据文件路径不能为空").into(),
+            );
+        }
+        // 零值会让对应机制立即失效/永久阻塞（与 ControlPolicy::validate
+        // 同一 fail-fast 原则），启动前拒绝而非静默修正。
+        if self.timeout_ms == 0 {
+            return Err(ConfigError::invalid("control.timeout_ms", "必须大于 0").into());
+        }
+        if self.queue_capacity == 0 {
+            return Err(ConfigError::invalid("control.queue_capacity", "必须大于 0").into());
+        }
+        if self.audit_timeout_ms == 0 {
+            return Err(ConfigError::invalid("control.audit_timeout_ms", "必须大于 0").into());
+        }
+        if self.shutdown_grace_ms == 0 {
+            return Err(ConfigError::invalid("control.shutdown_grace_ms", "必须大于 0").into());
+        }
+        if let Some(path) = &self.journal_path {
+            if path.as_os_str().is_empty() {
+                return Err(
+                    ConfigError::invalid("control.journal_path", "Journal 路径不能为空").into(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 impl RestOptions {
     fn validate(&self) -> Result<(), CollectorError> {
         if let Some(listen) = &self.listen {
@@ -497,6 +602,179 @@ mod tests {
             err.to_string().contains("rest.max_concurrency"),
             "错误应指向字段: {err}"
         );
+    }
+
+    /// 最小合法配置（§100 校验全通过；测试按需覆盖单字段）。
+    fn minimal_config() -> CollectorConfig {
+        CollectorConfig {
+            site_id: "plant-a".to_owned(),
+            session_id: None,
+            profiles_dir: PathBuf::from("profiles"),
+            driver: DriverSpec {
+                plugin: PathBuf::from("driver.dll"),
+                manifest: ManifestSpec {
+                    id: "modbus-tcp".to_owned(),
+                    ..Default::default()
+                },
+            },
+            devices: vec![DeviceSpec {
+                id: "vfd-01".to_owned(),
+                name: None,
+                domain: None,
+                driver: "modbus-tcp".to_owned(),
+                profile: "inovance-md500".to_owned(),
+                connection: serde_json::json!({ "host": "127.0.0.1", "port": 1502 }),
+                enabled: true,
+                labels: Default::default(),
+            }],
+            northbound: NorthboundConfig {
+                mqtt: MqttOptions {
+                    broker_host: "127.0.0.1".to_owned(),
+                    ..Default::default()
+                },
+            },
+            poll: Default::default(),
+            pipeline: Default::default(),
+            buffer: BufferOptions {
+                db_path: PathBuf::from("data/collector-wal.db"),
+                ..Default::default()
+            },
+            forward_poll_ms: 500,
+            rest: RestOptions {
+                listen: Some("127.0.0.1:18080".to_owned()),
+                max_concurrency: 8,
+            },
+            control: None,
+        }
+    }
+
+    /// 合法 control 段（凭据/Journal 路径仅作占位，路径存在性由运行时
+    /// 装配期校验，配置层只查非空）。
+    #[cfg(feature = "control")]
+    fn valid_control() -> ControlOptions {
+        ControlOptions {
+            namespace: "plant-a".to_owned(),
+            credentials_file: PathBuf::from("control-credentials.json"),
+            journal_path: None,
+            timeout_ms: 5_000,
+            queue_capacity: 16,
+            audit_timeout_ms: 1_000,
+            shutdown_grace_ms: 5_000,
+        }
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_accepts_valid_control_section() {
+        let mut config = minimal_config();
+        config.control = Some(valid_control());
+        config.validate().expect("合法 control 配置应通过");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_without_section_stays_readonly() {
+        // 段是控制的启用开关（与 rest.listen 同模式）：缺省保持只读采集，
+        // 运行时启动时告警提示（不误导也不阻塞既有只读部署）。
+        let config = minimal_config();
+        config.validate().expect("缺 control 段应通过（只读运行）");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_requires_rest_listen() {
+        // 控制端点经 REST v1 暴露（§31.5）：无 REST 的控制构建没有提交入口。
+        let mut config = minimal_config();
+        config.rest.listen = None;
+        config.control = Some(valid_control());
+        let err = config.validate().expect_err("未启用 REST 必须拒绝");
+        assert!(
+            err.to_string().contains("rest.listen"),
+            "错误应指向 rest.listen: {err}"
+        );
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_options_rejects_invalid_fields() {
+        let cases: Vec<(&str, ControlOptions)> = vec![
+            (
+                "control.namespace",
+                ControlOptions {
+                    namespace: String::new(),
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.timeout_ms",
+                ControlOptions {
+                    timeout_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.queue_capacity",
+                ControlOptions {
+                    queue_capacity: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.audit_timeout_ms",
+                ControlOptions {
+                    audit_timeout_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.shutdown_grace_ms",
+                ControlOptions {
+                    shutdown_grace_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.credentials_file",
+                ControlOptions {
+                    credentials_file: PathBuf::new(),
+                    ..valid_control()
+                },
+            ),
+        ];
+        for (field, options) in cases {
+            let err = options.validate().expect_err("非法字段必须拒绝");
+            assert!(err.to_string().contains(field), "错误应指向 {field}: {err}");
+        }
+    }
+
+    #[cfg(not(feature = "control"))]
+    #[test]
+    fn readonly_build_rejects_control_section() {
+        // 只读构建出现 control 段必须报错（fail-fast，防止用户误以为
+        // 控制已启用）。
+        let mut config = minimal_config();
+        config.control = Some(ControlOptions {
+            namespace: "plant-a".to_owned(),
+            credentials_file: PathBuf::from("control-credentials.json"),
+            journal_path: None,
+            timeout_ms: 5_000,
+            queue_capacity: 16,
+            audit_timeout_ms: 1_000,
+            shutdown_grace_ms: 5_000,
+        });
+        let err = config.validate().expect_err("只读构建必须拒绝 control 段");
+        assert!(
+            err.to_string().contains("只读"),
+            "错误应说明当前为只读构建: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "control"))]
+    #[test]
+    fn readonly_build_ok_without_control_section() {
+        minimal_config()
+            .validate()
+            .expect("无 control 段的只读配置应通过");
     }
 }
 
@@ -607,6 +885,31 @@ impl CollectorConfig {
         self.pipeline.validate()?;
         self.buffer.validate()?;
         self.rest.validate()?;
+        // 控制链路（§98/§81）：配置段与构建 feature 必须一致——
+        // - control 构建：段出现即启用（字段校验 + 必须启用 REST：控制
+        //   端点经 REST v1 暴露，无 REST 的控制没有提交入口）；段缺省
+        //   保持只读采集（运行时启动时告警提示）；
+        // - 只读构建：段不得出现（fail-fast，防止用户误以为控制已启用）。
+        #[cfg(feature = "control")]
+        if let Some(control) = &self.control {
+            control.validate()?;
+            if self.rest.listen.is_none() {
+                return Err(ConfigError::invalid(
+                    "rest.listen",
+                    "控制链路经 REST v1 暴露，启用 control 时必须配置 rest.listen",
+                )
+                .into());
+            }
+        }
+        #[cfg(not(feature = "control"))]
+        if self.control.is_some() {
+            return Err(ConfigError::invalid(
+                "control",
+                "已配置 control 段，但当前为只读构建（未启用 control feature）；\
+                 请移除该段或改用 control 构建",
+            )
+            .into());
+        }
         Ok(())
     }
 
