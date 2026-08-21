@@ -61,7 +61,10 @@ impl fmt::Display for CredentialsError {
             }
             Self::Parse(reason) => write!(f, "凭据文件解析失败: {reason}"),
             Self::SchemaMismatch(actual) => {
-                write!(f, "凭据文件 schema 不符: {actual}（要求 {CREDENTIALS_SCHEMA}）")
+                write!(
+                    f,
+                    "凭据文件 schema 不符: {actual}（要求 {CREDENTIALS_SCHEMA}）"
+                )
             }
             Self::DuplicateToken => write!(f, "凭据文件存在重复 Token"),
             Self::EmptySubject => write!(f, "凭据条目 subject 为空"),
@@ -137,8 +140,8 @@ impl StaticTokenAuthorizer {
     ///
     /// 同 [`Self::from_file`]（除文件 I/O 与权限项）。
     pub fn parse(content: &str) -> Result<Self, CredentialsError> {
-        let file: CredentialsFile = serde_json::from_str(content)
-            .map_err(|e| CredentialsError::Parse(e.to_string()))?;
+        let file: CredentialsFile =
+            serde_json::from_str(content).map_err(|e| CredentialsError::Parse(e.to_string()))?;
         if file.schema != CREDENTIALS_SCHEMA {
             return Err(CredentialsError::SchemaMismatch(file.schema));
         }
@@ -371,6 +374,9 @@ mod tests {
             "credentials": [ { "token": "secret-token-value", "subject": "a", "role": "viewer" } ]
         }"#;
         let err = StaticTokenAuthorizer::parse(json).unwrap_err().to_string();
-        assert!(!err.contains("secret-token-value"), "错误信息不得包含 Token");
+        assert!(
+            !err.contains("secret-token-value"),
+            "错误信息不得包含 Token"
+        );
     }
 }

@@ -145,15 +145,18 @@ pub fn decode_register_value(
 }
 
 /// 按字序重排 2 寄存器（4 字节）：`Cdab` 交换高低字。
-fn reorder_words4(slice: &[u8], word_order: WordOrder) -> [u8; 4] {
+///
+/// 读侧把线数据重排为自然大端值；写侧（`encode`）用同一置换做逆变换——
+/// 字交换是对合变换（应用两次回到原样），故读写共用同一函数保证镜像对称。
+pub(crate) fn reorder_words4(slice: &[u8], word_order: WordOrder) -> [u8; 4] {
     match word_order {
         WordOrder::Abcd => [slice[0], slice[1], slice[2], slice[3]],
         WordOrder::Cdab => [slice[2], slice[3], slice[0], slice[1]],
     }
 }
 
-/// 按字序重排 4 寄存器（8 字节）：`Cdab` 反转字顺序。
-fn reorder_words8(slice: &[u8], word_order: WordOrder) -> [u8; 8] {
+/// 按字序重排 4 寄存器（8 字节）：`Cdab` 反转字顺序（同为对合变换）。
+pub(crate) fn reorder_words8(slice: &[u8], word_order: WordOrder) -> [u8; 8] {
     match word_order {
         WordOrder::Abcd => [
             slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],

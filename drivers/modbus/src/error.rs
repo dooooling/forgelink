@@ -95,7 +95,7 @@ impl ModbusError {
     pub fn unsupported(feature: &str) -> Self {
         Self::new(
             "unsupported",
-            format!("{feature} 未声明（capability=false，本阶段仅支持读取）"),
+            format!("{feature} 未声明（capability=false，本阶段支持读取与写入）"),
             false,
         )
     }

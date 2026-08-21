@@ -17,6 +17,7 @@ serialport = "4"
 
 [dev-dependencies]
 driver-loader = { path = "../../crates/driver-loader" }
+libloading = "0.8"
 modbus-mock = { path = "../../crates/modbus-mock" }
 poll-engine = { path = "../../crates/poll-engine" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

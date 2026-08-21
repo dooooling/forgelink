@@ -2,13 +2,16 @@
 //!
 //! # 职责边界
 //!
-//! - **协议表示**：FC01/FC02/FC03/FC04 批量读取（§66 示例：FC03/CRC/Slave
-//!   ID/串口超时/Batch Read 属于 Driver）；
+//! - **协议表示**：FC01/FC02/FC03/FC04 批量读取与 FC05/FC06/FC15/FC16 写入
+//!   （§66 示例：FC03/FC06/FC16/CRC/Slave ID/串口超时/Batch Read 属于
+//!   Driver）；
 //! - **地址解析**：`1!40001`、`coil:00001`、`input:30001`（Driver 私有不透明
-//!   数据，§10，语义见 `address` 模块）；
-//! - **批量合并**：按从站分组、连续地址合并、协议上限拆分（`batch` 模块）；
-//! - **原始结果边界**：只返回 `RawReadResult`，不生成 `Observation`（§7.3）；
-//!   保留每个 item 的错误、类型与质量信息。
+//!   数据，§10，语义见 `address` 模块）；coil → FC05/FC15，
+//!   holding → FC06/FC16，discrete/input 只读（写请求显式拒绝）；
+//! - **批量合并**：按从站分组、连续地址合并、协议上限拆分（`batch` 模块；
+//!   读侧允许跳过中间地址，写侧必须精确相邻——不覆盖未请求的地址）；
+//! - **原始结果边界**：只返回 `RawReadResult` / `RawWriteResult`，不生成
+//!   `Observation`（§7.3）；保留每个 item 的错误、类型与质量信息。
 //!
 //! 型号差异（缩放、单位、枚举）属于 Profile，本 Driver 不感知。
 //!
@@ -21,7 +24,8 @@
 //!
 //! # 超时 / 断线重连
 //!
-//! - 请求超时：`timeout_ms`（socket 读超时），超时返回 `retryable` 错误；
+//! - 请求超时：`timeout_ms`（socket 读超时），读写同样受约束，超时返回
+//!   `retryable` 错误；
 //! - 断线重连：请求中检测到连接断开后，下一次请求按
 //!   `reconnect_max_attempts` × `reconnect_delay_ms` 自动重连（§34.3）。
 //!
@@ -36,6 +40,7 @@ pub mod batch;
 pub mod config;
 pub mod crc;
 pub mod decode;
+pub mod encode;
 pub mod error;
 pub mod frame;
 pub mod session;
@@ -44,13 +49,14 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use driver_sdk::ProtocolCapabilities;
+use driver_sdk::RawWriteResult;
 use driver_sdk::abi::envelope::{
-    AddressEnvelope, CapabilitiesEnvelope, ErrorEnvelope, ReadEnvelope,
+    AddressEnvelope, CapabilitiesEnvelope, ErrorEnvelope, ReadEnvelope, WriteEnvelope,
 };
 use driver_sdk::abi::{DriverApiV1, DriverHandle, FfiOwnedBuffer, FfiReadItem, FfiStr};
 use observation_model::{DriverErrorInfo, RawReadResult, TimestampNs};
 
-use crate::batch::{PlannedItem, plan_batch};
+use crate::batch::{PlannedItem, WritePlan, plan_batch, plan_write_batch};
 use crate::config::ModbusConfig;
 use crate::error::ModbusError;
 
@@ -156,6 +162,71 @@ impl ModbusDriver {
         self.connect()
     }
 
+    /// 批量写入：规划 → 逐计划请求 → 组装每 item 结果。
+    ///
+    /// 部分失败语义与 [`ModbusDriver::read_batch`] 一致：
+    ///
+    /// - 传输级失败（断线/超时/响应失步）：整体失败返回，由上层退避/重连；
+    /// - 协议级失败（从站异常）：同计划内全部 item 标记失败后继续后续计划；
+    /// - 值编码失败（Bool 写寄存器等）：规划期剔除，逐项返回 `invalid_type`。
+    fn write_batch(
+        &mut self,
+        items: &[batch::WriteRequest],
+    ) -> Result<Vec<RawWriteResult>, ModbusError> {
+        let (plans, mut results) =
+            plan_write_batch(items, self.config.unit_id, self.config.word_order)?;
+        // 请求串行化：与读路径一致，逐计划顺序执行；计划按 (unit, kind, 地址)
+        // 升序生成，重叠地址的写项因此获得确定的覆盖顺序。
+        for plan in &plans {
+            self.ensure_connected_before_plan()?;
+            match self.request_write_plan(plan) {
+                Ok(()) => {
+                    for item_id in &plan.item_ids {
+                        results.push(RawWriteResult {
+                            item_id: *item_id,
+                            success: true,
+                            // 写确认无附加协议质量码：成功置 0（与读路径一致）。
+                            protocol_code: Some(0),
+                            error: None,
+                        });
+                    }
+                }
+                // 传输级失败：会话已不可用，必须整体失败返回（PollDriver 约定
+                // §22），不得转成单项错误伪装成成功批次。
+                Err(e) if e.is_transport_level() => return Err(e),
+                // 协议级错误（从站异常等）：会话仍可用，逐项标记后继续。
+                Err(e) => {
+                    for item_id in &plan.item_ids {
+                        results.push(write_error_result(*item_id, &e));
+                    }
+                }
+            }
+        }
+        // 结果顺序与请求 item 顺序一致（供上层按 item_id 关联）。
+        results.sort_by_key(|r| r.item_id);
+        Ok(results)
+    }
+
+    /// 执行一个计划的写帧（回显校验在 session 层）。
+    fn request_write_plan(&mut self, plan: &WritePlan) -> Result<(), ModbusError> {
+        let transport = self.transport.as_deref_mut().expect("传输已创建");
+        let result = transport.write_transaction(
+            plan.unit_id,
+            plan.function,
+            plan.start_offset,
+            &plan.payload,
+        );
+        match result {
+            Ok(()) => Ok(()),
+            // 传输级错误：会话已失步/断开，标记断开供下次请求自动重连。
+            Err(e) if e.is_transport_level() => {
+                transport.disconnect();
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 执行一个计划的读帧，返回纯数据字节（寄存器大端字节 / 位字节）。
     fn request_plan(&mut self, plan: &batch::ReadPlan) -> Result<Vec<u8>, ModbusError> {
         let transport = self.transport.as_deref_mut().expect("传输已创建");
@@ -226,6 +297,16 @@ fn error_result(item_id: u64, error: &ModbusError) -> RawReadResult {
     error_result_with_ts(item_id, error, now_ns())
 }
 
+/// 组装单项写入失败结果。
+fn write_error_result(item_id: u64, error: &ModbusError) -> RawWriteResult {
+    RawWriteResult {
+        item_id,
+        success: false,
+        protocol_code: error.protocol_code,
+        error: Some(error.clone().into_info()),
+    }
+}
+
 fn error_result_with_ts(item_id: u64, error: &ModbusError, now: TimestampNs) -> RawReadResult {
     RawReadResult {
         item_id,
@@ -248,12 +329,12 @@ fn now_ns() -> TimestampNs {
 
 // ---------------------------------------------------------------- C ABI
 
-/// 能力声明：只读 + 轮询（写/订阅/历史本阶段未实现）。
+/// 能力声明：读 + 写 + 轮询（订阅/事件/历史本阶段未实现）。
 const CAPABILITIES: ProtocolCapabilities = ProtocolCapabilities {
     read: true,
-    write: false,
+    write: true,
     batch_read: true,
-    batch_write: false,
+    batch_write: true,
     browse: false,
     polling: true,
     subscription: false,
@@ -519,19 +600,70 @@ unsafe extern "C" fn api_read(
     .unwrap_or(-1)
 }
 
+/// 批量写入（§15 `write`；`out` 为 `abi::envelope::WriteEnvelope`）。
+///
+/// 每个 `FfiWriteItem` 的 `value_type` 为 ABI v1 Tag、`value_bytes` 为按
+/// §17.2 标量编码的值：Tag 非法（未知/复杂类型/长度不符）必须整体失败
+/// （invalid_type，§17.2），不得静默降级。
 unsafe extern "C" fn api_write(
     handle: DriverHandle,
-    _items: *const driver_sdk::abi::FfiWriteItem,
-    _len: usize,
-    _out: *mut FfiOwnedBuffer,
+    items: *const driver_sdk::abi::FfiWriteItem,
+    len: usize,
+    out: *mut FfiOwnedBuffer,
 ) -> i32 {
     catch_abi_panic(handle, || {
         let Some(driver) = driver_mut(handle) else {
             return -1;
         };
-        let e = ModbusError::unsupported("写");
-        driver.last_error = Some(e.clone().into_info());
-        -1
+        if items.is_null() && len > 0 {
+            driver.last_error = Some(
+                ModbusError::invalid_address("items 指针为空但长度非 0".to_owned()).into_info(),
+            );
+            return -1;
+        }
+        let mut write_items: Vec<batch::WriteRequest> = Vec::with_capacity(len);
+        for i in 0..len {
+            let item = unsafe { &*items.add(i) };
+            // value_bytes 借用调用期内存（§17.1）：len == 0 时 ptr 可为 null。
+            let bytes = if item.value_bytes.len == 0 {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts(item.value_bytes.ptr, item.value_bytes.len) }
+            };
+            let value = match driver_sdk::abi::tag::decode_value_bytes(item.value_type, bytes) {
+                Ok(value) => value,
+                Err(e) => {
+                    driver.last_error = Some(
+                        ModbusError::invalid_type(format!("item {} 写入值 Tag 非法：{e}", item.id))
+                            .into_info(),
+                    );
+                    return -1;
+                }
+            };
+            write_items.push(batch::WriteRequest {
+                id: item.id,
+                address: unsafe { ffi_str_to_str(item.address) }
+                    .unwrap_or_default()
+                    .to_owned(),
+                value_type: item.value_type,
+                value,
+            });
+        }
+        match driver.write_batch(&write_items) {
+            Ok(results) => {
+                let envelope = WriteEnvelope::new(results);
+                match serde_json::to_vec(&envelope) {
+                    Ok(bytes) => write_buffer(out, &bytes),
+                    Err(_) => return -1,
+                }
+                0
+            }
+            Err(e) => {
+                let info = e.clone().into_info();
+                driver.last_error = Some(info);
+                -1
+            }
+        }
     })
     .unwrap_or(-1)
 }
