@@ -65,6 +65,10 @@ pub struct CollectorConfig {
     ///   失败 fail-closed）；段缺省则保持只读采集（启动时告警提示，避免
     ///   运维误以为控制已启用）；
     /// - 只读构建：段**不得出现**——防止用户误以为控制已启用（fail-fast）。
+    ///
+    /// 另要求 `rest.listen` 存在且为 **loopback** 地址（§90.2：远程必须
+    /// TLS 而 MVP 无原生 TLS——MVP 控制面仅允许 loopback 直连，远程访问
+    /// 须经 TLS 反向代理转发；非 loopback 监听 fail-fast 启动失败）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<ControlOptions>,
 }
@@ -540,12 +544,12 @@ impl ControlOptions {
         if self.shutdown_grace_ms == 0 {
             return Err(ConfigError::invalid("control.shutdown_grace_ms", "必须大于 0").into());
         }
-        if let Some(path) = &self.journal_path {
-            if path.as_os_str().is_empty() {
-                return Err(
-                    ConfigError::invalid("control.journal_path", "Journal 路径不能为空").into(),
-                );
-            }
+        if let Some(path) = &self.journal_path
+            && path.as_os_str().is_empty()
+        {
+            return Err(
+                ConfigError::invalid("control.journal_path", "Journal 路径不能为空").into(),
+            );
         }
         Ok(())
     }
@@ -692,6 +696,47 @@ mod tests {
             err.to_string().contains("rest.listen"),
             "错误应指向 rest.listen: {err}"
         );
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_requires_loopback_listen_rejects_non_loopback() {
+        // §90.2：远程（非 loopback）必须 TLS，MVP 无原生 TLS——控制面仅
+        // 允许 loopback 直连（fail-fast 启动失败），远程访问须经 TLS 反向
+        // 代理转发。
+        let mut config = minimal_config();
+        config.rest.listen = Some("0.0.0.0:8080".to_owned());
+        config.control = Some(valid_control());
+        let err = config.validate().expect_err("通配地址监听必须拒绝");
+        let text = err.to_string();
+        assert!(
+            text.contains("loopback"),
+            "错误应说明仅允许 loopback: {text}"
+        );
+        assert!(
+            text.contains("TLS 反向代理"),
+            "错误应说明远程访问方案: {text}"
+        );
+
+        // 私网地址同样非 loopback，拒绝。
+        let mut config = minimal_config();
+        config.rest.listen = Some("192.168.1.10:8080".to_owned());
+        config.control = Some(valid_control());
+        assert!(config.validate().is_err(), "私网地址同样必须拒绝");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_allows_loopback_listen_ipv4_and_ipv6() {
+        // IPv4 127.0.0.0/8 与 IPv6 ::1 均为 loopback，允许启用控制链路。
+        for listen in ["127.0.0.1:8080", "[::1]:8080", "127.9.9.9:8080"] {
+            let mut config = minimal_config();
+            config.rest.listen = Some(listen.to_owned());
+            config.control = Some(valid_control());
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{listen} 应通过: {e}"));
+        }
     }
 
     #[cfg(feature = "control")]
@@ -886,17 +931,35 @@ impl CollectorConfig {
         self.buffer.validate()?;
         self.rest.validate()?;
         // 控制链路（§98/§81）：配置段与构建 feature 必须一致——
-        // - control 构建：段出现即启用（字段校验 + 必须启用 REST：控制
-        //   端点经 REST v1 暴露，无 REST 的控制没有提交入口）；段缺省
-        //   保持只读采集（运行时启动时告警提示）；
+        // - control 构建：段出现即启用（字段校验 + 必须启用 REST 且监听
+        //   loopback：控制端点经 REST v1 暴露，无 REST 的控制没有提交
+        //   入口；远程（非 loopback）必须 TLS 而 MVP 无原生 TLS，§90.2）；
+        //   段缺省保持只读采集（运行时启动时告警提示）；
         // - 只读构建：段不得出现（fail-fast，防止用户误以为控制已启用）。
         #[cfg(feature = "control")]
         if let Some(control) = &self.control {
             control.validate()?;
-            if self.rest.listen.is_none() {
-                return Err(ConfigError::invalid(
+            let listen = self.rest.listen.as_deref().ok_or_else(|| {
+                ConfigError::invalid(
                     "rest.listen",
                     "控制链路经 REST v1 暴露，启用 control 时必须配置 rest.listen",
+                )
+            })?;
+            // §90.2：远程（非 loopback）必须 TLS，MVP 无原生 TLS——控制面
+            // 仅允许 loopback 直连（IPv4 127.0.0.0/8、IPv6 ::1），fail-fast
+            // 启动失败；远程访问须经 TLS 反向代理转发。`listen` 为 IP:port
+            // （`SocketAddr` 解析，主机名形式如 `localhost:8080` 在
+            // `RestOptions::validate` 已被拒绝）。
+            let addr = listen.parse::<std::net::SocketAddr>().map_err(|e| {
+                ConfigError::invalid("rest.listen", format!("监听地址 {listen:?} 无法解析: {e}"))
+            })?;
+            if !addr.ip().is_loopback() {
+                return Err(ConfigError::invalid(
+                    "rest.listen",
+                    format!(
+                        "启用 control 时仅允许 loopback 监听（当前 {addr}）：\
+                         MVP 控制面仅允许 loopback 直连，远程访问须经 TLS 反向代理转发"
+                    ),
                 )
                 .into());
             }

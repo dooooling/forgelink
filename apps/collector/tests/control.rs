@@ -1,5 +1,5 @@
-//! Collector 控制链路集成测试（§31.5/§81/§90/§98）：真实 HTTP + modbus-mock
-//! + mock broker 全链路——Bearer 认证（401）、角色授权（403）、属性写入
+//! Collector 控制链路集成测试（§31.5/§81/§90/§98）：真实 HTTP、modbus-mock
+//! 与 mock broker 全链路——Bearer 认证（401）、角色授权（403）、属性写入
 //! 落地到 Mock 寄存器、凭据缺失 fail-closed 启动失败、在途控制请求停机
 //! 不挂起且 Journal 无残留。
 //!
@@ -98,7 +98,8 @@ async fn wait_until_settled(addr: SocketAddr, request_id: &str) -> Value {
             None,
         );
         assert_eq!(status, 200, "状态查询应成功: {body}");
-        match body["status"].as_str().expect("status 字段") {
+        // 三态字段名为 `state`（§31.5 Normative）。
+        match body["state"].as_str().expect("state 字段") {
             "settled" => return body,
             // 受理成功后台账必有条目：running 是唯一中间态。
             other => assert_eq!(other, "running", "意外状态: {body}"),

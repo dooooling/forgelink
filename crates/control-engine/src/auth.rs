@@ -72,7 +72,10 @@ impl fmt::Display for CredentialsError {
             }
             Self::DuplicateToken => write!(f, "凭据文件存在重复 Token"),
             Self::DuplicateSubject => {
-                write!(f, "凭据文件存在重复 subject（同一身份只允许一个 Token，§90.2）")
+                write!(
+                    f,
+                    "凭据文件存在重复 subject（同一身份只允许一个 Token，§90.2）"
+                )
             }
             Self::EmptySubject => write!(f, "凭据条目 subject 为空"),
         }

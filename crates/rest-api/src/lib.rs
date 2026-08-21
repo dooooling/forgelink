@@ -80,7 +80,7 @@ pub mod state;
 pub use control::{
     CONTROL_ACCEPTED_SCHEMA, CONTROL_REQUEST_SCHEMA, CONTROL_REQUESTS_PATH, CONTROL_STATUS_SCHEMA,
     CONTROLS_PATH, ControlAcceptedResponse, ControlAdapter, ControlGateway, ControlStatusQuery,
-    ControlStatusResponse, EngineControlAdapter, StatusQueryError, Submission,
+    ControlStatusResponse, ControlSubmitError, EngineControlAdapter, StatusQueryError, Submission,
 };
 pub use error::{ApiError, ErrorCode, ErrorResponse, RequestId};
 pub use models::{
