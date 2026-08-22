@@ -365,6 +365,14 @@ fn catalog() -> Arc<MemoryDeviceCatalog> {
     Arc::new(catalog)
 }
 
+/// 含第二台启用设备（dev-2）的目录（per-device metrics 隔离断言用）。
+fn catalog_two_devices() -> Arc<MemoryDeviceCatalog> {
+    let mut catalog = MemoryDeviceCatalog::new();
+    catalog.insert_profile(DEV.to_owned(), profile_for_test());
+    catalog.insert_profile("dev-2".to_owned(), profile_for_test());
+    Arc::new(catalog)
+}
+
 fn authorizer(role: Role) -> Arc<MemoryAuthorizer> {
     let auth = MemoryAuthorizer::new();
     auth.set_role("alice", role);
@@ -2629,8 +2637,93 @@ async fn metrics_settled_succeeded_rejected_and_queue_depth_pairing() {
     engine.shutdown(Duration::from_millis(500)).await;
 }
 
-/// 取消与超时终态：运行中取消 → Indeterminate；排队中取消 → Cancelled；
-/// 排队过期 → Timeout。各自进入对应常量名计数器。
+/// §34.2.1 per-device 队列深度维度：名称 `control_queue_depth_device_{id}`
+/// （首见注册，设备来自静态清单）；全局与 per-device 增减配对、互不串扰。
+#[tokio::test]
+async fn metrics_queue_depth_per_device_gauges_pair_and_isolate() {
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let executor = MockExecutor::new(); // 阻塞：制造排队窗口
+    executor.set_indeterminate();
+    let engine = {
+        let mut config = ControlEngineConfig {
+            catalog: catalog_two_devices(),
+            authorizer: authorizer(Role::Operator),
+            journal: Arc::new(InMemoryJournal::new()),
+            executor: executor.clone(),
+            audit: Arc::new(MemoryAuditSink::new()),
+            policy: default_policy(),
+            metrics: Some(registry.clone()),
+        };
+        ControlEngine::new(config)
+    };
+
+    // dev-1 两笔（1 运行 + 1 排队）、dev-2 一笔（运行）。超时放大到 60s：
+    // 断言窗口内不得有任何请求因 deadline 到期被结算（否则深度 -1 干扰
+    // 配对断言——此前 5s 默认超时恰在 wait_for_calls 轮询期间触发）。
+    let long_timeout = |r: ControlRequest| ControlRequest {
+        timeout_ms: 60_000,
+        ..r
+    };
+    let d1a = engine
+        .submit(long_timeout(frequency_write("pd-1", 10.0)), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    let d1b = engine
+        .submit(long_timeout(frequency_write("pd-2", 20.0)), &context())
+        .await
+        .unwrap();
+    let d2 = engine
+        .submit(
+            long_timeout(ControlRequest {
+                device_id: "dev-2".to_owned(),
+                ..write_request("pd-3", "drive.output.frequency", Value::F64(30.0))
+            }),
+            &context(),
+        )
+        .await
+        .unwrap();
+    // 只要求第 1 笔已进入执行器（worker 串行，其余必然仍在队列中）；
+    // 等待全部 3 笔反而要等 worker 逐个放行，与"排队"前提矛盾。
+    tokio::time::sleep(Duration::from_millis(100)).await; // 让 d1b/d2 完成入队
+
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.get("control_queue_depth_device_dev-1"),
+        Some(&MetricValue::Gauge(2)),
+        "dev-1 应为 2（运行+排队）"
+    );
+    assert_eq!(
+        snap.get("control_queue_depth_device_dev-2"),
+        Some(&MetricValue::Gauge(1)),
+        "dev-2 应为 1"
+    );
+    assert_eq!(
+        snap.get("control_queue_depth_gauge"),
+        Some(&MetricValue::Gauge(3))
+    );
+
+    executor.release();
+    for r in [d1a, d1b, d2] {
+        let _ = tokio::time::timeout(Duration::from_secs(2), r.wait()).await;
+    }
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.get("control_queue_depth_device_dev-1"),
+        Some(&MetricValue::Gauge(0)),
+        "全部结算后 dev-1 深度归零（配对）"
+    );
+    assert_eq!(
+        snap.get("control_queue_depth_device_dev-2"),
+        Some(&MetricValue::Gauge(0))
+    );
+    assert_eq!(
+        snap.get("control_queue_depth_gauge"),
+        Some(&MetricValue::Gauge(0))
+    );
+
+    engine.shutdown(Duration::from_millis(500)).await;
+}
 #[tokio::test]
 async fn metrics_settled_cancelled_timeout_indeterminate() {
     let registry = Arc::new(metrics::MetricsRegistry::new());

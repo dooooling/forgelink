@@ -13,6 +13,16 @@ use metrics::{Counter, Gauge, Histogram, MetricsRegistry};
 pub(crate) mod metric_names {
     /// 在途（已持久化、等待 PUBACK 确认）记录数：push 成功 +1、ACK 删除 -1。
     pub const WAL_INFLIGHT_GAUGE: &str = "wal_inflight_gauge";
+    /// 磁盘占用字节的即时量（估算成本口径，§34.2.1）：落盘成功 +成本、
+    /// ACK / 过期清理删除 -成本——与容量记账（`WorkerState::bytes`）
+    /// 同一增减路径配对。
+    pub const WAL_DISK_BYTES_GAUGE: &str = "wal_disk_bytes_gauge";
+    /// 已落盘但最终未送达即被丢弃的记录数（§34.2.1 `wal_ack_dropped_total`，
+    /// 规范原名）：保留时间到期清理丢弃 + 容量超限显式拒绝/结算丢弃。
+    /// **语义澄清**：不是"收到 PUBACK ack"的正常计数（那是成功送达，
+    /// 由 in-flight gauge 的 -1 配对表达），而是"曾占用 WAL、最终未能
+    /// 送达 broker 就被丢弃"的损失计数。
+    pub const WAL_ACK_DROPPED_TOTAL: &str = "wal_ack_dropped_total";
     /// 补传计数：`next` 取出补传记录（`replayed = true`）时 +1。
     pub const WAL_REPLAYED_TOTAL: &str = "wal_replayed_total";
     /// 落盘耗时（ns 直方图）：单条记录 INSERT 的耗时。
@@ -32,6 +42,10 @@ pub struct WalMetrics {
     inflight: Option<Gauge>,
     /// 在途记录数的线程内镜像（worker 单线程访问）。
     inflight_value: Arc<AtomicI64>,
+    /// 磁盘占用字节 gauge（估算成本口径；worker 单线程访问）。
+    disk_bytes: Option<Gauge>,
+    /// 已落盘但最终未送达即被丢弃的记录计数器（过期清理 / 容量拒绝）。
+    ack_dropped: Option<Counter>,
     /// 补传计数器。
     replayed: Option<Counter>,
     /// 落盘耗时直方图。
@@ -47,6 +61,8 @@ impl WalMetrics {
         Self {
             inflight: Some(registry.gauge(metric_names::WAL_INFLIGHT_GAUGE)),
             inflight_value: Arc::new(AtomicI64::new(0)),
+            disk_bytes: Some(registry.gauge(metric_names::WAL_DISK_BYTES_GAUGE)),
+            ack_dropped: Some(registry.counter(metric_names::WAL_ACK_DROPPED_TOTAL)),
             replayed: Some(registry.counter(metric_names::WAL_REPLAYED_TOTAL)),
             persist_ns: Some(registry.histogram(metric_names::WAL_PERSIST_NS_HIST)),
         }
@@ -56,10 +72,13 @@ impl WalMetrics {
     ///
     /// push 直连与背压 flush 共用；恢复加载的历史记录不计（由
     /// [`Self::observe_restored`] 在启动时统一入账）。
-    pub(crate) fn observe_persisted(&self, elapsed_ns: u64) {
+    pub(crate) fn observe_persisted(&self, elapsed_ns: u64, cost_bytes: u64) {
         if let Some(gauge) = self.inflight.as_ref() {
             let value = self.inflight_value.fetch_add(1, Ordering::Relaxed) + 1;
             gauge.set(value);
+        }
+        if let Some(gauge) = self.disk_bytes.as_ref() {
+            gauge.add(cost_bytes as i64);
         }
         if let Some(hist) = self.persist_ns.as_ref() {
             hist.observe_ns(elapsed_ns);
@@ -68,17 +87,22 @@ impl WalMetrics {
 
     /// 启动时把恢复的未确认记录数计入 in-flight（worker 启动后调用一次）：
     /// 这些记录是上一会话 push 的、仍在等待确认，ACK 时会 -1——不入账会
-    /// 让镜像计数漂移为负。
-    pub(crate) fn observe_restored(&self, count: i64) {
+    /// 让镜像计数漂移为负。`bytes` 为恢复的磁盘估算占用基线。
+    pub(crate) fn observe_restored(&self, count: i64, bytes: u64) {
         if let Some(gauge) = self.inflight.as_ref() {
             self.inflight_value.store(count.max(0), Ordering::Relaxed);
             gauge.set(count.max(0));
         }
+        if let Some(gauge) = self.disk_bytes.as_ref() {
+            gauge.set(bytes as i64);
+        }
     }
 
     /// 记录 n 条记录因保留时间到期被清理（§103）：与 ACK 同为"离开未确认
-    /// 集合"，必须同步扣减，否则 gauge 漂移。
-    pub(crate) fn observe_expired(&self, n: usize) {
+    /// 集合"，必须同步扣减，否则 gauge 漂移；`bytes` 为清理释放的估算
+    /// 磁盘占用。过期丢弃 = "已落盘但最终未送达即被丢弃"（§34.2.1
+    /// `wal_ack_dropped_total` 语义），同步计入丢弃计数。
+    pub(crate) fn observe_expired(&self, n: usize, bytes: u64) {
         if let Some(gauge) = self.inflight.as_ref()
             && n > 0
         {
@@ -87,15 +111,36 @@ impl WalMetrics {
             self.inflight_value.store(next, Ordering::Relaxed);
             gauge.set(next);
         }
+        if let Some(gauge) = self.disk_bytes.as_ref() {
+            gauge.sub_saturating(bytes);
+        }
+        if n > 0
+            && let Some(counter) = self.ack_dropped.as_ref()
+        {
+            counter.add(n as u64);
+        }
     }
 
-    /// 记录一条记录 ACK 删除：in-flight -1（饱和于 0；重复 ACK 幂等）。
-    pub(crate) fn observe_acked(&self) {
+    /// 记录一条记录 ACK 删除：in-flight -1（饱和于 0；重复 ACK 幂等）；
+    /// 同步扣减磁盘占用 gauge。
+    pub(crate) fn observe_acked(&self, cost_bytes: u64) {
         if let Some(gauge) = self.inflight.as_ref() {
             let current = self.inflight_value.load(Ordering::Relaxed);
             let next = current.saturating_sub(1);
             self.inflight_value.store(next, Ordering::Relaxed);
             gauge.set(next);
+        }
+        if let Some(gauge) = self.disk_bytes.as_ref() {
+            gauge.sub_saturating(cost_bytes);
+        }
+    }
+
+    /// 记录一次容量超限的显式拒绝/结算丢弃（§34.2.1 `wal_ack_dropped_total`
+    /// 的容量路径语义：记录已占用 WAL 或等待落盘，最终未能送达即被
+    /// 显式拒绝——不静默覆盖，但计入损失）。`n` 为本批拒绝条数。
+    pub(crate) fn observe_capacity_rejected(&self, n: u64) {
+        if let Some(counter) = self.ack_dropped.as_ref() {
+            counter.add(n);
         }
     }
 

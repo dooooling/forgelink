@@ -114,23 +114,30 @@ async fn run_loop(
     let mut ticker = tokio::time::interval(Duration::from_millis(target.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut backoff = config.backoff();
+    // 首个 tick 立即触发（interval 语义），计划时刻即任务启动时刻，不产生
+    // 有意义的调度偏差——跳过观测（评审 P1：首次观测会记录接近一个完整
+    // interval 的假延迟，污染 p99）。
+    let mut first_tick = true;
 
     loop {
-        // 正常节奏：等待周期 tick（首次立即触发）。调度偏差观测（§34.2.1）：
-        // interval 的 tick 时刻即计划时刻，唤醒时刻与计划时刻的差为调度延迟；
-        // 首个 tick 立即触发，不产生有意义的偏差，跳过观测。
-        let planned = tokio::time::Instant::now() + Duration::from_millis(target.interval_ms);
+        // 正常节奏：等待周期 tick。调度偏差观测（§34.2.1）：`tick()` 返回
+        // 值是该次 tick 的**计划时刻**（scheduled），实际唤醒时刻与其差值
+        // 即调度延迟（评审 P1：此前用"本轮开始前预写的 planned"计算，
+        // 测的是上一轮处理耗时/剩余 slack，不是唤醒偏差，p99 数据不可信）。
         tokio::select! {
             _ = cancel.cancelled() => {
                 info!(component = "poll-engine", device_id = %target.device_id, "设备轮询任务已取消");
                 break;
             }
-            _ = ticker.tick() => {
-                let delay = planned.saturating_duration_since(tokio::time::Instant::now());
-                if delay > Duration::ZERO
-                    && let Some(hist) = metrics.schedule_delay_ns.as_ref()
-                {
-                    hist.observe_ns(delay.as_nanos() as u64);
+            scheduled = ticker.tick() => {
+                if first_tick {
+                    first_tick = false;
+                    continue;
+                }
+                // 调度延迟 = 实际唤醒 − 计划时刻（唤醒晚于计划为正偏差）。
+                let late = tokio::time::Instant::now().saturating_duration_since(scheduled);
+                if let Some(hist) = metrics.schedule_delay_ns.as_ref() {
+                    hist.observe_ns(late.as_nanos() as u64);
                 }
             }
         }

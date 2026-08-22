@@ -649,8 +649,8 @@ fn worker_loop(
         "Local Buffer 启动：已恢复未确认记录（分页加载，内存窗口 = memory_records）"
     );
     // 恢复的未确认记录计入 in-flight 基线（§34.2.1）：ACK / 过期清理时
-    // 同步扣减，镜像计数不漂移。
-    wal_metrics.observe_restored(state.mem.len() as i64);
+    // 同步扣减，镜像计数不漂移。磁盘占用基线同步入账（估算成本口径）。
+    wal_metrics.observe_restored(state.mem.len() as i64, bytes);
 
     let mut conn = conn;
     loop {
@@ -671,11 +671,12 @@ fn worker_loop(
         //（告警日志，计入"过期丢弃"），不阻塞新数据。
         let cutoff = crate::now_ns() as i64 - config.retention.as_nanos() as i64;
         match cleanup_expired(&mut conn, &mut state, cutoff) {
-            Ok(n) => {
+            Ok((n, expired_bytes)) => {
                 progress |= n > 0;
                 // 过期清理与 ACK 同为"离开未确认集合"，同步扣减 in-flight
-                //（§34.2.1 gauge 配对语义）。
-                wal_metrics.observe_expired(n);
+                // 与磁盘占用 gauge（§34.2.1 gauge 配对语义）；过期丢弃计入
+                // `wal_ack_dropped_total`（已落盘但最终未送达即被丢弃）。
+                wal_metrics.observe_expired(n, expired_bytes);
             }
             Err(e) => {
                 // 记录失败状态：清理失败时用短退避重试（评审 P2-1），
@@ -956,12 +957,12 @@ fn capacity_full(state: &WorkerState, config: &LocalBufferConfig, requested: u64
 ///
 /// **事务提交成功后才更新内存状态**（评审 P2-3）：中途删除失败时
 /// 内存队列与容量统计保持不变（记录仍可访问、容量不失真），错误
-/// 向上传播由 worker 记录告警。
+/// 向上传播由 worker 记录告警。返回 (清理条数, 释放的估算磁盘字节)。
 fn cleanup_expired(
     conn: &mut Connection,
     state: &mut WorkerState,
     cutoff_ns: i64,
-) -> Result<usize, LocalBufferError> {
+) -> Result<(usize, u64), LocalBufferError> {
     // 评审 P2-5：不假设队头时间戳单调（SystemTime 回拨后，队列
     // 后部的记录可能更早过期）——`take_while` 会被未过期的队头
     // 阻断，过期记录无法及时释放容量；改为过滤全部记录。
@@ -972,7 +973,7 @@ fn cleanup_expired(
         .cloned()
         .collect();
     if expired.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     // 事务内删除磁盘（提交成功前不修改任何内存状态）。
     let tx = conn.transaction()?;
@@ -993,9 +994,10 @@ fn cleanup_expired(
         component = "local-buffer",
         error_code = "local_buffer_expired_discard",
         deleted = expired.len(),
+        freed_bytes = removed_bytes,
         "保留时间到期，发送队列中的记录被显式丢弃（§103 过期策略；在途记录不受影响）"
     );
-    Ok(expired.len())
+    Ok((expired.len(), removed_bytes))
 }
 
 /// 推送一个 Batch（幂等：同 `message_id` 已存在时直接成功，不覆盖
@@ -1091,7 +1093,9 @@ fn push_inner(
     if requested > config.disk_max_bytes {
         // 单条记录成本已超过磁盘上限（评审 P1-1）：任何状态下
         // `bytes + requested > disk_max_bytes` 恒成立，背压等待将
-        // 永久阻塞并拖住后续请求——任何策略都立即显式拒绝。
+        // 永久阻塞并拖住后续请求——任何策略都立即显式拒绝。计入
+        // 容量路径丢弃（§34.2.1：显式拒绝 = 该 Batch 无法送达）。
+        wal_metrics.observe_capacity_rejected(1);
         let _ = reply.send(Err(LocalBufferError::CapacityExceeded {
             kind: CapacityKind::Disk,
             limit: config.disk_max_bytes,
@@ -1111,11 +1115,13 @@ fn push_inner(
             // 背压等待队列有界（P2-3，与内存窗口同界）：防止满盘时
             // 请求无限累积导致内存无界增长——超出后即使策略为
             // Backpressure 也显式拒绝（不静默覆盖、不无限堆积）。
+            wal_metrics.observe_capacity_rejected(1);
             let _ = reply.send(Err(err()));
             return PushOutcome::Handled;
         }
         match config.capacity_policy {
             CapacityPolicy::Reject => {
+                wal_metrics.observe_capacity_rejected(1);
                 let _ = reply.send(Err(err()));
                 return PushOutcome::Handled;
             }
@@ -1176,9 +1182,10 @@ fn insert_record(conn: &mut Connection, record: &MemRecord) -> Result<(), LocalB
     Ok(())
 }
 
-/// 落盘并观测耗时（§34.2.1 `wal_persist_ns_hist`）；成功时 in-flight
-/// gauge +1（新记录进入未确认集合）。仅此包装路径计指标——恢复加载、
-/// 幂等命中等非落盘路径不产生观测。
+/// 落盘并观测耗时与磁盘占用（§34.2.1 `wal_persist_ns_hist` /
+/// `wal_disk_bytes_gauge`）；成功时 in-flight gauge +1、磁盘占用
+/// gauge +成本（新记录进入未确认集合并占用 WAL）。仅此包装路径计
+/// 指标——恢复加载、幂等命中等非落盘路径不产生观测。
 fn insert_record_timed(
     conn: &mut Connection,
     record: &MemRecord,
@@ -1186,7 +1193,7 @@ fn insert_record_timed(
 ) -> Result<(), LocalBufferError> {
     let started = std::time::Instant::now();
     insert_record(conn, record)?;
-    wal_metrics.observe_persisted(started.elapsed().as_nanos() as u64);
+    wal_metrics.observe_persisted(started.elapsed().as_nanos() as u64, record_cost(record));
     Ok(())
 }
 
@@ -1265,9 +1272,10 @@ fn handle_ack(
     if deleted > 0
         && let Some(record) = state.inflight.remove(&local_seq)
     {
-        // 容量统计用估算成本，ACK 释放也按同一口径扣减。
+        // 容量统计用估算成本，ACK 释放也按同一口径扣减（磁盘占用 gauge
+        // 与容量记账同路径配对）。
         state.bytes = state.bytes.saturating_sub(record_cost(&record));
-        wal_metrics.observe_acked();
+        wal_metrics.observe_acked(record_cost(&record));
     }
     Ok(())
 }

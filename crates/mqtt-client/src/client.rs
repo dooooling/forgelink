@@ -123,6 +123,10 @@ struct PublishRequest {
     /// 立即从在线跟踪中移除该设备——含尚未转发的在线重发条目与待重发
     /// 队列——重连时不得再标记在线（§31.1）。
     deregister: bool,
+    /// 请求被 worker 接受（校验通过进入 pending）的时刻：PUBACK resolve
+    /// 时据此观测发布往返耗时（§34.2.1 `mqtt_publish_ns_hist`；断线重发
+    /// 后确认的耗时同样覆盖——同一 resolve 路径）。
+    accepted_at: Instant,
     ack_tx: oneshot::Sender<Result<(), MqttClientError>>,
 }
 
@@ -159,6 +163,9 @@ struct AwaitingAck {
     /// 保持重排后与 rumqttc 一致（否则二次断线后 PUBACK 会关联到
     /// 错误的请求，§31.4）。
     leftover: bool,
+    /// 请求被 worker 接受的时刻（自 [`PublishRequest`] 转入）：PUBACK
+    /// resolve 时观测发布往返耗时（§34.2.1 `mqtt_publish_ns_hist`）。
+    accepted_at: Instant,
     ack_tx: oneshot::Sender<Result<(), MqttClientError>>,
 }
 
@@ -399,6 +406,9 @@ impl MqttClient {
             online_status,
             status_ids,
             deregister,
+            // 起始时刻取构造点（入队前）：PUBACK resolve 时观测完整
+            // 往返（§34.2.1 `mqtt_publish_ns_hist`）。
+            accepted_at: Instant::now(),
             ack_tx,
         };
         self.request_tx
@@ -1462,6 +1472,7 @@ fn forward_pending(
                     // 本轮会话新转发：断线时位于 rumqttc 通道（重发顺序最末）。
                     leftover: false,
                     parked_pkid: None,
+                    accepted_at: req.accepted_at,
                     ack_tx: req.ack_tx,
                 });
                 forwarded += 1;
@@ -1502,6 +1513,7 @@ fn make_online_status_request(site_id: &str, device_id: &str) -> Option<PublishR
         online_status: true,
         status_ids: Some((site_id.to_owned(), device_id.to_owned())),
         deregister: false,
+        accepted_at: Instant::now(),
         ack_tx,
     })
 }
@@ -1521,6 +1533,7 @@ fn make_offline_status_request(site_id: &str, device_id: &str) -> Option<Publish
         online_status: false,
         status_ids: Some((site_id.to_owned(), device_id.to_owned())),
         deregister: false,
+        accepted_at: Instant::now(),
         ack_tx,
     })
 }
@@ -1737,6 +1750,9 @@ fn on_await_ack_event(
 fn resolve_puback(awaiting_ack: &mut VecDeque<AwaitingAck>, pkid: u16, mqtt_metrics: &MqttMetrics) {
     if let Some(index) = awaiting_ack.iter().position(|e| e.pkid == Some(pkid)) {
         let entry = awaiting_ack.remove(index).expect("position 与 remove 一致");
+        // §34.2.1：发布往返耗时（请求接受 → PUBACK resolve；断线重发后
+        // 确认的耗时同样覆盖——同一 resolve 路径）。
+        mqtt_metrics.observe_publish_latency(entry.accepted_at.elapsed());
         mqtt_metrics.observe_published();
         let _ = entry.ack_tx.send(Ok(()));
         trace!(
@@ -2930,6 +2946,7 @@ mod tests {
                 leftover,
                 parked_pkid: None,
                 ack_tx,
+                accepted_at: Instant::now(),
             }
         };
         // 模拟二次断线瞬间的队列（插入顺序刻意打乱）：
@@ -2983,6 +3000,7 @@ mod tests {
             leftover: true,
             parked_pkid,
             ack_tx: oneshot::channel().0,
+            accepted_at: Instant::now(),
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：已写出（pkid 1，未确认）
@@ -3092,6 +3110,7 @@ mod tests {
             leftover: false,
             parked_pkid,
             ack_tx: oneshot::channel().0,
+            accepted_at: Instant::now(),
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3204,6 +3223,7 @@ mod tests {
             leftover: false,
             parked_pkid,
             ack_tx: oneshot::channel().0,
+            accepted_at: Instant::now(),
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3297,6 +3317,7 @@ mod tests {
             leftover: false,
             parked_pkid,
             ack_tx: oneshot::channel().0,
+            accepted_at: Instant::now(),
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3308,6 +3329,7 @@ mod tests {
             leftover: false,
             parked_pkid: None,
             ack_tx: e_ack_tx,
+            accepted_at: Instant::now(),
         });
         awaiting.push_back(entry(None, None)); //    F：第二个碰撞消息（pkid 2）
         awaiting.push_back(entry(None, None)); //    G：通道中新转发

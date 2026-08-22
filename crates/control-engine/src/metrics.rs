@@ -3,10 +3,22 @@
 //! 句柄在装配期注册一次并放入 [`EngineContext`](crate::engine::EngineContext)
 //! 共享；`Counter` / `Gauge` 为内部 `Arc` 原子量的轻量克隆，未注入
 //! registry 时全 no-op。队列深度 gauge 的增减发生在多设备 worker 与提交
-//! 线程之间（并发），镜像计数用原子量维护。
+//! 线程之间（并发）——直接用 [`Gauge`] 的原子 `add`/`sub_saturating`
+//! 操作单一底层值（评审 P1：镜像变量 + `set` 会因两次原子操作交错产生
+//! 后写覆盖前写/丢失递减，已废弃）。
+//!
+//! # per-device 维度（§34.2.1 有界采样）
+//!
+//! `queue_depth_device` 按设备拆分队列深度：名称格式
+//! `control_queue_depth_device_{device_id}`。§34.2.1 禁止运行期拼接
+//! **任意**维度值，但本维度的取值来自**静态配置的设备清单**（Device
+//! Catalog 装配期固定、数量有界且可枚举），不是任意外部输入——采用
+//! "装配期不可知、首见注册"的折衷：首次观测某设备时注册其 gauge，
+//! [`MAX_METRICS`](metrics::MAX_METRICS) 兜底超限（理论上不可能：
+//! 设备数有界）降级为只更新全局聚合。
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use metrics::{Counter, Gauge, MetricsRegistry};
 use observation_model::ControlStatus;
@@ -15,6 +27,9 @@ use observation_model::ControlStatus;
 pub(crate) mod metric_names {
     /// 控制队列深度（排队 + 执行中；入队 +1、结算 -1）。
     pub const CONTROL_QUEUE_DEPTH_GAUGE: &str = "control_queue_depth_gauge";
+    /// per-device 队列深度前缀：完整名 =
+    /// `{PREFIX}{device_id}`（维度值来自静态设备清单，见模块文档）。
+    pub const CONTROL_QUEUE_DEPTH_DEVICE_PREFIX: &str = "control_queue_depth_device_";
     /// 结算为 Succeeded（§80.1 终态）。
     pub const CONTROL_SETTLED_SUCCEEDED_TOTAL: &str = "control_settled_succeeded_total";
     /// 结算为 Failed（§80.1 终态）。
@@ -36,11 +51,15 @@ pub(crate) mod metric_names {
 /// 本组件的指标句柄集合（装配期注册一次；`None` = 不埋点）。
 #[derive(Clone, Default)]
 pub struct ControlMetrics {
-    /// 队列深度 gauge（全引擎聚合，不做 per-device 维度——§34.2.1
-    /// 禁止运行时拼接任意维度值）。
+    /// 队列深度 gauge（全引擎聚合；并发增减经 Gauge 原生原子
+    /// add/sub_saturating，无镜像变量）。
     queue_depth: Option<Gauge>,
-    /// 队列深度的全局镜像（入队 +1 / 结算 -1 跨线程配对）。
-    queue_depth_value: Arc<AtomicI64>,
+    /// per-device 队列深度 gauge（首见注册，有界化见模块文档）。
+    ///
+    /// `None` = 未注入 registry（不建 map）；`Some(map)` 内条目数受
+    /// 设备清单约束 + [`MAX_METRICS`](metrics::MAX_METRICS) 兜底。
+    /// `Arc<Mutex<..>>`：本结构体被 Clone 共享（worker/提交线程各持句柄）。
+    queue_depth_device: Option<(Arc<MetricsRegistry>, Arc<Mutex<HashMap<String, Gauge>>>)>,
     /// 六个终态计数器。
     settled_succeeded: Option<Counter>,
     settled_failed: Option<Counter>,
@@ -65,7 +84,10 @@ impl ControlMetrics {
         };
         Self {
             queue_depth: Some(registry.gauge(metric_names::CONTROL_QUEUE_DEPTH_GAUGE)),
-            queue_depth_value: Arc::new(AtomicI64::new(0)),
+            // per-device gauge 首见注册：registry 引用 + map 常驻，条目在
+            // 首次观测时经 registry 注册创建（MAX_METRICS 兜底超限返回
+            // no-op 句柄，深度更新降级为只动全局聚合）。
+            queue_depth_device: Some((Arc::clone(registry), Arc::new(Mutex::new(HashMap::new())))),
             settled_succeeded: Some(
                 registry.counter(metric_names::CONTROL_SETTLED_SUCCEEDED_TOTAL),
             ),
@@ -85,24 +107,48 @@ impl ControlMetrics {
         }
     }
 
-    /// 入队成功：队列深度 +1。
+    /// 取（首见时注册）指定设备的队列深度 gauge。
     ///
-    /// 由 [`crate::queue`] 的入队在持有队列锁的临界区外调用；
-    /// 原子镜像保证跨线程配对不丢失。
-    pub(crate) fn observe_enqueued(&self) {
+    /// 名称 = [`metric_names::CONTROL_QUEUE_DEPTH_DEVICE_PREFIX`] +
+    /// `device_id`。设备 ID 来自静态设备清单（数量有界），registry 的
+    /// MAX_METRICS 兜底超限（返回 no-op 句柄——只影响该维度观测，
+    /// 不影响正确性）。锁内操作仅发生在首见注册（低频）；命中路径是
+    /// 一次 HashMap 查找 + 句柄克隆，不在 registry 锁上。
+    fn device_gauge(&self, device_id: &str) -> Option<Gauge> {
+        let (registry, map) = self.queue_depth_device.as_ref()?;
+        let mut map = map.lock().expect("queue_depth_device 锁被毒化");
+        if let Some(gauge) = map.get(device_id) {
+            return Some(gauge.clone());
+        }
+        let name = format!(
+            "{}{device_id}",
+            metric_names::CONTROL_QUEUE_DEPTH_DEVICE_PREFIX
+        );
+        let gauge = registry.gauge(&name);
+        map.insert(device_id.to_owned(), gauge.clone());
+        Some(gauge)
+    }
+
+    /// 入队成功：全局与 per-device 队列深度 +1。
+    ///
+    /// 由 [`crate::queue`] 的入队在持有队列锁的临界区外调用；Gauge 原生
+    /// 原子加保证跨线程配对不丢失（单一底层值，评审 P1）。
+    pub(crate) fn observe_enqueued(&self, device_id: &str) {
         if let Some(gauge) = self.queue_depth.as_ref() {
-            let value = self.queue_depth_value.fetch_add(1, Ordering::Relaxed) + 1;
-            gauge.set(value.max(0));
+            gauge.add(1);
+        }
+        if let Some(gauge) = self.device_gauge(device_id) {
+            gauge.add(1);
         }
     }
 
-    /// 结算完成（任何终态）：队列深度 -1（饱和于 0）。
-    pub(crate) fn observe_settled_exit(&self) {
+    /// 结算完成（任何终态）：全局与 per-device 队列深度 -1（饱和于 0）。
+    pub(crate) fn observe_settled_exit(&self, device_id: &str) {
         if let Some(gauge) = self.queue_depth.as_ref() {
-            let current = self.queue_depth_value.load(Ordering::Relaxed);
-            let next = current.saturating_sub(1);
-            self.queue_depth_value.store(next, Ordering::Relaxed);
-            gauge.set(next);
+            gauge.sub_saturating(1);
+        }
+        if let Some(gauge) = self.device_gauge(device_id) {
+            gauge.sub_saturating(1);
         }
     }
 

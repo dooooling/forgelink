@@ -20,6 +20,30 @@ use tracing_subscriber::fmt::MakeWriter;
 /// 通道容量（行数）。满时丢弃新行。
 const CHANNEL_LINES: usize = 8_192;
 
+/// 日志丢弃计数（§34.2.1 自诊断：log pipeline 自身健康度）。
+///
+/// 非阻塞 writer 的 `try_send` 满时静默丢弃事件行——这是唯一"观测不到
+/// 自己丢了什么"的路径，必须自计数。diagnostics 是零依赖底层 crate，
+/// **不得**反向依赖 metrics：用裸进程级原子量 + [`dropped_log_count`]
+/// 公开读取函数；§34.2.1 的门面聚合（collector 装配时同步进 metrics
+/// registry 的 counter 或 REST 快照）由上层完成。
+static DROPPED_LOG_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 已被丢弃的日志事件行总数（进程启动以来累计，饱和于 u64::MAX）。
+///
+/// 丢弃发生在锁/热路径（`try_send` 满分支），实现为单次原子加；
+/// 读取为一次 `Relaxed` load——仅用于运维自检与指标聚合，不参与
+/// 同步。
+///
+/// TODO(collector-bridge)：§34.2.1 的门面聚合由上层做——collector
+/// 装配时周期性（或快照前）把 [`dropped_log_count`] 同步进 metrics
+/// registry 的 counter（建议名 `diagnostics_dropped_logs_total`，用
+/// `Counter::add(delta)` 增量同步避免重复计入），或直接并入 REST
+/// `/api/v1/metrics` 快照；本 crate 保持零依赖，不反向依赖 metrics。
+pub fn dropped_log_count() -> u64 {
+    DROPPED_LOG_LINES.load(Ordering::Relaxed)
+}
+
 /// 关闭后刷写线程的轮询间隔：关闭事件最多延迟该时长生效。
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
@@ -120,8 +144,17 @@ fn write_line(line: &[u8]) -> bool {
 
 impl io::Write for NonBlockingWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if !self.inner.closed.load(Ordering::Relaxed) {
-            let _ = self.inner.tx.try_send(buf.to_vec().into_boxed_slice());
+        if !self.inner.closed.load(Ordering::Relaxed)
+            && self
+                .inner
+                .tx
+                .try_send(buf.to_vec().into_boxed_slice())
+                .is_err()
+        {
+            // 通道满：新行被丢弃（日志丢帧优先于阻塞采集路径，§5）。
+            // 自诊断计数（§34.2.1 log pipeline 健康度）；热路径上只做
+            // 一次原子加。
+            DROPPED_LOG_LINES.fetch_add(1, Ordering::Relaxed);
         }
         Ok(buf.len())
     }

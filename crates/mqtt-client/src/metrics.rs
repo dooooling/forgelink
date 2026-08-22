@@ -7,13 +7,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use metrics::{Counter, Gauge, MetricsRegistry};
+use metrics::{Counter, Gauge, Histogram, MetricsRegistry};
 
 /// 静态指标名清单（§34.2.1 规范表）。
 pub(crate) mod metric_names {
     /// 在途（已入队等待 PUBACK）发布数：请求进入 worker 队列 +1、
     /// PUBACK 确认 / 失败结算 -1。
     pub const MQTT_INFLIGHT_GAUGE: &str = "mqtt_inflight_gauge";
+    /// 发布往返耗时（ns 直方图）：请求被 worker 接受 → PUBACK resolve；
+    /// 断线重发后确认的耗时同样覆盖（同一 resolve 路径）。
+    pub const MQTT_PUBLISH_NS_HIST: &str = "mqtt_publish_ns_hist";
     /// 已确认送达的发布数（收到 broker PUBACK）。
     pub const MQTT_PUBLISHED_TOTAL: &str = "mqtt_published_total";
     /// 断线重发计数：断线时存在未确认在途消息即 +1（重连后由 rumqttc
@@ -34,6 +37,8 @@ pub struct MqttMetrics {
     inflight: Option<Gauge>,
     /// 在途发布数的镜像值（worker 单线程访问）。
     inflight_value: Arc<AtomicI64>,
+    /// 发布往返耗时直方图（ns）。
+    publish_ns: Option<Histogram>,
     /// 已确认发布计数器。
     published: Option<Counter>,
     /// 断线重发计数器。
@@ -47,6 +52,7 @@ impl Default for MqttMetrics {
         Self {
             inflight: None,
             inflight_value: Arc::new(AtomicI64::new(0)),
+            publish_ns: None,
             published: None,
             redelivered: None,
             failed: None,
@@ -68,6 +74,7 @@ impl MqttMetrics {
         Self {
             inflight: Some(registry.gauge(metric_names::MQTT_INFLIGHT_GAUGE)),
             inflight_value: Arc::new(AtomicI64::new(0)),
+            publish_ns: Some(registry.histogram(metric_names::MQTT_PUBLISH_NS_HIST)),
             published: Some(registry.counter(metric_names::MQTT_PUBLISHED_TOTAL)),
             redelivered: Some(registry.counter(metric_names::MQTT_REDELIVERED_TOTAL)),
             failed: Some(registry.counter(metric_names::MQTT_FAILED_TOTAL)),
@@ -95,6 +102,14 @@ impl MqttMetrics {
             counter.inc();
         }
         self.bump_inflight(-1);
+    }
+
+    /// 观测一次发布往返耗时（请求接受 → PUBACK resolve，§34.2.1
+    /// `mqtt_publish_ns_hist`；断线重发后确认同样覆盖）。
+    pub(crate) fn observe_publish_latency(&self, elapsed: std::time::Duration) {
+        if let Some(hist) = self.publish_ns.as_ref() {
+            hist.observe_ns(elapsed.as_nanos() as u64);
+        }
     }
 
     /// 记录一次成功入队（请求进入 worker 待发队列）：in-flight +1。

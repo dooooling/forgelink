@@ -189,6 +189,9 @@ impl DeviceQueue {
         entry: QueuedEntry,
         ctx: &Arc<EngineContext>,
     ) -> Result<(), EnqueueError> {
+        // §34.2.1：入队成功，队列深度 +1（全局与 per-device；结算时 -1 配对）。
+        // device_id 须在 push_back 消耗 entry 前取出。
+        let device_id = entry.key.device_id.clone();
         {
             let mut inner = self.inner.lock().expect("DeviceQueue 锁被毒化");
             // P1-A：引擎已停机则拒绝——停机排空后重建的队列也必须拒绝，
@@ -205,8 +208,7 @@ impl DeviceQueue {
             inner.entries.entry(priority).or_default().push_back(entry);
             inner.len += 1;
         }
-        // §34.2.1：入队成功，队列深度 +1（结算时 -1 配对）。
-        ctx.metrics.observe_enqueued();
+        ctx.metrics.observe_enqueued(&device_id);
         self.ensure_worker();
         self.notify.notify_one();
         Ok(())
@@ -900,8 +902,9 @@ async fn settle_entry(
     deadline: Option<Instant>,
 ) {
     let completed_at_ns = now_ns();
-    // §34.2.1：本条目离开队列（结算完成），深度 -1；终态计数按状态归类。
-    ctx.metrics.observe_settled_exit();
+    // §34.2.1：本条目离开队列（结算完成），深度 -1（全局与 per-device）；
+    // 终态计数按状态归类。
+    ctx.metrics.observe_settled_exit(&entry.key.device_id);
     let mut result = match run {
         RunResult::Done(result) => result,
         RunResult::Timeout => ControlResult {
