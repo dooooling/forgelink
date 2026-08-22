@@ -168,6 +168,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "driver-sdk",
+ "metrics",
  "observation-model",
  "profile-engine",
  "serde",
@@ -229,6 +230,7 @@ name = "data-pipeline"
 version = "0.1.0"
 dependencies = [
  "diagnostics",
+ "metrics",
  "observation-model",
  "serde",
  "tokio",
@@ -693,6 +695,7 @@ name = "local-buffer"
 version = "0.1.0"
 dependencies = [
  "data-pipeline",
+ "metrics",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -782,6 +785,7 @@ name = "mqtt-client"
 version = "0.1.0"
 dependencies = [
  "data-pipeline",
+ "metrics",
  "rcgen",
  "ring",
  "rumqttc",
@@ -875,6 +879,7 @@ dependencies = [
  "diagnostics",
  "driver-loader",
  "driver-sdk",
+ "metrics",
  "observation-model",
  "tokio",
  "tokio-util",
@@ -972,6 +977,7 @@ dependencies = [
  "axum",
  "control-engine",
  "driver-sdk",
+ "metrics",
  "mqtt-client",
  "observation-model",
  "profile-engine",

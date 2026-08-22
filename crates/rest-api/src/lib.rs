@@ -89,8 +89,8 @@ pub use control::{
 };
 pub use error::{ApiError, ErrorCode, ErrorResponse, RequestId};
 pub use models::{
-    ApiSnapshot, BufferView, DeviceView, GroupView, HealthResponse, HealthStatus, MqttView,
-    PropertyView, ResourceView,
+    ApiSnapshot, BufferView, DeviceView, GroupView, HealthResponse, HealthStatus, MetricView,
+    MetricsResponse, MqttView, PropertyView, ResourceView,
 };
 pub use server::{RestApiServer, RestConfig};
 pub use state::{ApiState, StateError};
@@ -100,6 +100,9 @@ pub const API_PREFIX: &str = "/api/v1";
 
 /// 健康检查端点的完整路径（§104 Health endpoint）。
 pub const HEALTH_PATH: &str = "/api/v1/health";
+
+/// 指标快照端点的完整路径（§34.2.1；管理接口，非控制面）。
+pub const METRICS_PATH: &str = "/api/v1/metrics";
 
 /// 当前时间纳秒（i64，UNIX 时间；request_id 前缀与时间戳语义）。
 pub fn now_ns() -> i64 {

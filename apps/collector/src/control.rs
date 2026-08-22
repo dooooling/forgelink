@@ -227,6 +227,7 @@ pub(crate) fn assemble(statics: ControlStatic, manager: &Arc<DeviceManager>) -> 
         executor,
         audit: Arc::new(TracingAuditSink),
         policy: statics.policy,
+        metrics: None,
     });
 
     // REST 适配层：namespace/默认超时来自 control 配置（§32.2 服务端

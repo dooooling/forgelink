@@ -330,6 +330,7 @@ impl CollectorRuntime {
                                 rest_api::RestConfig {
                                     listen,
                                     max_concurrency: config.rest.max_concurrency,
+                                    metrics: None,
                                 },
                             )
                             .await
@@ -340,6 +341,7 @@ impl CollectorRuntime {
                                 rest_api::RestConfig {
                                     listen,
                                     max_concurrency: config.rest.max_concurrency,
+                                    metrics: None,
                                 },
                             )
                             .await
@@ -353,6 +355,7 @@ impl CollectorRuntime {
                         rest_api::RestConfig {
                             listen,
                             max_concurrency: config.rest.max_concurrency,
+                            metrics: None,
                         },
                     )
                     .await
