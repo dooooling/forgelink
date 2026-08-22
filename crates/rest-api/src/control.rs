@@ -970,7 +970,7 @@ fn map_engine_submit_error(err: &SubmitError) -> ApiError {
         SubmitError::Conflict { .. } => ApiError::control(
             ErrorCode::StateConflict,
             "IDEMPOTENCY_CONFLICT",
-            "同 request_id 已存在不同 payload 的控制记录（§80.1），请更换 request_id 重试",
+            "同 request_id 已存在不同 payload 的控制记录（§80.1），请先确认原请求状态；仅在确认这是独立的新控制动作时使用新的 request_id",
         ),
         // 引擎停机与未来新增变体统一按服务端暂不可用处理（503）：当前
         // 版本授权失败以 Rejected 收据返回（INSUFFICIENT_ROLE → 403，见
