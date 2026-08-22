@@ -10,8 +10,9 @@
 //!   运行时锁跨 `await`；
 //! - 优雅停机：停止后拒绝新连接，在途请求限时排空（独立任务，不
 //!   阻塞采集/WAL/MQTT）；
-//! - 未匹配路径与不支持的方法统一返回 §31.6 错误载荷（控制路由
-//!   [`crate::models`] 只读契约之外不可达）。
+//! - 未匹配路径与不支持的方法统一返回 §31.6 错误载荷（控制路由仅在
+//!   `control` feature 且 [`RestApiServer::spawn_with_control`] 装配时
+//!   存在；[`RestApiServer::spawn`] 与只读构建下控制路由不可达——404/405）。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -38,7 +39,7 @@ use crate::models::{
 use crate::state::{ApiState, map_state_error};
 
 /// 统一 handler 返回类型：错误携带 `request_id`（§31.6）。
-type ApiResult<T> = Result<T, ApiErrorResponse>;
+pub(crate) type ApiResult<T> = Result<T, ApiErrorResponse>;
 
 /// 带 `request_id` 的 API 错误（newtype 以满足 `IntoResponse` 孤儿规则）。
 pub struct ApiErrorResponse(pub RequestId, pub ApiError);
@@ -103,14 +104,55 @@ pub struct RestApiServer {
 impl RestApiServer {
     /// 绑定并启动服务器（独立任务；`state` 为只读快照提供者）。
     ///
+    /// 只读接口：**不挂载控制路由**（即使启用 `control` feature）——需要
+    /// 控制端点时使用 [`Self::spawn_with_control`]（feature 门控）。这保证
+    /// 只读构建与只读装配语义一致：控制路由不存在（404/405）。
+    ///
     /// # Errors
     ///
-    /// 监听地址绑定失败（占用/权限等）时返回错误，调用方应显式失败
-    /// 启动（不静默降级）。
+    /// 监听地址绑定失败（占用/权限等）或并发配置非法时返回错误，调用方
+    /// 应显式失败启动（不静默降级）。
     pub async fn spawn(
         state: Arc<dyn ApiState>,
         config: RestConfig,
     ) -> Result<Self, std::io::Error> {
+        Self::validate_config(&config)?;
+        let listener = TcpListener::bind(config.listen).await?;
+        let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
+        let app = router(state, concurrency);
+        Self::serve(listener, app, config).await
+    }
+
+    /// 绑定并启动带控制端点的服务器（§31.5 控制链路；`control` feature）。
+    ///
+    /// 在只读路由之上合并控制路由（`POST /api/v1/devices/{device_id}/controls`
+    /// 与 `GET /api/v1/devices/{device_id}/control-requests/{request_id}`），
+    /// 共用同一并发门控；所有控制端点要求 Bearer 认证（§90.2）。listen 地址
+    /// 必须为 **loopback**（评审二轮 P2，[`Self::validate_config`] 之外的额外
+    /// 校验）。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::spawn`]；另：listen 非 loopback（§90.2 MVP 控制面仅允许
+    /// loopback 直连，远程访问须经 TLS 反向代理转发）时返回
+    /// `InvalidInput` 配置错误——collector 配置层已先行校验，此处对直接
+    /// 构造的 [`RestConfig`] 兜底拒绝（纵深防御）。
+    #[cfg(feature = "control")]
+    pub async fn spawn_with_control(
+        state: Arc<dyn ApiState>,
+        control: crate::control::ControlGateway,
+        config: RestConfig,
+    ) -> Result<Self, std::io::Error> {
+        Self::validate_config(&config)?;
+        Self::validate_control_listen(config.listen)?;
+        let listener = TcpListener::bind(config.listen).await?;
+        let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
+        let app = router_with_control(state, control, concurrency);
+        Self::serve(listener, app, config).await
+    }
+
+    /// 并发配置校验（评审 P2：0 与超上限都拒绝而非静默修正/崩溃）。
+    fn validate_config(config: &RestConfig) -> Result<(), std::io::Error> {
         // 评审 P2：`Semaphore::new` 对超过 `MAX_PERMITS` 的 permits 会
         // panic。配置层（collector config）已先行校验，此处兜底拒绝
         // 直接构造的 `RestConfig`，返回错误而非崩溃。
@@ -131,15 +173,42 @@ impl RestApiServer {
                 "rest.max_concurrency 必须大于 0",
             ));
         }
-        let listener = TcpListener::bind(config.listen).await?;
+        Ok(())
+    }
+
+    /// 控制装配的 listen 地址校验（评审二轮 P2，§90.2）：必须 loopback
+    /// （IPv4 `127.0.0.0/8`、IPv6 `::1`）。远程访问须经 TLS 反向代理转发，
+    /// 而 MVP 无原生 TLS——非 loopback 监听会让控制端点绕过该约束直接
+    /// 对外暴露。collector 配置层（启用 control 时）已先行校验，此处对
+    /// 直接构造的 [`RestConfig`] 兜底拒绝；只读 [`Self::spawn`] 不受此限
+    /// （§90.1 允许显式配置非 loopback 的只读接口）。
+    #[cfg(feature = "control")]
+    fn validate_control_listen(addr: SocketAddr) -> Result<(), std::io::Error> {
+        if addr.ip().is_loopback() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "控制端点仅允许 loopback 监听（当前 {addr}）：§90.2 MVP 控制面\
+                 仅允许 loopback 直连（IPv4 127.0.0.0/8、IPv6 ::1），远程访问\
+                 须经 TLS 反向代理转发"
+            ),
+        ))
+    }
+
+    /// 启动 serve 任务（绑定已完成；只读与控制装配共用此逻辑）。
+    async fn serve(
+        listener: TcpListener,
+        app: Router,
+        config: RestConfig,
+    ) -> Result<Self, std::io::Error> {
         let addr = listener.local_addr()?;
         let (stop_tx, stop_rx) = watch::channel(false);
         // 异常退出通知通道（评审 P2）：serve 任务错误退出时置 true，
         // 正常停机（stop 信号触发的优雅退出）不触发。
         let (exit_tx, exit_rx) = watch::channel(false);
         let exit_tx_task = exit_tx.clone();
-        let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
-        let app = router(state, concurrency);
         let alive = Arc::new(AtomicBool::new(true));
         let alive_task = Arc::clone(&alive);
 
@@ -166,7 +235,7 @@ impl RestApiServer {
             component = "rest-api",
             addr = %addr,
             max_concurrency = config.max_concurrency,
-            "REST v1 只读接口已启动（loopback 默认绑定）"
+            "REST v1 接口已启动（loopback 默认绑定）"
         );
         Ok(Self {
             stop: stop_tx,
@@ -220,18 +289,17 @@ impl RestApiServer {
     pub async fn shutdown(&self) {
         let _ = self.stop.send(true);
         let mut guard = self.join.lock().await;
-        if let Some(handle) = guard.as_mut() {
-            if tokio::time::timeout(SHUTDOWN_GRACE, &mut *handle)
+        if let Some(handle) = guard.as_mut()
+            && tokio::time::timeout(SHUTDOWN_GRACE, &mut *handle)
                 .await
                 .is_err()
-            {
-                warn!(component = "rest-api", "REST 停机排空超时，强制取消");
-                // 强制 abort 不经过 serve 任务内部的 alive=false 置位
-                // （评审 P2），此处显式清除存活标记，调用方不得继续误报。
-                self.alive.store(false, Ordering::SeqCst);
-                handle.abort();
-                let _ = handle.await;
-            }
+        {
+            warn!(component = "rest-api", "REST 停机排空超时，强制取消");
+            // 强制 abort 不经过 serve 任务内部的 alive=false 置位
+            // （评审 P2），此处显式清除存活标记，调用方不得继续误报。
+            self.alive.store(false, Ordering::SeqCst);
+            handle.abort();
+            let _ = handle.await;
         }
         // 释放句柄：任务已结束（优雅退出或 abort 后等待完成），后续
         // 重复调用不再重复等待/排空。
@@ -243,8 +311,39 @@ impl RestApiServer {
 /// 组装只读路由（§31.5 最小资源路径 + §104 健康检查）。
 ///
 /// 未匹配路径（404）与不支持的 method（405）都返回统一 §31.6 错误
-/// 载荷（含 request_id）；`/controls` 等控制路由不存在于本只读契约。
-fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
+/// 载荷（含 request_id）；`/controls` 等控制路由不存在于本只读契约
+/// （启用 `control` feature 时也仅 [`Self::spawn_with_control`] 挂载，
+/// 本函数保持纯只读语义，供既有调用方与测试复用）。
+pub(crate) fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
+    base_router(state, concurrency)
+        .fallback(fallback_not_found)
+        .method_not_allowed_fallback(fallback_method_not_allowed)
+        // request_id 层必须在全部路由合并之后应用：axum 的 `.layer` 只
+        // 包裹已注册的路由，后合并进来的控制路由也要经过同一层（§31.6
+        // 贯穿日志与错误响应依赖该层注入的 `RequestId` extension）。
+        .layer(middleware::from_fn(request_id_layer))
+}
+
+/// 组装只读 + 控制路由（§31.5 控制链路；`control` feature 门控）。
+///
+/// 控制路由与只读路由共用同一并发门控（全局有界，§90.1）；fallback 与
+/// `request_id` 层在合并后统一应用。
+#[cfg(feature = "control")]
+pub(crate) fn router_with_control(
+    state: Arc<dyn ApiState>,
+    control: crate::control::ControlGateway,
+    concurrency: Arc<Semaphore>,
+) -> Router {
+    base_router(state, concurrency.clone())
+        .merge(crate::control::control_router(control, concurrency))
+        .fallback(fallback_not_found)
+        .method_not_allowed_fallback(fallback_method_not_allowed)
+        .layer(middleware::from_fn(request_id_layer))
+}
+
+/// 只读路由集合（不含 fallback 与中间件；由 [`router`] /
+/// [`router_with_control`] 统一收尾）。
+fn base_router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
     Router::new()
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/devices/{device_id}", get(device))
@@ -252,9 +351,6 @@ fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
         .route("/api/v1/devices/{device_id}/properties", get(properties))
         .route(HEALTH_PATH, get(health))
         .with_state(AppState { state, concurrency })
-        .fallback(fallback_not_found)
-        .method_not_allowed_fallback(fallback_method_not_allowed)
-        .layer(middleware::from_fn(request_id_layer))
 }
 
 /// 未匹配路径（404，§31.6 统一错误载荷）。
@@ -263,6 +359,7 @@ async fn fallback_not_found(axum::Extension(id): axum::Extension<RequestId>) -> 
         id,
         ApiError {
             code: ErrorCode::ResourceNotFound,
+            code_override: None,
             message: "接口路径不存在".to_owned(),
             details: serde_json::Value::Object(Default::default()),
         },
@@ -276,6 +373,7 @@ async fn fallback_method_not_allowed(axum::Extension(id): axum::Extension<Reques
         id,
         ApiError {
             code: ErrorCode::MethodNotAllowed,
+            code_override: None,
             message: "接口不支持该 HTTP 方法".to_owned(),
             details: serde_json::Value::Object(Default::default()),
         },
@@ -311,11 +409,13 @@ async fn request_id_layer(req: Request<axum::body::Body>, next: Next) -> Respons
 }
 
 /// 每个 handler 前的有界并发门控：获取信号量，超时 → 503。
-async fn acquire(
-    state: &AppState,
+///
+/// 只读与控制路由共用同一 `Semaphore`（全局有界并发，§90.1）。
+pub(crate) async fn acquire(
+    concurrency: &Arc<Semaphore>,
     id: &RequestId,
 ) -> Result<tokio::sync::OwnedSemaphorePermit, ApiErrorResponse> {
-    match tokio::time::timeout(CONCURRENCY_WAIT, state.concurrency.clone().acquire_owned()).await {
+    match tokio::time::timeout(CONCURRENCY_WAIT, concurrency.clone().acquire_owned()).await {
         Ok(Ok(permit)) => Ok(permit),
         Ok(Err(_)) => Err(ApiErrorResponse(
             id.clone(),
@@ -377,8 +477,8 @@ fn validate_device_id(
 /// 非法 URL 编码（如 `%FF` 解码为非法 UTF-8）会在 handler 之前被
 /// axum 拒绝，此前返回默认纯文本 400，不含 `forgelink.error.v1` 与
 /// `request_id`。这里把拒绝交给 handler 处理，固定安全文案、原始
-/// 拒绝原因只进日志。
-fn path_rejection_error(rejection: &PathRejection, id: &RequestId) -> ApiErrorResponse {
+/// 拒绝原因只进日志。（只读与控制路由共用同一模式。）
+pub(crate) fn path_rejection_error(rejection: &PathRejection, id: &RequestId) -> ApiErrorResponse {
     debug!(
         component = "rest-api",
         request_id = %id,
@@ -395,7 +495,7 @@ async fn devices(
     State(state): State<AppState>,
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<DevicesResponse>> {
-    let _permit = acquire(&state, &id).await?;
+    let _permit = acquire(&state.concurrency, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
     Ok(Json(DevicesResponse {
         schema: DevicesResponse::SCHEMA,
@@ -409,7 +509,7 @@ async fn device(
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<DeviceResponse>> {
     let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
-    let _permit = acquire(&state, &id).await?;
+    let _permit = acquire(&state.concurrency, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
     validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
@@ -427,7 +527,7 @@ async fn resources(
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<ResourcesResponse>> {
     let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
-    let _permit = acquire(&state, &id).await?;
+    let _permit = acquire(&state.concurrency, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
     validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
@@ -445,7 +545,7 @@ async fn properties(
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<PropertiesResponse>> {
     let Path(device_id) = path.map_err(|rej| path_rejection_error(&rej, &id))?;
-    let _permit = acquire(&state, &id).await?;
+    let _permit = acquire(&state.concurrency, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
     validate_device_id(&device_id, &snapshot.site_id, &id)?;
     match snapshot.devices.iter().find(|d| d.device_id == device_id) {
@@ -461,7 +561,7 @@ async fn health(
     State(state): State<AppState>,
     axum::Extension(id): axum::Extension<RequestId>,
 ) -> ApiResult<Json<HealthResponse>> {
-    let _permit = acquire(&state, &id).await?;
+    let _permit = acquire(&state.concurrency, &id).await?;
     let snapshot = snapshot_or_error(&state.state, &id)?;
     let status = if snapshot.has_anomalies() {
         HealthStatus::Degraded
@@ -724,8 +824,13 @@ mod tests {
     #[tokio::test]
     async fn control_routes_not_exposed() {
         let app = app(Arc::new(StaticState(snapshot())));
-        // POST /controls 与 GET /control-requests 都不存在（§31.5 控制
-        // 路由属于 Control Engine，本分支禁止暴露）；未知方法返回 405。
+        // POST /controls 与 GET devices/{id}/control-requests 都不存在；
+        // 未知方法返回 405。
+        // 本测试在两种构建下都必须通过：
+        // - 默认（只读）构建：`control` feature 未启用，控制代码不编译，
+        //   路由天然不存在（§固定架构：只读版本不得暴露控制入口）；
+        // - `--all-features` 构建：`router()`/`spawn()` 保持纯只读装配，
+        //   控制路由仅经 `spawn_with_control` 挂载。
         for (method, path, expect_status) in [
             (
                 Method::POST,
@@ -734,7 +839,7 @@ mod tests {
             ),
             (
                 Method::GET,
-                "/api/v1/control-requests/cmd-1",
+                "/api/v1/devices/vfd-01/control-requests/cmd-1",
                 StatusCode::NOT_FOUND,
             ),
             (
@@ -1017,5 +1122,30 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_listen_validation_accepts_only_loopback() {
+        // 评审二轮 P2（§90.2）：控制装配仅允许 loopback——IPv4
+        // 127.0.0.0/8 与 IPv6 ::1；其余（含通配与私网）一律拒绝。
+        for addr in ["127.0.0.1:8080", "127.9.9.9:8080", "[::1]:8080"] {
+            RestApiServer::validate_control_listen(addr.parse().expect("静态地址合法"))
+                .unwrap_or_else(|e| panic!("{addr} 应通过: {e}"));
+        }
+        for addr in [
+            "0.0.0.0:8080",
+            "192.168.1.10:8080",
+            "[::]:8080",
+            "[fd00::1]:8080",
+        ] {
+            let err = RestApiServer::validate_control_listen(addr.parse().expect("静态地址合法"))
+                .expect_err("非 loopback 必须拒绝");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{addr}");
+            assert!(
+                err.to_string().contains("loopback"),
+                "错误应说明仅允许 loopback: {addr}"
+            );
+        }
     }
 }

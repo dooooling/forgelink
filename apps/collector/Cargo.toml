@@ -20,11 +20,17 @@ collector = [
     "rest-api",
 ]
 
-# 启用控制链路（driver-write、control-engine）。当前阶段保持空占位：
-# 接入控制链路后必须验证只读构建
+# 启用控制链路（§98）：只读采集之上叠加写入与控制面。
+# - driver-read：控制执行器路由到 DeviceManager 管理的共享 Driver 会话，
+#   设备目录亦来自注册后的设备全集（控制与采集共用同一设备注册表）；
+# - driver-write：写入链路语义标记（§98 特性词汇，见下）；
+# - control-engine：ControlEngine 装配 + rest-api/control 控制路由。
+# 必须验证只读构建
 # （cargo check -p collector --no-default-features --features collector）
-# 的产物不包含控制代码。
+# 的产物不包含控制代码（本 crate 全部控制装配代码以
+# `#[cfg(feature = "control")]` 门控）。
 control = [
+    "driver-read",
     "driver-write",
     "control-engine",
 ]
@@ -48,8 +54,15 @@ driver-read = [
 rest-api = ["dep:rest-api"]
 mqtt = ["dep:mqtt-client"]
 local-cache = ["dep:local-buffer"]
+# 写入链路标记（§98）：实际写能力由 `control-engine` feature 引入的
+# DeviceControlExecutor（device-manager，按 device_id 路由到共享 Driver
+# 会话）承载，本 feature 保持空标记以维持设计文档的特性词汇，并为将来
+# 按协议拆分写依赖预留挂点。
 driver-write = []
-control-engine = []
+# 控制引擎（§81-§90）：显式 feature 与同名可选依赖并存——`dep:` 语法
+# 启用依赖，同时级联启用 rest-api 的 control feature（控制端点仅在该
+# feature 下挂载）；async-trait 供 collector 侧审计汇实现 AuditSink。
+control-engine = ["dep:control-engine", "dep:async-trait", "rest-api/control"]
 
 [dependencies]
 # 采集与映射链路（driver-read）
@@ -75,6 +88,10 @@ local-buffer = { path = "../../crates/local-buffer", optional = true }
 
 # REST v1 只读管理接口（rest-api feature）。
 rest-api = { path = "../../crates/rest-api", optional = true }
+
+# 控制链路依赖（仅 control-engine/control feature 时编译进产物）：
+async-trait = { version = "0.1", optional = true }
+control-engine = { path = "../../crates/control-engine", optional = true }
 
 tracing = "0.1"
 

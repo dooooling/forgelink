@@ -1975,7 +1975,7 @@ GET  /api/v1/devices/{device_id}/resources
 GET  /api/v1/devices/{device_id}/properties
 
 POST /api/v1/devices/{device_id}/controls
-GET  /api/v1/control-requests/{request_id}
+GET  /api/v1/devices/{device_id}/control-requests/{request_id}
 ```
 
 控制提交统一返回：
@@ -1992,7 +1992,35 @@ GET  /api/v1/control-requests/{request_id}
 }
 ```
 
+`GET /api/v1/devices/{device_id}/control-requests/{request_id}` 返回请求当前状态（§77 异步控制三态）。查询键与幂等键（§80.1）对齐——request_id 的唯一性作用域是设备；不同设备复用同一 request_id 是两个独立请求，互不影响：
+
+```json
+{
+  "schema": "forgelink.control.status.v1",
+  "request_id": "cmd-...",
+  "state": "unknown | running | settled",
+  "result": {
+    "request_id": "cmd-...",
+    "namespace": "plant-a",
+    "device_id": "dev-1",
+    "status": "succeeded | failed | timeout | cancelled | indeterminate | rejected",
+    "started_at_ns": 0,
+    "completed_at_ns": 0,
+    "result": {},
+    "error": { "code": "...", "message": "...", "details": {} }
+  }
+}
+```
+
+- `state = unknown`：服务端当前无该 request_id 的可答记录（可能是从未提交，也可能因进程重启丢失内存台账——持久化 Journal 中或有记录；**unknown 不构成重试或任何后续动作的依据**，客户端应沿用原 request_id 或人工确认）；
+- `state = running`：已受理尚未结算（`result` 缺省）；
+- `state = settled`：终态，`result` 为 §80.1 `ControlResult` 完整载荷。
+
 Property Write 与 Command Execute 都使用 `/controls`，通过 `kind` 区分，且都进入 Control Engine。
+
+控制端点必须经过 §90.2 认证（Bearer Token）；未认证请求一律 `401`。
+
+`forgelink.control.request.v1` 不携带 `namespace`/`device_id`/`requested_at_ns`/`timeout_ms`：`device_id` 取自路径，`requested_at_ns` 由服务端生成，`timeout_ms` 与 `namespace` 由服务端配置提供（`namespace` 进入幂等键 §80.1，须在 Collector 配置中显式声明）。
 
 ## 31.6 REST Error Model
 
@@ -2380,7 +2408,7 @@ V0.4: FANUC FOCAS Process Plugin
 
 ## 34.7 当前仓库实施状态（非架构决策）
 
-截至 REST v1 只读管理接口合并，以下能力已经在 workspace 中实现并有自动化测试：
+截至控制链路交付合并，以下能力已经在 workspace 中实现并有自动化测试：
 
 ```text
 observation-model     共享规范模型
@@ -2390,22 +2418,29 @@ driver-loader         Native Plugin 加载、ABI 校验与句柄生命周期
 profile-engine        Profile 校验、加载、注册与读写转换
 domain-model          Domain 路径校验与 Observation 映射
 poll-engine           周期调度、超时、指数退避、取消与阻塞隔离
-driver-modbus         Modbus TCP/RTU 读取 Driver MVP
-device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射
+driver-modbus         Modbus TCP/RTU Driver：读取 MVP；写功能 FC05/06/15/16（帧编解码、
+                      响应回显校验、精确相邻批量合并、多寄存器字序镜像读侧）
+control-engine        Control Engine 基础（§81-§90：统一入口、幂等键去重、每设备有界队列、
+                      审计日志与 FileJournal）
+device-manager        设备实例注册、Driver/Profile 绑定校验、读取项生成与分组、全链路数据映射；
+                      ControlExecutor 适配层（DriverSession 共享会话抽象，读写同锁互斥；
+                      保守 Indeterminate 映射——仅可证明未上线才 Failed）
 data-pipeline         Telemetry Batch 聚合输出（有界队列、按设备分批、背压/取消/有界排空）
 mqtt-client           MQTT 北向客户端（QoS 1 发布、自动重连退避、LWT、TLS/mTLS、有界队列与背压）
 local-buffer          Local Buffer/WAL（SQLite WAL 崩溃恢复、两级缓冲、幂等补传与 ack 删除）
-rest-api              REST v1 只读管理接口（设备/资源/属性/健康、错误模型、有界并发，§31.5/§31.6）
+rest-api              REST v1 管理接口——只读：设备/资源/属性/健康、错误模型、有界并发
+                      （§31.5/§31.6）；控制：POST controls 202 异步受理 + GET control-requests
+                      三态查询、Bearer 认证（§90.2）、错误映射 400/404/409/422/503
 collector             Collector 运行时组装（§93/§100：只读采集链路——轮询→映射→组包→WAL→MQTT
-                      QoS1 发布；有序停机有限排空，REST 服务异常退出触发停机）
+                      QoS1 发布；有序停机有限排空，REST 服务异常退出触发停机；control feature：
+                      control 配置段装配 Control Engine，停机第 0.5 步结算在途控制）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 
 以下能力仍未完成端到端交付：
 
 ```text
-REST 控制链路（Control Engine、driver-write），以及 edge-server / manager
-的完整运行时组装、三平台部署、性能基准和长时间稳定性验收。
+edge-server / manager 的完整运行时组装、三平台部署、性能基准和长时间稳定性验收。
 ```
 
 本节只记录实现进度，不改变前述 Normative 契约和 MVP 验收标准。
@@ -5226,6 +5261,45 @@ TLS -> Authentication -> Authorization -> Validation
     -> Policy -> Durable Control Journal -> Queue -> Driver
 ```
 
+# 90.2 REST 控制面认证（Normative）
+
+启用 Control 能力时，REST 控制 API（§31.5 `POST /api/v1/devices/{device_id}/controls`、`GET /api/v1/devices/{device_id}/control-requests/{request_id}`）必须启用认证。MVP 采用静态 Bearer Token 方案；mTLS 客户端证书认证留给 Edge/Manager 阶段扩展。
+
+## 凭据形态
+
+- 客户端每次请求携带 `Authorization: Bearer <token>` 头。
+- Token 必须为高熵随机串（建议 ≥ 32 字节的 base64/hex 编码）；禁止低熵口令。
+- 凭据文件（JSON，schema 显式版本化）：
+
+```json
+{
+  "schema": "forgelink.control.credentials.v1",
+  "credentials": [
+    { "token": "<高熵随机串>", "subject": "alice", "role": "operator" },
+    { "token": "<高熵随机串>", "subject": "bob", "role": "viewer" }
+  ]
+}
+```
+
+- 主配置（YAML）只允许配置凭据文件**路径**，禁止内联 Token（§90.1：Token 禁止进入普通明文配置）。
+- 凭据文件权限：Linux/Unix 必须为 `0600`（启动时校验，过宽拒绝启动）；Windows 使用服务账户 ACL 保护（MVP 不做 ACL 强校验）。
+- `subject`/`role` 语义见 §83 角色模型；REST 层只负责**认证**（Token → subject/role 上下文），**授权**由 Control Engine 的 Authorizer 执行（§81、§83）。
+
+## 认证行为
+
+- Token 比较必须使用常量时间比较，防止时序侧信道枚举。
+- 缺失头、格式非法、未知 Token → `401`（`forgelink.error.v1`，code `UNAUTHENTICATED`）。
+- 已认证但角色不足 → 由 Control Engine 授权拒绝映射为 `403`（`INSUFFICIENT_ROLE`）。
+- 凭据文件缺失、权限校验失败、解析失败、schema 不符 → **启动失败**（fail-closed，§90.1），不得降级为无认证运行。
+- 同一 Token 重复出现、`subject` 为空、非法角色值 → 启动失败（fail-closed）。
+- Token、`Authorization` 头与凭据文件内容禁止进入日志与诊断（§6 脱敏兜底，不记录敏感字段优先）。
+
+## 认证范围
+
+- **控制路由必须认证**：无有效凭据一律 `401`，loopback 监听亦不豁免（fail-closed）。
+- 只读管理接口（§31.5 GET 端点）MVP 维持现状（不强制认证，依赖 loopback 默认与 §90.1 网络边界）；后续版本再统一收紧。
+- 远程（非 loopback）监听必须同时满足 §90.1 的 TLS 要求；TLS 终止前的明文控制请求不得放行。MVP 实现强制：控制链路启用时 REST 只允许绑定 loopback——远程访问由带 TLS 的反向代理转发到 loopback，原生 TLS listener 就绪前不开放非 loopback 直连。
+
 ---
 
 # 91. 设备侧轻量部署需求
@@ -6026,9 +6100,9 @@ Industrial Control Gateway
 - [x] Bad/Timeout 新结果 `value = None`；缓存值只能以 `Uncertain/Stale` 返回。
 - [x] Driver ABI 定义字符串编码、ptr+len、内存释放、panic、thread、callback、error 与版本兼容。
 - [x] Protocol/Profile/Domain Capabilities 不混层。
-- [ ] Property Write 和 Command Execute 都必须经过 Control Engine。
+- [x] Property Write 和 Command Execute 都必须经过 Control Engine。
 - [ ] MQTT 明确 topic、QoS、retain、schema、去重和重传语义。
-- [ ] REST Control 使用 `202 + request_id` 异步模型。
+- [x] REST Control 使用 `202 + request_id` 异步模型。
 - [ ] MVP 有性能、重连、缓存、断电恢复和三平台验收测试。
 
 其中 `[x]` 表示当前仓库已有实现与测试，`[ ]` 表示仍需后续功能或验收；

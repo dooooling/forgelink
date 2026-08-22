@@ -37,6 +37,19 @@ pub enum MalformedException {
     ExtraByte,
 }
 
+/// 捕获的写请求（测试断言合并/功能码选择行为用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteRecord {
+    /// 从站号。
+    pub unit: u8,
+    /// 功能码（FC05/06/15/16）。
+    pub function: u8,
+    /// 协议偏移起点。
+    pub start_offset: u16,
+    /// 数量（位数或寄存器数；FC05/06 恒为 1）。
+    pub quantity: u16,
+}
+
 /// Mock 服务器行为配置。
 #[derive(Debug, Clone, Default)]
 pub struct MockBehavior {
@@ -54,6 +67,8 @@ pub struct MockBehavior {
     pub malformed_exception: Option<MalformedException>,
     /// 统计：收到的请求数。
     pub request_count: Arc<AtomicU32>,
+    /// 收到的写请求（FC05/06/15/16，含被异常拒绝的请求）。
+    pub captured_writes: Arc<Mutex<Vec<WriteRecord>>>,
 }
 
 impl MockBehavior {
@@ -66,6 +81,7 @@ impl MockBehavior {
             declare_wrong_byte_count: false,
             malformed_exception: None,
             request_count: Arc::new(AtomicU32::new(0)),
+            captured_writes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -164,6 +180,27 @@ impl MockServer {
             .load(Ordering::Relaxed)
     }
 
+    /// 收到的写请求快照（FC05/06/15/16，按到达顺序）。
+    pub fn write_records(&self) -> Vec<WriteRecord> {
+        self.behavior
+            .lock()
+            .expect("行为锁")
+            .captured_writes
+            .lock()
+            .expect("写请求锁")
+            .clone()
+    }
+
+    /// 读取寄存器表当前值（写入生效断言用）。
+    pub fn value(&self, unit: u8, kind: Kind, offset: u16) -> Option<u16> {
+        self.behavior
+            .lock()
+            .expect("行为锁")
+            .values
+            .get(&(unit, kind, offset))
+            .copied()
+    }
+
     /// 停止服务器（等待线程退出）。
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -179,15 +216,46 @@ impl Drop for MockServer {
     }
 }
 
-/// 功能码 -> 数据段。
+/// 功能码 -> 数据段（读 FC01~FC04 与写 FC05/06/15/16）。
 fn kind_of(function: u8) -> Option<Kind> {
     match function {
-        0x01 => Some(Kind::Coil),
+        0x01 | 0x05 | 0x0F => Some(Kind::Coil),
         0x02 => Some(Kind::DiscreteInput),
-        0x03 => Some(Kind::HoldingRegister),
+        0x03 | 0x06 | 0x10 => Some(Kind::HoldingRegister),
         0x04 => Some(Kind::InputRegister),
         _ => None,
     }
+}
+
+/// 是否为写功能码（FC05/06/15/16）。
+fn is_write_function(function: u8) -> bool {
+    matches!(function, 0x05 | 0x06 | 0x0F | 0x10)
+}
+
+/// 组装异常响应帧（MBAP 头 + fc|0x80 + 异常码；畸形模式改变 body 字节数）。
+fn exception_response(
+    header: &[u8; 7],
+    unit: u8,
+    function: u8,
+    code: u8,
+    malformed: Option<MalformedException>,
+) -> Vec<u8> {
+    let mut body = vec![function | 0x80, code];
+    match malformed {
+        Some(MalformedException::MissingCode) => {
+            body.pop();
+        }
+        Some(MalformedException::ExtraByte) => body.push(0x00),
+        None => {}
+    }
+    let mut response = vec![0u8; 7 + body.len()];
+    response[0..2].copy_from_slice(&header[0..2]);
+    response[2..4].copy_from_slice(&[0x00, 0x00]);
+    // MBAP length = unit + body 字节数。
+    response[4..6].copy_from_slice(&((1 + body.len()) as u16).to_be_bytes());
+    response[6] = unit;
+    response[7..].copy_from_slice(&body);
+    response
 }
 
 fn handle_connection(
@@ -244,8 +312,33 @@ fn handle_connection(
             None => return,
         };
 
+        // 写功能码的数量字段位置与读不同：FC05/06 无数量（载荷首二字为值，
+        // 数量恒 1）；FC15/16 的数量位于 rest[3..5]。
+        let write_quantity = if is_write_function(function) {
+            match function {
+                0x05 | 0x06 => 1,
+                _ => quantity,
+            }
+        } else {
+            quantity
+        };
+
+        // 写请求捕获（供测试断言合并与功能码选择；含被异常拒绝的请求）。
+        if is_write_function(function) {
+            guard
+                .captured_writes
+                .lock()
+                .expect("写请求锁")
+                .push(WriteRecord {
+                    unit,
+                    function,
+                    start_offset: start,
+                    quantity: write_quantity,
+                });
+        }
+
         // 检查异常覆盖（区间起始地址）。
-        let exception = (0..quantity).find_map(|offset| {
+        let exception = (0..write_quantity).find_map(|offset| {
             guard
                 .exception_at
                 .get(&(unit, kind, start + offset))
@@ -257,21 +350,102 @@ fn handle_connection(
             // 异常响应：功能码置高位 + 异常码，连接保持。
             // 畸形模式按配置改变 body 字节数（缺异常码 / 多余字节）。
             let malformed = guard.malformed_exception;
-            let mut body = vec![function | 0x80, code];
-            match malformed {
-                Some(MalformedException::MissingCode) => {
-                    body.pop();
-                }
-                Some(MalformedException::ExtraByte) => body.push(0x00),
-                None => {}
+            let response = exception_response(&header, unit, function, code, malformed);
+            if stream.write_all(&response).is_err() {
+                return;
             }
-            let mut response = vec![0u8; 7 + body.len()];
-            response[0..2].copy_from_slice(&header[0..2]);
-            response[2..4].copy_from_slice(&[0x00, 0x00]);
-            // MBAP length = unit + body 字节数。
-            response[4..6].copy_from_slice(&((1 + body.len()) as u16).to_be_bytes());
-            response[6] = unit;
-            response[7..].copy_from_slice(&body);
+            continue;
+        } else if is_write_function(function) {
+            // 写请求：校验载荷合法性（违规回异常 0x03 illegal data value），
+            // 应用到寄存器 bank 后按协议回显（addr + 值/数量）。
+            let echo_tail: u16 = match function {
+                0x05 => match quantity {
+                    // quantity 此处即 FC05 的值字段（0xFF00/0x0000 之外非法）。
+                    0xFF00 => 0xFF00,
+                    0x0000 => 0x0000,
+                    _ => {
+                        let response = exception_response(
+                            &header,
+                            unit,
+                            function,
+                            0x03,
+                            guard.malformed_exception,
+                        );
+                        if stream.write_all(&response).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                },
+                0x06 => quantity,
+                0x0F | 0x10 => {
+                    let max = if function == 0x0F { 1_968u16 } else { 123 };
+                    let byte_count = *rest.get(5).unwrap_or(&0) as usize;
+                    let expected = if function == 0x0F {
+                        write_quantity.div_ceil(8) as usize
+                    } else {
+                        write_quantity as usize * 2
+                    };
+                    if write_quantity == 0
+                        || write_quantity > max
+                        || byte_count != expected
+                        || rest.len() < 6 + byte_count
+                    {
+                        let response = exception_response(
+                            &header,
+                            unit,
+                            function,
+                            0x03,
+                            guard.malformed_exception,
+                        );
+                        if stream.write_all(&response).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    write_quantity
+                }
+                _ => unreachable!("is_write_function 已限定"),
+            };
+            // 应用写入：线圈存 0/1，寄存器存 16 位原值。
+            match function {
+                0x05 => {
+                    guard
+                        .values
+                        .insert((unit, kind, start), (echo_tail == 0xFF00) as u16);
+                }
+                0x06 => {
+                    guard.values.insert((unit, kind, start), echo_tail);
+                }
+                0x0F => {
+                    let bits = &rest[6..6 + write_quantity.div_ceil(8) as usize];
+                    for offset in 0..write_quantity {
+                        let bit = (bits[offset as usize / 8] >> (offset % 8)) & 1;
+                        guard
+                            .values
+                            .insert((unit, kind, start + offset), u16::from(bit));
+                    }
+                }
+                0x10 => {
+                    let data = &rest[6..6 + write_quantity as usize * 2];
+                    for offset in 0..write_quantity {
+                        let base = offset as usize * 2;
+                        let value = u16::from_be_bytes([data[base], data[base + 1]]);
+                        guard.values.insert((unit, kind, start + offset), value);
+                    }
+                }
+                _ => unreachable!("is_write_function 已限定"),
+            }
+            // 写响应：MBAP + unit + fc + addr(2) + 值/数量(2)，无 Byte Count。
+            let mut response = Vec::with_capacity(12);
+            response.extend_from_slice(&transaction_id.to_be_bytes());
+            response.extend_from_slice(&[0x00, 0x00]);
+            // MBAP length = unit(1) + fc(1) + addr(2) + 值/数量(2)。
+            response.extend_from_slice(&6u16.to_be_bytes());
+            response.push(unit);
+            response.push(function);
+            response.extend_from_slice(&start.to_be_bytes());
+            response.extend_from_slice(&echo_tail.to_be_bytes());
             if stream.write_all(&response).is_err() {
                 return;
             }
@@ -346,4 +520,200 @@ pub fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
         "reconnect_delay_ms": 50,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 发送一帧请求并读取完整响应（MBAP 头 + body）。
+    fn exchange(addr: std::net::SocketAddr, unit: u8, body: &[u8], txn: u16) -> Vec<u8> {
+        let mut stream = TcpStream::connect(addr).expect("连接 mock 失败");
+        let mut frame = Vec::with_capacity(7 + body.len());
+        frame.extend_from_slice(&txn.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00]);
+        // MBAP length 含 unit 字节。
+        frame.extend_from_slice(&((body.len() + 1) as u16).to_be_bytes());
+        frame.extend_from_slice(&[unit]);
+        frame.extend_from_slice(body);
+        stream.write_all(&frame).expect("发送请求失败");
+        let mut header = [0u8; 7];
+        stream.read_exact(&mut header).expect("读响应头失败");
+        let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+        let mut response = header.to_vec();
+        let mut rest = vec![0u8; length - 1];
+        stream.read_exact(&mut rest).expect("读响应体失败");
+        response.extend_from_slice(&rest);
+        response
+    }
+
+    #[test]
+    fn fc05_applies_coil_and_echos() {
+        let server = MockServer::start(MockBehavior::new());
+        // 写线圈 offset 3 = ON。
+        let response = exchange(server.addr, 1, &[0x05, 0x00, 0x03, 0xFF, 0x00], 7);
+        assert_eq!(&response[0..2], &[0x00, 0x07]); // 事务号回显
+        assert_eq!(response[6], 1);
+        assert_eq!(response[7], 0x05);
+        assert_eq!(&response[8..12], &[0x00, 0x03, 0xFF, 0x00]); // addr + value 回显
+        assert_eq!(server.value(1, Kind::Coil, 3), Some(1));
+
+        // OFF。
+        let _ = exchange(server.addr, 1, &[0x05, 0x00, 0x03, 0x00, 0x00], 8);
+        assert_eq!(server.value(1, Kind::Coil, 3), Some(0));
+    }
+
+    #[test]
+    fn fc05_rejects_non_standard_value() {
+        // 协议规定 FC05 值只能 0xFF00/0x0000，其余必须异常（illegal data value）。
+        let server = MockServer::start(MockBehavior::new());
+        let response = exchange(server.addr, 1, &[0x05, 0x00, 0x03, 0x00, 0x01], 1);
+        assert_eq!(response[7], 0x85);
+        assert_eq!(response[8], 0x03);
+        assert_eq!(server.value(1, Kind::Coil, 3), None);
+    }
+
+    #[test]
+    fn fc06_applies_register_and_echos() {
+        let server = MockServer::start(MockBehavior::new());
+        let response = exchange(server.addr, 2, &[0x06, 0x00, 0x09, 0x13, 0x88], 3);
+        assert_eq!(response[7], 0x06);
+        assert_eq!(&response[8..12], &[0x00, 0x09, 0x13, 0x88]);
+        assert_eq!(server.value(2, Kind::HoldingRegister, 9), Some(5000));
+    }
+
+    #[test]
+    fn fc15_packs_bits_lsb_and_echos() {
+        let server = MockServer::start(MockBehavior::new());
+        // 从 offset 10 写 3 位 [true, false, true]：byte count=1，位流 0b101。
+        let response = exchange(
+            server.addr,
+            1,
+            &[0x0F, 0x00, 0x0A, 0x00, 0x03, 0x01, 0b101],
+            4,
+        );
+        assert_eq!(response[7], 0x0F);
+        assert_eq!(&response[8..12], &[0x00, 0x0A, 0x00, 0x03]); // addr + qty 回显
+        assert_eq!(server.value(1, Kind::Coil, 10), Some(1));
+        assert_eq!(server.value(1, Kind::Coil, 11), Some(0));
+        assert_eq!(server.value(1, Kind::Coil, 12), Some(1));
+    }
+
+    #[test]
+    fn fc16_applies_registers_and_echos() {
+        let server = MockServer::start(MockBehavior::new());
+        // 从 offset 2 写 2 寄存器 [0x1234, 0x5678]。
+        let response = exchange(
+            server.addr,
+            1,
+            &[0x10, 0x00, 0x02, 0x00, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78],
+            5,
+        );
+        assert_eq!(response[7], 0x10);
+        assert_eq!(&response[8..12], &[0x00, 0x02, 0x00, 0x02]);
+        assert_eq!(server.value(1, Kind::HoldingRegister, 2), Some(0x1234));
+        assert_eq!(server.value(1, Kind::HoldingRegister, 3), Some(0x5678));
+    }
+
+    #[test]
+    fn fc15_fc16_reject_bad_quantity_or_byte_count() {
+        let server = MockServer::start(MockBehavior::new());
+        // FC16 数量超上限（124 > 123）。
+        let response = exchange(
+            server.addr,
+            1,
+            &[0x10, 0x00, 0x00, 0x00, 0x7C, 0xF8, 0x00],
+            1,
+        );
+        assert_eq!(response[7], 0x90);
+        assert_eq!(response[8], 0x03);
+        // FC16 字节计数与数量不符。
+        let response = exchange(
+            server.addr,
+            1,
+            &[0x10, 0x00, 0x00, 0x00, 0x02, 0x03, 0x11, 0x22, 0x33],
+            2,
+        );
+        assert_eq!(response[7], 0x90);
+        assert_eq!(response[8], 0x03);
+        // FC15 字节计数与位数不符。
+        let response = exchange(
+            server.addr,
+            1,
+            &[0x0F, 0x00, 0x00, 0x00, 0x09, 0x01, 0xFF],
+            3,
+        );
+        assert_eq!(response[7], 0x8F);
+        assert_eq!(response[8], 0x03);
+        // FC15 数量为 0。
+        let response = exchange(server.addr, 1, &[0x0F, 0x00, 0x00, 0x00, 0x00, 0x00], 4);
+        assert_eq!(response[7], 0x8F);
+        assert_eq!(response[8], 0x03);
+    }
+
+    #[test]
+    fn write_exception_injection_and_malformed_modes() {
+        let behavior = MockBehavior::new();
+        let server = MockServer::start(behavior);
+        server
+            .behavior()
+            .lock()
+            .unwrap()
+            .exception_at
+            .insert((1, Kind::HoldingRegister, 5), 0x02);
+
+        // 注入异常覆盖写响应。
+        let response = exchange(server.addr, 1, &[0x06, 0x00, 0x05, 0x00, 0x01], 9);
+        assert_eq!(response[7], 0x86);
+        assert_eq!(response[8], 0x02);
+        assert_eq!(
+            server.value(1, Kind::HoldingRegister, 5),
+            None,
+            "异常时不得应用写入"
+        );
+
+        // 畸形模式同样作用于写异常响应（多余字节）。
+        server.behavior().lock().unwrap().malformed_exception = Some(MalformedException::ExtraByte);
+        let response = exchange(server.addr, 1, &[0x06, 0x00, 0x05, 0x00, 0x01], 10);
+        assert_eq!(response.len(), 7 + 3, "ExtraByte 模式 body 多 1 字节");
+        assert_eq!(response[7], 0x86);
+        assert_eq!(response[8], 0x02);
+        assert_eq!(response[9], 0x00);
+    }
+
+    #[test]
+    fn captured_writes_record_requests() {
+        let server = MockServer::start(MockBehavior::new());
+        let _ = exchange(server.addr, 1, &[0x05, 0x00, 0x00, 0xFF, 0x00], 1);
+        let _ = exchange(server.addr, 1, &[0x06, 0x00, 0x02, 0x00, 0x2A], 2);
+        let _ = exchange(
+            server.addr,
+            1,
+            &[0x10, 0x00, 0x04, 0x00, 0x02, 0x04, 0xAA, 0xBB, 0xCC, 0xDD],
+            3,
+        );
+        assert_eq!(
+            server.write_records(),
+            vec![
+                WriteRecord {
+                    unit: 1,
+                    function: 0x05,
+                    start_offset: 0,
+                    quantity: 1
+                },
+                WriteRecord {
+                    unit: 1,
+                    function: 0x06,
+                    start_offset: 2,
+                    quantity: 1
+                },
+                WriteRecord {
+                    unit: 1,
+                    function: 0x10,
+                    start_offset: 4,
+                    quantity: 2
+                },
+            ]
+        );
+    }
 }

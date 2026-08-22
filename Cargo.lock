@@ -139,6 +139,8 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "collector"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "control-engine",
  "data-pipeline",
  "device-manager",
  "diagnostics",
@@ -243,6 +245,8 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 name = "device-manager"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "control-engine",
  "diagnostics",
  "domain-model",
  "driver-loader",
@@ -304,6 +308,7 @@ version = "0.1.0"
 dependencies = [
  "driver-loader",
  "driver-sdk",
+ "libloading",
  "modbus-mock",
  "observation-model",
  "poll-engine",
@@ -959,8 +964,13 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rest-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
+ "control-engine",
+ "driver-sdk",
  "mqtt-client",
+ "observation-model",
+ "profile-engine",
  "serde",
  "serde_json",
  "tokio",

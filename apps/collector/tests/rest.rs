@@ -193,7 +193,7 @@ async fn rest_readonly_endpoints_full_chain() {
     // 6) 控制路由未暴露（§31.5：本分支只读，不实现控制链路）。
     for path in [
         "/api/v1/devices/vfd-01/controls",
-        "/api/v1/control-requests/cmd-1",
+        "/api/v1/devices/vfd-01/control-requests/cmd-1",
     ] {
         let mut stream = TcpStream::connect(addr).expect("连接");
         write!(

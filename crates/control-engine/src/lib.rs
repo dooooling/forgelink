@@ -35,6 +35,7 @@
 //!   引擎保证同设备控制请求串行执行（§87）。
 
 mod audit;
+mod auth;
 mod catalog;
 mod engine;
 #[cfg(test)]
@@ -50,6 +51,7 @@ mod validate;
 pub use audit::{
     AuditEvent, AuditOperation, AuditParameter, AuditSink, MemoryAuditSink, NoopAuditSink,
 };
+pub use auth::{CREDENTIALS_SCHEMA, CredentialsError, StaticTokenAuthorizer};
 pub use catalog::{DeviceCatalog, DeviceInfo, MemoryDeviceCatalog};
 pub use engine::{
     CancelError, ControlEngine, ControlEngineConfig, ControlReceipt, SubmitContext, SubmitError,

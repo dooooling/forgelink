@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use crate::config::ModbusConfig;
 use crate::error::ModbusError;
-use crate::frame::{self, FrameError, parse_tcp_response_header, rtu_response_total_len};
+use crate::frame::{
+    self, FrameError, is_write_function, parse_tcp_response_header, rtu_response_total_len,
+};
 /// 传输层抽象。
 pub trait Transport: Send {
     /// 建立连接（TCP 建流 / RTU 打开串口）。
@@ -32,6 +34,19 @@ pub trait Transport: Send {
         start_offset: u16,
         quantity: u16,
     ) -> Result<Vec<u8>, ModbusError>;
+    /// 执行一次写事务（FC05/06/15/16）：发送写请求帧，读取并校验回显响应。
+    ///
+    /// `payload` 为功能码后随载荷（不含地址）：FC05/06 为 2 字节值；
+    /// FC15/16 为数量(2) + 字节计数(1) + 数据。成功返回表示从站已确认
+    /// 回显（地址与值/数量逐字节一致）；Modbus 异常映射为
+    /// [`ModbusError::modbus_exception`]。
+    fn write_transaction(
+        &mut self,
+        unit_id: u8,
+        function: u8,
+        start_offset: u16,
+        payload: &[u8],
+    ) -> Result<(), ModbusError>;
 }
 
 /// 按连接配置创建传输（TCP 或 RTU）。
@@ -213,6 +228,44 @@ impl Transport for TcpTransport {
         }
         Ok(body[2..].to_vec())
     }
+
+    fn write_transaction(
+        &mut self,
+        unit_id: u8,
+        function: u8,
+        start_offset: u16,
+        payload: &[u8],
+    ) -> Result<(), ModbusError> {
+        self.transaction_id = self.transaction_id.wrapping_add(1);
+        let request = frame::build_tcp_write_request(
+            self.transaction_id,
+            unit_id,
+            function,
+            start_offset,
+            payload,
+        );
+        // 写失败视为连接断开（对端已关闭）。
+        self.stream()?
+            .write_all(&request)
+            .map_err(|e| ModbusError::connection_lost(format!("发送请求失败：{e}")))?;
+        let header = self.read_exact(7)?;
+        let meta = parse_tcp_response_header(&header)
+            .map_err(|e| ModbusError::invalid_response(frame_error_message(e)))?;
+        if meta.transaction_id != self.transaction_id {
+            return Err(ModbusError::invalid_response(format!(
+                "事务号不匹配（期望 {}，收到 {}）",
+                self.transaction_id, meta.transaction_id
+            )));
+        }
+        if meta.unit_id != unit_id {
+            return Err(ModbusError::invalid_response(format!(
+                "从站号不匹配（期望 {unit_id}，收到 {}）",
+                meta.unit_id
+            )));
+        }
+        let body = self.read_exact(meta.data_len)?;
+        validate_write_body(function, start_offset, payload, &body)
+    }
 }
 
 /// RTU 传输（串口）。
@@ -368,6 +421,56 @@ impl Transport for RtuTransport {
         }
         Ok(frame[3..total - 2].to_vec())
     }
+
+    fn write_transaction(
+        &mut self,
+        unit_id: u8,
+        function: u8,
+        start_offset: u16,
+        payload: &[u8],
+    ) -> Result<(), ModbusError> {
+        let request = frame::build_rtu_write_request(unit_id, function, start_offset, payload);
+        self.port()?
+            .write_all(&request)
+            .map_err(|e| ModbusError::connection_lost(format!("发送 RTU 帧失败：{e}")))?;
+        // 读 unit + function 两个字节后按功能码计算剩余长度
+        // （写响应无 Byte Count，正常恒为 4 字节回显 + CRC）。
+        let mut head = [0u8; 2];
+        self.port()?.read_exact(&mut head).map_err(map_io_error)?;
+        if head[0] != unit_id {
+            return Err(ModbusError::invalid_response(format!(
+                "RTU 从站号不匹配（期望 {unit_id}，收到 {}）",
+                head[0]
+            )));
+        }
+        let total = rtu_response_total_len(&head, function, 0)
+            .map_err(|e| ModbusError::invalid_response(frame_error_message(e)))?;
+        let mut rest = vec![0u8; total - 2];
+        self.port()?.read_exact(&mut rest).map_err(map_io_error)?;
+        let mut frame_bytes = Vec::with_capacity(total);
+        frame_bytes.extend_from_slice(&head);
+        frame_bytes.extend_from_slice(&rest);
+        if !crate::crc::verify(&frame_bytes) {
+            return Err(ModbusError::invalid_response(
+                "RTU 帧 CRC 校验失败".to_owned(),
+            ));
+        }
+        let meta = frame::parse_rtu_response_meta(&frame_bytes)
+            .map_err(|e| ModbusError::invalid_response(frame_error_message(e)))?;
+        if meta.function != function {
+            return Err(ModbusError::invalid_response(format!(
+                "RTU 功能码不匹配（期望 {function:#04x}，收到 {:#04x}）",
+                meta.function
+            )));
+        }
+        if meta.is_exception {
+            let code = frame_bytes[2];
+            let (name, _) = frame::exception_code_name(code);
+            return Err(ModbusError::modbus_exception(code, name));
+        }
+        // 正常写响应：unit + fc + 4 回显 + CRC；校验回显内容。
+        validate_write_body(function, start_offset, payload, &frame_bytes[1..total - 2])
+    }
 }
 
 /// I/O 错误分类：超时 -> `timeout`；其余 -> 连接断开。
@@ -382,6 +485,49 @@ fn frame_error_message(e: FrameError) -> String {
     match e {
         FrameError::Truncated(m) | FrameError::Invalid(m) => format!("响应帧无效：{m}"),
     }
+}
+
+/// 校验写响应体（TCP body / RTU 去除 unit 与 CRC 后的载荷）。
+///
+/// 异常响应（功能码置高位）必须恰好 2 字节（fc|0x80 + 异常码），映射为
+/// [`ModbusError::modbus_exception`]（与读路径同一规则）；正常响应必须为
+/// 4 字节逐字节回显（地址 + 值/数量，无 Byte Count 字段），回显不符按
+/// 响应失步（invalid_response）处理——把未确认的写入当成功会破坏
+/// 控制链路的可信性。
+fn validate_write_body(
+    function: u8,
+    start_offset: u16,
+    payload: &[u8],
+    body: &[u8],
+) -> Result<(), ModbusError> {
+    if body.is_empty() {
+        return Err(ModbusError::invalid_response("响应体为空".to_owned()));
+    }
+    let raw_function = body[0];
+    let response_function = raw_function & 0x7F;
+    if response_function != function {
+        return Err(ModbusError::invalid_response(format!(
+            "功能码不匹配（期望 {function:#04x}，收到 {response_function:#04x}）"
+        )));
+    }
+    if raw_function & 0x80 != 0 {
+        if body.len() != 2 {
+            return Err(ModbusError::invalid_response(format!(
+                "异常响应长度不符（{} 字节，期望 2）",
+                body.len()
+            )));
+        }
+        let code = body[1];
+        let (name, _) = frame::exception_code_name(code);
+        return Err(ModbusError::modbus_exception(code, name));
+    }
+    if !is_write_function(function) {
+        return Err(ModbusError::invalid_response(
+            "写事务收到非写功能码响应".to_owned(),
+        ));
+    }
+    frame::validate_write_echo(&body[1..], start_offset, payload)
+        .map_err(|e| ModbusError::invalid_response(frame_error_message(e)))
 }
 
 #[cfg(test)]
@@ -556,5 +702,96 @@ mod tests {
             .read_transaction(1, frame::FC_READ_HOLDING_REGISTERS, 0, 1)
             .expect_err("字节计数不符必须失败");
         assert_eq!(err.code, "invalid_response");
+    }
+
+    // ------------------------------------------------------ RTU 写事务
+
+    #[test]
+    fn rtu_write_transaction_validates_echo() {
+        let (mem, rx, tx) = MemSerial::new();
+        let mut transport = rtu_transport(Box::new(mem));
+        // 从站回显：unit=1, FC06, addr=0x0005, value=0x1388。
+        rx.lock()
+            .unwrap()
+            .extend(rtu_response(&[0x01, 0x06, 0x00, 0x05, 0x13, 0x88]));
+
+        transport
+            .write_transaction(1, frame::FC_WRITE_SINGLE_REGISTER, 5, &[0x13, 0x88])
+            .expect("RTU 写入失败");
+
+        // 请求帧：unit+fc+offset+value+CRC = 8 字节，CRC 合法。
+        let request = tx.lock().unwrap().clone();
+        assert_eq!(request.len(), 8);
+        assert_eq!(request[1], 0x06);
+        assert_eq!(&request[2..4], &[0x00, 0x05]);
+        assert_eq!(&request[4..6], &[0x13, 0x88]);
+        assert!(crate::crc::verify(&request));
+    }
+
+    #[test]
+    fn rtu_write_transaction_rejects_wrong_echo() {
+        let (mem, rx, _) = MemSerial::new();
+        let mut transport = rtu_transport(Box::new(mem));
+        // 回显值与请求不符（0x1388 vs 0x0000）。
+        rx.lock()
+            .unwrap()
+            .extend(rtu_response(&[0x01, 0x06, 0x00, 0x05, 0x00, 0x00]));
+
+        let err = transport
+            .write_transaction(1, frame::FC_WRITE_SINGLE_REGISTER, 5, &[0x13, 0x88])
+            .expect_err("回显不符必须失败");
+        assert_eq!(err.code, "invalid_response");
+        assert!(err.is_transport_level(), "响应失步必须丢弃会话");
+    }
+
+    #[test]
+    fn rtu_write_transaction_rejects_wrong_echo_address() {
+        let (mem, rx, _) = MemSerial::new();
+        let mut transport = rtu_transport(Box::new(mem));
+        rx.lock()
+            .unwrap()
+            .extend(rtu_response(&[0x01, 0x06, 0x00, 0x06, 0x13, 0x88]));
+
+        let err = transport
+            .write_transaction(1, frame::FC_WRITE_SINGLE_REGISTER, 5, &[0x13, 0x88])
+            .expect_err("回显地址不符必须失败");
+        assert_eq!(err.code, "invalid_response");
+    }
+
+    #[test]
+    fn rtu_write_transaction_exception_maps_protocol_code() {
+        let (mem, rx, _) = MemSerial::new();
+        let mut transport = rtu_transport(Box::new(mem));
+        rx.lock().unwrap().extend(rtu_response(&[0x01, 0x86, 0x02]));
+
+        let err = transport
+            .write_transaction(1, frame::FC_WRITE_SINGLE_REGISTER, 5, &[0x13, 0x88])
+            .expect_err("异常响应必须失败");
+        assert_eq!(err.code, "modbus_exception");
+        assert_eq!(err.protocol_code, Some(0x02));
+        assert!(!err.retryable);
+        assert!(!err.is_transport_level(), "从站异常不丢弃会话");
+    }
+
+    #[test]
+    fn rtu_write_multiple_registers_round_trip() {
+        // FC16 写 2 寄存器：payload = qty(2)+bc(1)+4 数据；回显 qty。
+        let (mem, rx, tx) = MemSerial::new();
+        let mut transport = rtu_transport(Box::new(mem));
+        rx.lock()
+            .unwrap()
+            .extend(rtu_response(&[0x01, 0x10, 0x00, 0x00, 0x00, 0x02]));
+
+        let payload = [0x00, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78];
+        transport
+            .write_transaction(1, frame::FC_WRITE_MULTIPLE_REGISTERS, 0, &payload)
+            .expect("RTU FC16 写入失败");
+
+        let request = tx.lock().unwrap().clone();
+        // unit + fc + addr(2) + payload + CRC。
+        assert_eq!(request.len(), 4 + payload.len() + 2);
+        assert_eq!(request[1], 0x10);
+        assert_eq!(&request[4..4 + payload.len()], &payload);
+        assert!(crate::crc::verify(&request));
     }
 }

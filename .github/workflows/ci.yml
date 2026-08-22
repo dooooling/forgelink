@@ -30,8 +30,10 @@ jobs:
       - name: cargo check
         run: cargo check --workspace
 
-      - name: cargo test
-        run: cargo test --workspace
+      # --all-features：feature 门控的测试（collector/rest-api 控制链路、
+      # test-utils 等）必须被 CI 强制覆盖，不能只靠本地自觉。
+      - name: cargo test (--all-features)
+        run: cargo test --workspace --all-features
 
       # 真实进程强杀 WAL 崩溃恢复（§103 kill -9 验收）：由 test-utils
       # feature 门控，默认 cargo test --workspace 不执行——单独启用
