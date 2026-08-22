@@ -126,8 +126,15 @@ impl ControlMetrics {
     /// 取指定设备预注册的队列深度 gauge（启动期已建表，运行期只读查找：
     /// 一次 HashMap 命中 + 句柄克隆，零锁零分配；未在清单中的设备返回
     /// `None`——理论上不可达，DeviceQueue 由同一清单构造）。
-    fn device_gauge(&self, device_id: &str) -> Option<Gauge> {
-        self.queue_depth_device.as_ref()?.get(device_id).cloned()
+    /// 取指定设备预注册的队列深度 gauge（启动期已建表，运行期只读查找）。
+    ///
+    /// 返回**引用**而非克隆（评审 P2：`.cloned()` 是两次 Arc refcount
+    /// 原子操作——增与 drop 减，叠加 gauge 更新即三次原子操作，违背
+    /// §34.2.1"热路径只做一次原子操作"；借用后调用方直接在引用上做
+    /// 一次原子 add/sub）。未在清单中的设备返回 `None`——理论上不可达，
+    /// DeviceQueue 由同一清单构造。
+    fn device_gauge(&self, device_id: &str) -> Option<&Gauge> {
+        self.queue_depth_device.as_ref()?.get(device_id)
     }
 
     /// 入队成功：全局与 per-device 队列深度 +1。

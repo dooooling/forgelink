@@ -812,6 +812,9 @@ impl ControlEngine {
                         error_code = "journal_settle_failed",
                         "停机拒绝结算落盘失败: {e}"
                     );
+                    // §34.2.1：Journal 结算落盘失败统一计数（含停机拒绝
+                    // 路径——评审 P2：此前仅队列正常结算路径计数）。
+                    self.inner.context.metrics.observe_journal_settle_failed();
                 }
                 self.inner
                     .context
@@ -1091,6 +1094,8 @@ impl ControlEngine {
                 error_code = "journal_settle_failed",
                 "孤儿记录结算落盘失败: {e}"
             );
+            // §34.2.1：Journal 结算落盘失败统一计数（评审 P2）。
+            self.inner.context.metrics.observe_journal_settle_failed();
             result = ControlResult {
                 status: ControlStatus::Indeterminate,
                 error: Some(ControlError {
@@ -1175,6 +1180,8 @@ impl ControlEngine {
                 error_code = "journal_settle_failed",
                 "拒绝结算落盘失败: {e}"
             );
+            // §34.2.1：Journal 结算落盘失败统一计数（评审 P2）。
+            self.inner.context.metrics.observe_journal_settle_failed();
             // P2-G：结算失败不得宣称已以 Rejected 终态落盘——当前进程与重启
             // 恢复（Indeterminate）必须一致。降级为 Indeterminate（原始错误只
             // 进日志，不进入北向结果）。

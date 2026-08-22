@@ -982,6 +982,7 @@ async fn run_worker(
                 &mut pending,
                 capacity,
                 &mut needs_online_republish,
+                &mqtt_metrics,
             );
         }
 
@@ -1560,11 +1561,17 @@ fn rebuild_online_republish(
 /// 清除 `needs_online_republish` 标记。从队首推进保证进度不丢失：
 /// 设备数超过容量时每轮只推进部分设备，下一轮从断点继续（每次从头
 /// 遍历会让尾部设备永久遗漏，§31.1）。
+///
+/// 重发请求与用户请求**统一经 [`MqttMetrics::observe_accepted`] 计入
+/// in-flight**（评审 P1：此前绕过计数边界——自动生成的在线状态直接
+/// push_back，PUBACK 结算却统一 -1，每次断线重连后 in-flight 永久少算
+/// 并累积偏差）。
 fn step_online_republish(
     pending_online_republish: &mut VecDeque<(String, String)>,
     pending: &mut VecDeque<PublishRequest>,
     capacity: usize,
     needs_online_republish: &mut bool,
+    mqtt_metrics: &MqttMetrics,
 ) {
     while pending.len() < capacity {
         let Some((site_id, device_id)) = pending_online_republish.pop_front() else {
@@ -1572,6 +1579,7 @@ fn step_online_republish(
             break;
         };
         if let Some(request) = make_online_status_request(&site_id, &device_id) {
+            mqtt_metrics.observe_accepted();
             pending.push_back(request);
         }
     }
@@ -2290,6 +2298,61 @@ mod tests {
         broker.stop().await;
     }
 
+    /// 评审 P1 回归：断线自动在线重发必须与用户请求共用同一 in-flight
+    /// 计数边界——此前 `step_online_republish` 绕过 `observe_accepted()`，
+    /// PUBACK 结算统一 -1 导致内部值变负，后续 telemetry 的 +1 只是把
+    /// 负数补回 0，REST 显示 inflight=0 而实际有 1 条在途，且每次重连
+    /// 累积偏差。修复后：自动重发确认归位（0），再挂一条未确认
+    /// telemetry 时 gauge 恰为 1。
+    #[tokio::test]
+    async fn auto_online_republish_counts_toward_inflight_gauge() {
+        use std::sync::Arc;
+        let registry = Arc::new(metrics::MetricsRegistry::new());
+        let broker = MockBroker::start().await;
+        // 首个 PUBLISH 不回复 PUBACK → 触发断线 + 自动在线重发。
+        broker.drop_connection_after_publish();
+        let client = MqttClient::spawn_with_metrics(
+            test_config(&broker, "client-inflight"),
+            registry.clone(),
+        )
+        .unwrap();
+
+        let inflight = || {
+            registry
+                .snapshot()
+                .get("mqtt_inflight_gauge")
+                .cloned()
+                .expect("inflight gauge 已注册")
+        };
+
+        // 自动重发完成并确认后，无在途请求 → gauge 必须回到 0
+        // （修复前此值为 -1，后续偏差由此开始）。
+        client
+            .publish_online("plant-a", "cnc-01")
+            .await
+            .unwrap()
+            .acked()
+            .await
+            .unwrap();
+        wait_until(|| {
+            broker.publishes().len() == 3 && matches!(inflight(), metrics::MetricValue::Gauge(0))
+        })
+        .await;
+
+        // 再挂一条**未确认**的普通 telemetry：gauge 必须恰为 1。
+        // （修复前内部镜像为 0：-1 + 1 = 0，显示少算。）用 puback_hold
+        // 钩子扣住确认——断线钩子是一次性的且已消耗，否则 PUBACK 立即
+        // 到达、+1/-1 配对完成，断言窗口抓不到中间态。nth 为全局报文
+        // 序号：当前已记录 3 条，telemetry 是第 4 条。
+        let release = broker.hold_puback(4);
+        let _pending_publish = client.publish("t/telemetry", b"payload").await.unwrap();
+        wait_until(|| matches!(inflight(), metrics::MetricValue::Gauge(1))).await;
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        client.shutdown().await.unwrap();
+        broker.stop().await;
+    }
+
     #[tokio::test]
     async fn online_statuses_republished_per_device_after_reconnect() {
         let broker = MockBroker::start().await;
@@ -2838,6 +2901,7 @@ mod tests {
     fn online_republish_progress_resumes_where_left_off() {
         // 设备数（5）超过容量（2）时，重发必须从上次断点继续（队首
         // 推进）：每次从头遍历会让尾部设备永久遗漏（§31.1）。
+        let metrics = MqttMetrics::new(None);
         let mut needs = true;
         let mut queue: VecDeque<(String, String)> = (0..5)
             .map(|i| (format!("site-{i}"), format!("dev-{i}")))
@@ -2847,16 +2911,16 @@ mod tests {
 
         // 每轮只推进 2 台（容量上限），标记保持；中间模拟转发清空
         // pending（与 worker 循环一致）。
-        step_online_republish(&mut queue, &mut pending, 2, &mut needs);
+        step_online_republish(&mut queue, &mut pending, 2, &mut needs, &metrics);
         assert!(needs);
         assert_eq!(pending.len(), 2);
         seen.extend(pending.drain(..).map(|r| r.topic));
-        step_online_republish(&mut queue, &mut pending, 2, &mut needs);
+        step_online_republish(&mut queue, &mut pending, 2, &mut needs, &metrics);
         assert!(needs);
         assert_eq!(pending.len(), 2);
         seen.extend(pending.drain(..).map(|r| r.topic));
         // 最后一轮推进剩余 1 台并清空标记。
-        step_online_republish(&mut queue, &mut pending, 8, &mut needs);
+        step_online_republish(&mut queue, &mut pending, 8, &mut needs, &metrics);
         assert!(!needs);
         assert_eq!(pending.len(), 1);
         seen.extend(pending.drain(..).map(|r| r.topic));
@@ -2873,7 +2937,7 @@ mod tests {
             .map(|i| (format!("site-{i}"), format!("dev-{i}")))
             .collect();
         let mut pending: VecDeque<PublishRequest> = VecDeque::new();
-        step_online_republish(&mut queue, &mut pending, 8, &mut needs);
+        step_online_republish(&mut queue, &mut pending, 8, &mut needs, &metrics);
         for (i, req) in pending.iter().enumerate() {
             let ids = req.status_ids.as_ref().expect("在线状态必须带设备标识");
             assert_eq!(ids.1, format!("dev-{i}"));
