@@ -205,6 +205,8 @@ impl DeviceQueue {
             inner.entries.entry(priority).or_default().push_back(entry);
             inner.len += 1;
         }
+        // §34.2.1：入队成功，队列深度 +1（结算时 -1 配对）。
+        ctx.metrics.observe_enqueued();
         self.ensure_worker();
         self.notify.notify_one();
         Ok(())
@@ -624,6 +626,8 @@ impl DeviceQueue {
                             Instant::now()
                                 + Duration::from_millis(ctx.policy.indeterminate_cooldown_ms),
                         );
+                        // §34.2.1：冷却期建立计数（不确定结果后拒绝新动作的窗口）。
+                        ctx.metrics.observe_cooldown_entered();
                     }
                     // 三审 P1：结算完成前不清除 running——否则强制中止恰好在
                     // 异步 Journal 结算期间发生时，settle_abandoned 找不到该
@@ -896,6 +900,8 @@ async fn settle_entry(
     deadline: Option<Instant>,
 ) {
     let completed_at_ns = now_ns();
+    // §34.2.1：本条目离开队列（结算完成），深度 -1；终态计数按状态归类。
+    ctx.metrics.observe_settled_exit();
     let mut result = match run {
         RunResult::Done(result) => result,
         RunResult::Timeout => ControlResult {
@@ -987,6 +993,7 @@ async fn settle_entry(
             error_code = "journal_settle_failed",
             "幂等结算落盘失败: {e}"
         );
+        ctx.metrics.observe_journal_settle_failed();
         // P1-2：结算失败不得向调用方宣称成功——当前进程与重启恢复
         // （Indeterminate）必须一致。降级为 Indeterminate（原始错误只进日志，
         // 不进入北向结果）。
@@ -1056,6 +1063,8 @@ async fn settle_entry(
     }
 
     // 回传结果（§77 异步控制：提交后等待/轮询结果）。
+    // §34.2.1：按最终终态（含 Journal 失败降级后的 Indeterminate）计数。
+    ctx.metrics.observe_settled(result.status);
     entry.reply.set(result);
 }
 

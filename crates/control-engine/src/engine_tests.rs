@@ -436,6 +436,7 @@ fn engine_with(
         executor,
         audit,
         policy,
+        metrics: None,
     })
 }
 
@@ -1353,6 +1354,7 @@ fn policy_validate_rejects_short_retention() {
         executor: MockExecutor::new(),
         audit: Arc::new(MemoryAuditSink::new()),
         policy: Arc::new(policy),
+        metrics: None,
     });
 }
 
@@ -2534,4 +2536,234 @@ async fn audit_timeout_retries_once() {
         sink.calls.load(Ordering::SeqCst) >= 2,
         "超时后应至少重试一次"
     );
+}
+
+// ---- 指标埋点（§34.2.1） -----------------------------------------------------
+
+use metrics::MetricValue;
+
+fn metrics_engine(
+    registry: Arc<metrics::MetricsRegistry>,
+    executor: Arc<MockExecutor>,
+) -> ControlEngine {
+    let mut config = ControlEngineConfig {
+        catalog: catalog(),
+        authorizer: authorizer(Role::Operator),
+        journal: Arc::new(InMemoryJournal::new()),
+        executor,
+        audit: Arc::new(MemoryAuditSink::new()),
+        policy: default_policy(),
+        metrics: None,
+    };
+    config.metrics = Some(registry);
+    ControlEngine::new(config)
+}
+
+/// 注入 registry 后：成功结算计入 `control_settled_succeeded_total`，
+/// Driver 前拒绝计入 `control_settled_rejected_total`，队列深度增减
+/// 配对归零。
+#[tokio::test]
+async fn metrics_settled_succeeded_rejected_and_queue_depth_pairing() {
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let executor = MockExecutor::new();
+    executor.release();
+    let engine = metrics_engine(registry.clone(), executor);
+
+    // 成功路径：深度曾 +1，结算后 -1 归零；终态计数 Succeeded。
+    let ok = engine
+        .submit(frequency_write("mt-ok", 10.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(ok.status, ControlStatus::Succeeded);
+    assert_eq!(
+        registry.snapshot().get("control_queue_depth_gauge"),
+        Some(&MetricValue::Gauge(0)),
+        "结算后队列深度必须归零（增减配对）"
+    );
+
+    // Driver 前拒绝（设备不存在）：Rejected 计数 +1，不触碰深度。
+    let rejected = engine
+        .submit(
+            ControlRequest {
+                device_id: "dev-unknown".to_owned(),
+                ..write_request("mt-rej", "drive.output.frequency", Value::F64(1.0))
+            },
+            &context(),
+        )
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(rejected.status, ControlStatus::Rejected);
+
+    let snap = registry.snapshot();
+    use crate::metrics::metric_names as mn;
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_SUCCEEDED_TOTAL),
+        Some(&MetricValue::Count(1))
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_REJECTED_TOTAL),
+        Some(&MetricValue::Count(1))
+    );
+    // 未发生的终态：计数为 0（装配期已注册）。
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_FAILED_TOTAL),
+        Some(&MetricValue::Count(0))
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_TIMEOUT_TOTAL),
+        Some(&MetricValue::Count(0))
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_CANCELLED_TOTAL),
+        Some(&MetricValue::Count(0))
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_INDETERMINATE_TOTAL),
+        Some(&MetricValue::Count(0))
+    );
+
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 取消与超时终态：运行中取消 → Indeterminate；排队中取消 → Cancelled；
+/// 排队过期 → Timeout。各自进入对应常量名计数器。
+#[tokio::test]
+async fn metrics_settled_cancelled_timeout_indeterminate() {
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let executor = MockExecutor::new(); // 阻塞：制造排队窗口
+    let engine = metrics_engine(registry.clone(), executor.clone());
+
+    // 运行中取消 → Indeterminate。
+    let r1 = engine
+        .submit(command_request("mt-c1", true), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    engine.cancel(&key("mt-c1"), &context()).await.unwrap();
+    assert_eq!(r1.wait().await.status, ControlStatus::Indeterminate);
+
+    // 排队中取消 → Cancelled。
+    let holder = engine
+        .submit(frequency_write("mt-ch", 20.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 2).await;
+    let queued = engine
+        .submit(command_request("mt-c2", true), &context())
+        .await
+        .unwrap();
+    engine.cancel(&key("mt-c2"), &context()).await.unwrap();
+
+    // 排队过期 → Timeout：deadline 已过但未取消的条目被 worker 以
+    // Timeout 结算（短超时写入请求）。
+    let expired = engine
+        .submit(
+            ControlRequest {
+                timeout_ms: 1,
+                ..frequency_write("mt-to", 30.0)
+            },
+            &context(),
+        )
+        .await
+        .unwrap();
+
+    executor.release(); // holder 完成 → worker 处理 c2（Cancelled）/ to（Timeout）
+    assert_eq!(holder.wait().await.status, ControlStatus::Succeeded);
+    assert_eq!(queued.wait().await.status, ControlStatus::Cancelled);
+    let to = expired.wait().await;
+    if to.status == ControlStatus::Running {
+        panic!("过期条目必须结算");
+    }
+    // timeout_ms=1 在排队期间几乎必然已过期 → Timeout；若恰在执行窗口内
+    // 完成则为 Succeeded/Indeterminate——两者都是合法终态，此处只断言
+    // 非 Running 已在上面完成。
+
+    let snap = registry.snapshot();
+    use crate::metrics::metric_names as mn;
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_INDETERMINATE_TOTAL),
+        Some(&MetricValue::Count(1)),
+        "运行中取消必须以 Indeterminate 计数"
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_CANCELLED_TOTAL),
+        Some(&MetricValue::Count(1)),
+        "排队中取消必须以 Cancelled 计数"
+    );
+    assert!(
+        matches!(
+            snap.get(mn::CONTROL_SETTLED_TIMEOUT_TOTAL),
+            Some(MetricValue::Count(n)) if *n <= 1
+        ),
+        "Timeout 计数不得虚高"
+    );
+    // 全部结算后队列深度归零。
+    assert_eq!(
+        snap.get(mn::CONTROL_QUEUE_DEPTH_GAUGE),
+        Some(&MetricValue::Gauge(0))
+    );
+
+    engine.shutdown(Duration::from_millis(500)).await;
+}
+
+/// 冷却期建立计数：Indeterminate 结算触发冷却期时
+/// `control_cooldown_entered_total` +1；冷却期内的提交以 Rejected 拒绝
+/// （同时计入 Rejected 终态）。
+#[tokio::test]
+async fn metrics_count_cooldown_entered() {
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let executor = MockExecutor::new(); // 阻塞
+    let audit = Arc::new(MemoryAuditSink::new());
+    let config = ControlEngineConfig {
+        catalog: catalog(),
+        authorizer: authorizer(Role::Operator),
+        journal: Arc::new(InMemoryJournal::new()),
+        executor: executor.clone(),
+        audit,
+        policy: Arc::new(ControlPolicy {
+            indeterminate_cooldown_ms: 200,
+            ..ControlPolicy::default()
+        }),
+        metrics: Some(registry.clone()),
+    };
+    let engine = ControlEngine::new(config);
+
+    let receipt = engine
+        .submit(frequency_write("mc-a", 10.0), &context())
+        .await
+        .unwrap();
+    wait_for_calls(&executor, 1).await;
+    engine.cancel(&key("mc-a"), &context()).await.unwrap();
+    assert_eq!(receipt.wait().await.status, ControlStatus::Indeterminate);
+
+    // 冷却期内提交：Rejected（Driver 前拒绝）。
+    let rejected = engine
+        .submit(frequency_write("mc-b", 20.0), &context())
+        .await
+        .unwrap()
+        .wait()
+        .await;
+    assert_eq!(rejected.status, ControlStatus::Rejected);
+
+    let snap = registry.snapshot();
+    use crate::metrics::metric_names as mn;
+    assert_eq!(
+        snap.get(mn::CONTROL_COOLDOWN_ENTERED_TOTAL),
+        Some(&MetricValue::Count(1)),
+        "冷却期建立必须恰好计数一次"
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_REJECTED_TOTAL),
+        Some(&MetricValue::Count(1))
+    );
+    assert_eq!(
+        snap.get(mn::CONTROL_SETTLED_INDETERMINATE_TOTAL),
+        Some(&MetricValue::Count(1))
+    );
+    executor.release();
+    engine.shutdown(Duration::from_millis(500)).await;
 }

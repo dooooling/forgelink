@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::config::{MqttClientConfig, TlsMode};
+use crate::metrics::MqttMetrics;
 
 /// 优雅断开（发送并冲刷 DISCONNECT 报文）时限。
 const GRACE_PERIOD: Duration = Duration::from_secs(2);
@@ -248,6 +249,27 @@ impl MqttClient {
     /// 配置非法（含 TLS 材料解析失败）时返回
     /// [`MqttClientError::InvalidConfig`]。
     pub fn spawn(config: MqttClientConfig) -> Result<Self, MqttClientError> {
+        Self::spawn_inner(config, MqttMetrics::new(None))
+    }
+
+    /// 校验配置并启动客户端，注入指标注册表（§34.2.1）：在途 gauge、
+    /// 确认 / 重发 / 失败计数经 `registry` 暴露。语义与 [`Self::spawn`]
+    /// 完全一致。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Self::spawn`]。
+    pub fn spawn_with_metrics(
+        config: MqttClientConfig,
+        registry: std::sync::Arc<metrics::MetricsRegistry>,
+    ) -> Result<Self, MqttClientError> {
+        Self::spawn_inner(config, MqttMetrics::new(Some(&registry)))
+    }
+
+    fn spawn_inner(
+        config: MqttClientConfig,
+        mqtt_metrics: MqttMetrics,
+    ) -> Result<Self, MqttClientError> {
         config
             .validate()
             .map_err(|reason| MqttClientError::InvalidConfig {
@@ -298,6 +320,7 @@ impl MqttClient {
             eventloop,
             request_rx,
             shutdown_rx,
+            mqtt_metrics,
         ));
         Ok(Self {
             request_tx,
@@ -881,6 +904,7 @@ async fn run_worker(
     mut eventloop: EventLoop,
     mut request_rx: mpsc::Receiver<PublishRequest>,
     mut shutdown_rx: watch::Receiver<bool>,
+    mqtt_metrics: MqttMetrics,
 ) {
     // 当前是否处于已连接状态（决定停机时是否发送 DISCONNECT，以及
     // select 的 recv 分支与 pending 转发是否启用）。
@@ -966,6 +990,7 @@ async fn run_worker(
                             config.max_packet_size,
                             &mut last_online,
                             &mut pending_online_republish,
+                            &mqtt_metrics,
                         );
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
@@ -982,6 +1007,7 @@ async fn run_worker(
                 &mut awaiting_ack,
                 &mut last_online,
                 None,
+                &mqtt_metrics,
             );
         }
 
@@ -995,6 +1021,7 @@ async fn run_worker(
                             config.max_packet_size,
                             &mut last_online,
                             &mut pending_online_republish,
+                            &mqtt_metrics,
                         );
                     }
                     None => break, // 所有句柄已释放，无调用方
@@ -1038,9 +1065,10 @@ async fn run_worker(
                             Event::Outgoing(Outgoing::AwaitAck(pkid)) => {
                                 on_await_ack_event(
                                     &mut awaiting_ack,
-                                    &mut collision_pkid,
-                                    &mut collision_recovered,
+                                        &mut collision_pkid,
+                                        &mut collision_recovered,
                                     pkid,
+                                        &mqtt_metrics,
                                 );
                             }
                             // broker 确认：按包标识结算对应请求（§31.4）。
@@ -1051,9 +1079,10 @@ async fn run_worker(
                                 last_puback = puback.pkid;
                                 on_puback_event(
                                     &mut awaiting_ack,
-                                    &mut collision_pkid,
-                                    &mut collision_recovered,
+                                        &mut collision_pkid,
+                                        &mut collision_recovered,
                                     puback.pkid,
+                                        &mqtt_metrics,
                                 );
                             }
                             _ => trace!(component = "mqtt-client", "MQTT 事件: {ev:?}"),
@@ -1062,6 +1091,11 @@ async fn run_worker(
                     Err(e) => {
                         connected = false;
                         connect_failures += 1;
+                        // 断线重发计数（§31.3 / §34.2.1）：存在未确认在途
+                        // 消息即计一次重发窗口（重连后由 rumqttc 重发）。
+                        if !awaiting_ack.is_empty() {
+                            mqtt_metrics.observe_disconnect_with_unacked();
+                        }
                         // 断线：未确认消息在重连后由 rumqttc 重发（新包
                         // 标识）；按 clean() 的重发顺序重排并清空包标识，
                         // 使重发后的 PUBACK 仍关联到原请求。同时标记：
@@ -1111,6 +1145,7 @@ async fn run_worker(
                                 MqttClientError::Disconnected {
                                     reason: e.to_string(),
                                 },
+                                &mqtt_metrics,
                             );
                             return;
                         }
@@ -1155,6 +1190,7 @@ async fn run_worker(
                 &mut awaiting_ack,
                 &mut last_online,
                 Some(offline_remaining),
+                &mqtt_metrics,
             );
             offline_remaining = pending
                 .iter()
@@ -1171,9 +1207,10 @@ async fn run_worker(
                         Ok(Event::Incoming(Incoming::PubAck(puback))) => {
                             on_puback_event(
                                 &mut awaiting_ack,
-                                &mut collision_pkid,
-                                &mut collision_recovered,
+                                    &mut collision_pkid,
+                                    &mut collision_recovered,
                                 puback.pkid,
+                                    &mqtt_metrics,
                             );
                         }
                         Ok(Event::Outgoing(Outgoing::Publish(pkid))) => {
@@ -1188,9 +1225,10 @@ async fn run_worker(
                         Ok(Event::Outgoing(Outgoing::AwaitAck(pkid))) => {
                             on_await_ack_event(
                                 &mut awaiting_ack,
-                                &mut collision_pkid,
-                                &mut collision_recovered,
+                                    &mut collision_pkid,
+                                    &mut collision_recovered,
                                 pkid,
+                                    &mqtt_metrics,
                             );
                         }
                         Ok(_) => {}
@@ -1245,9 +1283,10 @@ async fn run_worker(
                         Ok(Event::Outgoing(Outgoing::AwaitAck(pkid))) => {
                             on_await_ack_event(
                                 &mut awaiting_ack,
-                                &mut collision_pkid,
-                                &mut collision_recovered,
+                                    &mut collision_pkid,
+                                    &mut collision_recovered,
                                 pkid,
+                                    &mqtt_metrics,
                             );
                         }
                         Ok(Event::Outgoing(Outgoing::Disconnect)) => {
@@ -1259,9 +1298,10 @@ async fn run_worker(
                         Ok(Event::Incoming(Incoming::PubAck(puback))) => {
                             on_puback_event(
                                 &mut awaiting_ack,
-                                &mut collision_pkid,
-                                &mut collision_recovered,
+                                    &mut collision_pkid,
+                                    &mut collision_recovered,
                                 puback.pkid,
+                                    &mqtt_metrics,
                             );
                         }
                         Ok(_) => {}
@@ -1285,9 +1325,10 @@ async fn run_worker(
                             Ok(Event::Incoming(Incoming::PubAck(puback))) => {
                                 on_puback_event(
                                     &mut awaiting_ack,
-                                    &mut collision_pkid,
-                                    &mut collision_recovered,
+                                        &mut collision_pkid,
+                                        &mut collision_recovered,
                                     puback.pkid,
+                                        &mqtt_metrics,
                                 );
                             }
                             Ok(Event::Outgoing(Outgoing::Publish(pkid))) => {
@@ -1302,9 +1343,10 @@ async fn run_worker(
                             Ok(Event::Outgoing(Outgoing::AwaitAck(pkid))) => {
                                 on_await_ack_event(
                                     &mut awaiting_ack,
-                                    &mut collision_pkid,
-                                    &mut collision_recovered,
+                                        &mut collision_pkid,
+                                        &mut collision_recovered,
                                     pkid,
+                                        &mqtt_metrics,
                                 );
                             }
                             Ok(_) => {}
@@ -1334,6 +1376,7 @@ async fn run_worker(
         &mut pending,
         &mut awaiting_ack,
         MqttClientError::Closed,
+        &mqtt_metrics,
     );
 }
 
@@ -1350,6 +1393,7 @@ fn accept_request(
     max_packet_size: usize,
     last_online: &mut BTreeSet<(String, String)>,
     pending_online_republish: &mut VecDeque<(String, String)>,
+    mqtt_metrics: &MqttMetrics,
 ) {
     let result = validate_publish_topic(&request.topic)
         .and_then(|()| validate_payload_size(&request.topic, &request.payload, max_packet_size));
@@ -1366,9 +1410,12 @@ fn accept_request(
                 pending.retain(|r| !(r.online_status && r.status_ids.as_ref() == Some(ids)));
                 pending_online_republish.retain(|d| d != ids);
             }
+            mqtt_metrics.observe_accepted();
             pending.push_back(request);
         }
         Err(e) => {
+            // 入队前拒绝（非法主题 / 超限载荷）：计入失败结算。
+            mqtt_metrics.observe_failed();
             let _ = request.ack_tx.send(Err(e));
         }
     }
@@ -1391,6 +1438,7 @@ fn forward_pending(
     awaiting_ack: &mut VecDeque<AwaitingAck>,
     last_online: &mut BTreeSet<(String, String)>,
     limit: Option<usize>,
+    mqtt_metrics: &MqttMetrics,
 ) {
     let mut forwarded = 0;
     while let Some(req) = pending.front() {
@@ -1423,6 +1471,7 @@ fn forward_pending(
                 // 转发失败（异常路径）：以明确错误结算该请求（调用方
                 // 不得删除 WAL，§31.4），并继续处理后续请求。
                 let failed = pending.pop_front().expect("front 与 pop 之间无人修改");
+                mqtt_metrics.observe_failed();
                 let _ = failed.ack_tx.send(Err(MqttClientError::PublishFailed {
                     reason: e.to_string(),
                 }));
@@ -1626,11 +1675,12 @@ fn on_puback_event(
     collision_pkid: &mut Option<u16>,
     collision_recovered: &mut bool,
     pkid: u16,
+    mqtt_metrics: &MqttMetrics,
 ) {
     if *collision_pkid == Some(pkid) {
         *collision_recovered = true;
     }
-    resolve_puback(awaiting_ack, pkid);
+    resolve_puback(awaiting_ack, pkid, mqtt_metrics);
 }
 
 /// `Outgoing::AwaitAck(pkid)`：包标识碰撞开始（§31.4）。停放入队最老的
@@ -1648,6 +1698,7 @@ fn on_await_ack_event(
     collision_pkid: &mut Option<u16>,
     collision_recovered: &mut bool,
     pkid: u16,
+    mqtt_metrics: &MqttMetrics,
 ) {
     *collision_recovered = false;
     if let Some(previous) = *collision_pkid {
@@ -1656,6 +1707,7 @@ fn on_await_ack_event(
             .position(|e| e.parked_pkid == Some(previous))
         {
             let entry = awaiting_ack.remove(index).expect("position 与 remove 一致");
+            mqtt_metrics.observe_failed();
             let _ = entry
                 .ack_tx
                 .send(Err(MqttClientError::CollisionOverwritten));
@@ -1682,9 +1734,10 @@ fn on_await_ack_event(
 /// `Incoming::PubAck(pkid)`：按包标识结算第一个匹配的请求（PUBACK
 /// 允许乱序到达，按标识关联而不是队首）。未匹配（协议异常）时仅记录
 /// 日志：该请求保持未确认，由退出路径结算，不会误报成功。
-fn resolve_puback(awaiting_ack: &mut VecDeque<AwaitingAck>, pkid: u16) {
+fn resolve_puback(awaiting_ack: &mut VecDeque<AwaitingAck>, pkid: u16, mqtt_metrics: &MqttMetrics) {
     if let Some(index) = awaiting_ack.iter().position(|e| e.pkid == Some(pkid)) {
         let entry = awaiting_ack.remove(index).expect("position 与 remove 一致");
+        mqtt_metrics.observe_published();
         let _ = entry.ack_tx.send(Ok(()));
         trace!(
             component = "mqtt-client",
@@ -1744,14 +1797,18 @@ fn fail_all_queued(
     pending: &mut VecDeque<PublishRequest>,
     awaiting_ack: &mut VecDeque<AwaitingAck>,
     err: MqttClientError,
+    mqtt_metrics: &MqttMetrics,
 ) {
     while let Ok(req) = request_rx.try_recv() {
+        mqtt_metrics.observe_failed();
         let _ = req.ack_tx.send(Err(err.clone()));
     }
     while let Some(req) = pending.pop_front() {
+        mqtt_metrics.observe_failed();
         let _ = req.ack_tx.send(Err(err.clone()));
     }
     while let Some(entry) = awaiting_ack.pop_front() {
+        mqtt_metrics.observe_failed();
         let _ = entry.ack_tx.send(Err(err.clone()));
     }
 }
@@ -2942,6 +2999,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(collision_pkid, Some(1));
         assert_eq!(
@@ -2992,6 +3050,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(awaiting.len(), 3, "A 必须被结算");
         on_puback_event(
@@ -2999,6 +3058,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(awaiting.len(), 2, "E 必须被结算");
         on_puback_event(
@@ -3006,12 +3066,14 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             2,
+            &MqttMetrics::noop(),
         );
         on_puback_event(
             &mut awaiting,
             &mut collision_pkid,
             &mut collision_recovered,
             3,
+            &MqttMetrics::noop(),
         );
         assert!(awaiting.is_empty(), "全部请求必须结算");
     }
@@ -3044,6 +3106,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(
             awaiting[1].parked_pkid,
@@ -3093,6 +3156,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert!(collision_recovered, "旧消息确认后必须记录恢复状态");
         assert_eq!(awaiting.len(), 2, "A 必须被结算");
@@ -3116,6 +3180,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(awaiting.len(), 1, "E 必须被结算");
         on_puback_event(
@@ -3123,6 +3188,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             2,
+            &MqttMetrics::noop(),
         );
         assert!(awaiting.is_empty(), "全部请求必须结算");
     }
@@ -3152,6 +3218,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
 
         reset_pkids(&mut awaiting, 0);
@@ -3194,6 +3261,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(awaiting.len(), 2, "A 必须被结算");
         on_publish_event(
@@ -3254,6 +3322,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert_eq!(collision_pkid, Some(1), "首个碰撞记录标识");
         assert_eq!(awaiting[2].parked_pkid, Some(1), "E 配对 pkid 1");
@@ -3266,6 +3335,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             2,
+            &MqttMetrics::noop(),
         );
         assert_eq!(
             match e_ack_rx.try_recv() {
@@ -3300,6 +3370,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             1,
+            &MqttMetrics::noop(),
         );
         assert!(!collision_recovered, "A 的确认不匹配当前碰撞标识");
         assert_eq!(awaiting.len(), 3, "A 必须被结算");
@@ -3312,6 +3383,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             2,
+            &MqttMetrics::noop(),
         );
         assert!(collision_recovered, "B 确认后进入恢复流程");
         assert_eq!(awaiting.len(), 2, "B 必须被结算");
@@ -3334,6 +3406,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             2,
+            &MqttMetrics::noop(),
         );
         assert_eq!(awaiting.len(), 1, "F 必须被结算");
         on_puback_event(
@@ -3341,6 +3414,7 @@ mod tests {
             &mut collision_pkid,
             &mut collision_recovered,
             3,
+            &MqttMetrics::noop(),
         );
         assert!(awaiting.is_empty(), "全部请求必须结算");
     }
@@ -3680,5 +3754,124 @@ mod tests {
         let batch = make_batch("plant-a", "cnc-01", 7);
         let topic = telemetry_topic(&batch.site_id, &batch.device_id).unwrap();
         assert_eq!(topic, "forgelink/v1/telemetry/plant-a/cnc-01");
+    }
+
+    // ---- 指标埋点（§34.2.1） ---------------------------------------------------
+
+    use crate::metrics::metric_names;
+    use metrics::MetricValue;
+
+    /// 注入 registry 后：PUBACK 确认计入 `mqtt_published_total`，在途
+    /// gauge 增减配对（入队 +1、确认 -1）。
+    #[tokio::test]
+    async fn metrics_count_published_and_inflight_pairing() {
+        let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+        let broker = MockBroker::start().await;
+        let client = MqttClient::spawn_with_metrics(
+            test_config(&broker, "client-metrics-a"),
+            registry.clone(),
+        )
+        .unwrap();
+
+        let snap0 = registry.snapshot();
+        // 装配期即注册全部指标名（句柄恒存在）：未发布时在途计数为 0。
+        assert_eq!(
+            snap0.get(metric_names::MQTT_INFLIGHT_GAUGE),
+            Some(&MetricValue::Gauge(0)),
+            "未发布前在途计数必须为 0"
+        );
+
+        let first = client.publish("t/m1", b"one").await.unwrap();
+        // 请求已进入 worker 队列（in-flight 曾 +1）；确认可能极快完成，
+        // 不在中间态上断言，只验证最终配对。
+        first.acked().await.unwrap();
+        let second = client.publish("t/m2", b"two").await.unwrap();
+        second.acked().await.unwrap();
+        wait_until(|| broker.publishes().len() == 2).await;
+
+        client.shutdown().await.unwrap();
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get(metric_names::MQTT_PUBLISHED_TOTAL),
+            Some(&MetricValue::Count(2)),
+            "两次 PUBACK 确认必须计数"
+        );
+        assert_eq!(
+            snap.get(metric_names::MQTT_INFLIGHT_GAUGE),
+            Some(&MetricValue::Gauge(0)),
+            "全部确认后在途计数必须归零（增减配对）"
+        );
+        assert_eq!(
+            snap.get(metric_names::MQTT_FAILED_TOTAL),
+            Some(&MetricValue::Count(0))
+        );
+        broker.stop().await;
+    }
+
+    /// 断线重发：存在未确认在途消息的断线计入 `mqtt_redelivered_total`，
+    /// 重发后确认仍按成功结算。
+    #[tokio::test]
+    async fn metrics_count_redelivery_after_disconnect() {
+        let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+        let broker = MockBroker::start().await;
+        broker.drop_connection_after_publish();
+        let client = MqttClient::spawn_with_metrics(
+            test_config(&broker, "client-metrics-b"),
+            registry.clone(),
+        )
+        .unwrap();
+
+        let receipt = client.publish("t/redeliver-m", b"payload").await.unwrap();
+        wait_until(|| broker.publishes().len() == 2).await;
+        receipt.acked().await.unwrap();
+
+        client.shutdown().await.unwrap();
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get(metric_names::MQTT_REDELIVERED_TOTAL),
+            Some(&MetricValue::Count(1)),
+            "带未确认在途消息的断线必须计一次重发"
+        );
+        assert_eq!(
+            snap.get(metric_names::MQTT_PUBLISHED_TOTAL),
+            Some(&MetricValue::Count(1)),
+            "重发送达后的确认只结算一次"
+        );
+        assert_eq!(
+            snap.get(metric_names::MQTT_FAILED_TOTAL),
+            Some(&MetricValue::Count(0)),
+            "成功路径不得产生失败计数"
+        );
+        broker.stop().await;
+    }
+
+    /// 重连上限耗尽：任务退出时全部未确认请求以失败结算
+    /// `mqtt_failed_total`；此后 in-flight 归零。
+    #[tokio::test]
+    async fn metrics_count_failures_on_reconnect_exhausted() {
+        let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+        // broker 不可达（同 bounded_retries_fail_publishes 的静态端口说明）。
+        let mut config = MqttClientConfig::new("client-metrics-c", "127.0.0.1", 11880);
+        config.reconnect_min_delay = Duration::from_millis(50);
+        config.reconnect_max_delay = Duration::from_millis(100);
+        config.connect_timeout = Duration::from_secs(1);
+        config.max_reconnect_retries = Some(1);
+        let client = MqttClient::spawn_with_metrics(config, registry.clone()).unwrap();
+
+        let result = wait_publish_failure(&client).await;
+        assert!(result.is_err(), "前置：发布应最终失败");
+        client.shutdown().await.unwrap();
+
+        let snap = registry.snapshot();
+        let failed = match snap.get(metric_names::MQTT_FAILED_TOTAL) {
+            Some(MetricValue::Count(n)) => *n,
+            other => panic!("失败计数应已注册，实际 {other:?}"),
+        };
+        assert!(failed >= 1, "任务退出时的失败结算必须计数，实际 {failed}");
+        assert_eq!(
+            snap.get(metric_names::MQTT_INFLIGHT_GAUGE),
+            Some(&MetricValue::Gauge(0)),
+            "全部失败结算后在途计数必须归零"
+        );
     }
 }

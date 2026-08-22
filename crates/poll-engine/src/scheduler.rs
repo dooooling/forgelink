@@ -11,6 +11,7 @@ use tracing::warn;
 use crate::config::{PollConfig, PollConfigError};
 use crate::driver::PollDriver;
 use crate::events::PollEvent;
+use crate::metrics::PollMetrics;
 use crate::poll::{PollTarget, poll_loop};
 
 /// 轮询调度器。
@@ -18,23 +19,55 @@ use crate::poll::{PollTarget, poll_loop};
 /// 持有根取消令牌与全部设备任务句柄；[`PollScheduler::shutdown`] 统一取消并等待所有
 /// 任务退出。同一驱动实例被多个目标共享时，由调用方用
 /// `Arc<Mutex<Box<dyn PollDriver>>>` 包装以串行化访问。
+///
+/// 指标埋点（§34.2.1）：[`PollScheduler::spawn_with_metrics`] 注入
+/// `Arc<MetricsRegistry>` 后，本调度器启动的全部轮询任务共享同一组句柄；
+/// 未注入（[`PollScheduler::spawn`]）时不埋点——热路径仅一次 `Option`
+/// 判断，零额外开销。
 #[derive(Default)]
 pub struct PollScheduler {
     cancel: Option<CancellationToken>,
     tasks: Vec<JoinHandle<()>>,
+    metrics: PollMetrics,
 }
 
 impl PollScheduler {
-    /// 创建一个空调度器。
+    /// 创建一个空调度器（不埋点）。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cancel: None,
+            tasks: Vec::new(),
+            metrics: PollMetrics::NOOP,
+        }
+    }
+
+    /// 创建一个带指标埋点的调度器：全部后续 [`Self::spawn`] 的任务共用
+    /// 同一组指标句柄（注册幂等；重复注册返回同一底层单元格）。
+    pub fn with_metrics(registry: Arc<metrics::MetricsRegistry>) -> Self {
+        Self {
+            cancel: None,
+            tasks: Vec::new(),
+            metrics: PollMetrics::new(Some(&registry)),
+        }
     }
 
     /// 启动一个设备轮询任务（每设备每周期一组，对应 §22 的 Group）。
     ///
     /// 启动前校验配置（`interval_ms`、超时与退避参数必须为正），校验失败返回
-    /// [`PollConfigError`] 且不创建任务。
+    /// [`PollConfigError`] 且不创建任务。等价于不埋点的
+    /// [`Self::spawn_with_metrics`]。
     pub fn spawn(
+        &mut self,
+        target: PollTarget,
+        driver: Arc<Mutex<Box<dyn PollDriver>>>,
+        config: PollConfig,
+        events: mpsc::Sender<PollEvent>,
+    ) -> Result<(), PollConfigError> {
+        self.spawn_with_metrics(target, driver, config, events)
+    }
+
+    /// 启动一个设备轮询任务并携带本调度器的指标句柄（§34.2.1）。
+    pub fn spawn_with_metrics(
         &mut self,
         target: PollTarget,
         driver: Arc<Mutex<Box<dyn PollDriver>>>,
@@ -45,7 +78,14 @@ impl PollScheduler {
         config.validate()?;
         let root = self.cancel.get_or_insert_with(CancellationToken::new);
         let cancel = root.child_token();
-        let handle = tokio::spawn(poll_loop(target, driver, config, cancel, events));
+        let handle = tokio::spawn(poll_loop(
+            target,
+            driver,
+            config,
+            cancel,
+            events,
+            self.metrics.clone(),
+        ));
         self.tasks.push(handle);
         Ok(())
     }

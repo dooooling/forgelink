@@ -8,10 +8,12 @@ description = "数据管道（§31.2）：有界队列、按设备聚合的 Tele
 
 [dependencies]
 diagnostics = { path = "../diagnostics" }
+metrics = { path = "../metrics" }
 observation-model = { path = "../observation-model" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tracing = "0.1"
 
 [dev-dependencies]
+metrics = { path = "../metrics" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

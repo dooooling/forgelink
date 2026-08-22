@@ -20,6 +20,7 @@ test-utils = [
 
 [dependencies]
 data-pipeline = { path = "../data-pipeline" }
+metrics = { path = "../metrics" }
 ring = "0.17"
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
 rustls = "0.22"
@@ -33,6 +34,7 @@ tokio-rustls = { version = "0.25", optional = true }
 tracing = "0.1"
 
 [dev-dependencies]
+metrics = { path = "../metrics" }
 rcgen = "0.13"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
 tokio-rustls = "0.25"

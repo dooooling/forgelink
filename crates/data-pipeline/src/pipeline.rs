@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 
 use observation_model::Observation;
@@ -11,6 +12,7 @@ use tracing::warn;
 
 use crate::batch::ObservationBatch;
 use crate::config::{BUFFER_BATCH_MULTIPLIER, PipelineConfig};
+use crate::metrics::PipelineMetrics;
 
 /// 管道错误。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +59,12 @@ struct PendingBatch {
     observations: Vec<Observation>,
 }
 
+/// outbox 中在途批次的指标上下文：入队时刻（背压等待起点，§34.2.1）。
+struct QueuedBatch {
+    batch: ObservationBatch,
+    queued_at: Instant,
+}
+
 /// data-pipeline（§31.2）。
 ///
 /// # 用法
@@ -86,16 +94,36 @@ impl Pipeline {
     ///   `ingest()` 返回 [`PipelineError::Closed`]，剩余数据结算为丢弃
     ///   统计，不静默丢失。
     /// - 配置非法时返回 [`PipelineError::InvalidConfig`]，不启动任务。
+    /// - 不埋点（§34.2.1 句柄全 no-op）；需要指标用
+    ///   [`Self::spawn_with_metrics`]。
     pub fn spawn(
         config: PipelineConfig,
         output: mpsc::Sender<ObservationBatch>,
+    ) -> Result<Self, PipelineError> {
+        Self::spawn_inner(config, output, PipelineMetrics::new(None))
+    }
+
+    /// 启动管道并注入指标注册表（§34.2.1）：批次输出、观测计数与
+    /// 背压等待时长经 `registry` 暴露（注册幂等）。
+    pub fn spawn_with_metrics(
+        config: PipelineConfig,
+        output: mpsc::Sender<ObservationBatch>,
+        registry: Arc<metrics::MetricsRegistry>,
+    ) -> Result<Self, PipelineError> {
+        Self::spawn_inner(config, output, PipelineMetrics::new(Some(&registry)))
+    }
+
+    fn spawn_inner(
+        config: PipelineConfig,
+        output: mpsc::Sender<ObservationBatch>,
+        metrics: PipelineMetrics,
     ) -> Result<Self, PipelineError> {
         if let Err(reason) = config.validate() {
             return Err(PipelineError::InvalidConfig { reason });
         }
         let (ingest_tx, ingest_rx) = mpsc::channel(config.input_capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let task = tokio::spawn(run(config, ingest_rx, output, shutdown_rx));
+        let task = tokio::spawn(run(config, ingest_rx, output, shutdown_rx, metrics));
         Ok(Self {
             ingest_tx,
             shutdown_tx,
@@ -149,10 +177,12 @@ async fn run(
     mut ingest_rx: mpsc::Receiver<Observation>,
     output_tx: mpsc::Sender<ObservationBatch>,
     mut shutdown_rx: watch::Receiver<bool>,
+    metrics: PipelineMetrics,
 ) -> DrainStats {
     let mut pending: HashMap<String, PendingBatch> = HashMap::new();
     let mut device_sequence: HashMap<String, u64> = HashMap::new();
-    let mut outbox: VecDeque<ObservationBatch> = VecDeque::new();
+    // outbox 携带入队时刻（背压等待起点，§34.2.1）。
+    let mut outbox: VecDeque<QueuedBatch> = VecDeque::new();
     let mut buffered = 0usize;
     let mut stats = DrainStats::default();
     // P2：`PipelineConfig::validate()` 已拒绝乘法溢出的配置，
@@ -186,7 +216,7 @@ async fn run(
                     }
                     flush_pending_to_outbox(&config, &mut pending, &mut device_sequence, &mut outbox);
                     let deadline = Instant::now() + config.drain_timeout;
-                    drain_outbox(&mut outbox, &output_tx, deadline, &mut stats).await;
+                    drain_outbox(&mut outbox, &output_tx, deadline, &mut stats, &metrics).await;
                     break;
                 }
             }
@@ -212,13 +242,16 @@ async fn run(
                         if full {
                             // 满批立即输出（§31.2）：转入 outbox，由发送分支输出。
                             let entry = pending.remove(&device_id).expect("满批必须存在");
-                            outbox.push_back(ObservationBatch::new(
-                                &config.site_id,
-                                &config.collector_session_id,
-                                device_id.clone(),
-                                entry.sequence,
-                                entry.observations,
-                            ));
+                            outbox.push_back(QueuedBatch {
+                                batch: ObservationBatch::new(
+                                    &config.site_id,
+                                    &config.collector_session_id,
+                                    device_id.clone(),
+                                    entry.sequence,
+                                    entry.observations,
+                                ),
+                                queued_at: Instant::now(),
+                            });
                             if let Some(seq) = device_sequence.get_mut(&device_id) {
                                 *seq += 1;
                             }
@@ -231,12 +264,13 @@ async fn run(
             result = output_tx.reserve(), if !outbox.is_empty() => {
                 match result {
                     Ok(permit) => {
-                        let batch = outbox.pop_front().expect("guard 保证 outbox 非空");
-                        let count = batch.observations.len();
-                        permit.send(batch);
+                        let queued = outbox.pop_front().expect("guard 保证 outbox 非空");
+                        let count = queued.batch.observations.len();
+                        permit.send(queued.batch);
                         buffered -= count;
                         stats.batches_emitted += 1;
                         stats.observations_emitted += count;
+                        metrics.observe_batch_emitted(count, queued.queued_at.elapsed().as_nanos());
                     }
                     Err(_) => {
                         // P1：reserve 失败即输出接收端永久消失 → 终止管道。
@@ -285,7 +319,7 @@ async fn terminate_on_output_closed(
     ingest_rx: &mut mpsc::Receiver<Observation>,
     pending: &mut HashMap<String, PendingBatch>,
     device_sequence: &mut HashMap<String, u64>,
-    outbox: &mut VecDeque<ObservationBatch>,
+    outbox: &mut VecDeque<QueuedBatch>,
     stats: &mut DrainStats,
 ) {
     ingest_rx.close();
@@ -294,7 +328,7 @@ async fn terminate_on_output_closed(
     }
     flush_pending_to_outbox(config, pending, device_sequence, outbox);
     let dropped_batches = outbox.len();
-    let dropped_observations: usize = outbox.iter().map(|b| b.observations.len()).sum();
+    let dropped_observations: usize = outbox.iter().map(|q| q.batch.observations.len()).sum();
     stats.batches_dropped += dropped_batches;
     stats.observations_dropped += dropped_observations;
     warn!(
@@ -330,7 +364,7 @@ fn flush_pending_to_outbox(
     config: &PipelineConfig,
     pending: &mut HashMap<String, PendingBatch>,
     device_sequence: &mut HashMap<String, u64>,
-    outbox: &mut VecDeque<ObservationBatch>,
+    outbox: &mut VecDeque<QueuedBatch>,
 ) {
     let device_ids: Vec<String> = pending.keys().cloned().collect();
     for device_id in device_ids {
@@ -339,13 +373,16 @@ fn flush_pending_to_outbox(
         while !entry.observations.is_empty() {
             let take = entry.observations.len().min(config.max_batch_size);
             let observations = entry.observations.drain(..take).collect();
-            outbox.push_back(ObservationBatch::new(
-                &config.site_id,
-                &config.collector_session_id,
-                device_id.clone(),
-                sequence,
-                observations,
-            ));
+            outbox.push_back(QueuedBatch {
+                batch: ObservationBatch::new(
+                    &config.site_id,
+                    &config.collector_session_id,
+                    device_id.clone(),
+                    sequence,
+                    observations,
+                ),
+                queued_at: Instant::now(),
+            });
             sequence += 1;
         }
         if let Some(seq) = device_sequence.get_mut(&device_id) {
@@ -359,17 +396,18 @@ fn flush_pending_to_outbox(
 /// 每批 ≤ `max_batch_size`（聚合时已保证，§31.2 批次上限契约）；
 /// 超时或输出通道关闭时，未输出的数据计入统计（有界排空）。
 async fn drain_outbox(
-    outbox: &mut VecDeque<ObservationBatch>,
+    outbox: &mut VecDeque<QueuedBatch>,
     output_tx: &mpsc::Sender<ObservationBatch>,
     deadline: Instant,
     stats: &mut DrainStats,
+    metrics: &PipelineMetrics,
 ) {
-    while let Some(batch) = outbox.pop_front() {
-        let observation_count = batch.observations.len();
+    while let Some(queued) = outbox.pop_front() {
+        let observation_count = queued.batch.observations.len();
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             drop_outbox_rest(
-                batch,
+                queued,
                 outbox,
                 stats,
                 "pipeline_drain_timeout",
@@ -383,13 +421,17 @@ async fn drain_outbox(
             result = output_tx.reserve() => {
                 match result {
                     Ok(permit) => {
-                        permit.send(batch);
+                        permit.send(queued.batch);
                         stats.batches_emitted += 1;
                         stats.observations_emitted += observation_count;
+                        metrics.observe_batch_emitted(
+                            observation_count,
+                            queued.queued_at.elapsed().as_nanos(),
+                        );
                     }
                     Err(_) => {
                         drop_outbox_rest(
-                            batch,
+                            queued,
                             outbox,
                             stats,
                             "pipeline_output_closed",
@@ -401,7 +443,7 @@ async fn drain_outbox(
             }
             _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                 drop_outbox_rest(
-                    batch,
+                    queued,
                     outbox,
                     stats,
                     "pipeline_drain_timeout",
@@ -415,26 +457,29 @@ async fn drain_outbox(
 
 /// 丢弃当前批次与 outbox 中剩余批次并计入统计。
 fn drop_outbox_rest(
-    current: ObservationBatch,
-    outbox: &mut VecDeque<ObservationBatch>,
+    current: QueuedBatch,
+    outbox: &mut VecDeque<QueuedBatch>,
     stats: &mut DrainStats,
     error_code: &str,
     reason: &str,
 ) {
     stats.batches_dropped += 1 + outbox.len();
-    stats.observations_dropped +=
-        current.observations.len() + outbox.iter().map(|b| b.observations.len()).sum::<usize>();
+    stats.observations_dropped += current.batch.observations.len()
+        + outbox
+            .iter()
+            .map(|q| q.batch.observations.len())
+            .sum::<usize>();
     warn!(
         component = "data-pipeline",
-        device_id = %current.device_id,
+        device_id = %current.batch.device_id,
         error_code = error_code,
         "{reason}，{count} 个批次被丢弃",
         count = 1 + outbox.len(),
     );
-    for batch in outbox.drain(..) {
+    for queued in outbox.drain(..) {
         warn!(
             component = "data-pipeline",
-            device_id = %batch.device_id,
+            device_id = %queued.batch.device_id,
             error_code = error_code,
             "{reason}，批次被丢弃"
         );
@@ -963,5 +1008,102 @@ mod tests {
             out_rx.try_recv().is_err(),
             "取消后不得排空输出（刷新周期内不应出现批次）"
         );
+    }
+
+    // ---- 指标埋点（§34.2.1） ---------------------------------------------------
+
+    /// 注入 registry 后：满批输出计入 `pipeline_batches_flushed_total` 与
+    /// `pipeline_observations_total`（add(n) 批量加）；背压直方图有观测。
+    #[tokio::test]
+    async fn metrics_count_flushed_batches_and_observations() {
+        let registry = Arc::new(metrics::MetricsRegistry::new());
+        let (out_tx, mut out_rx) = mpsc::channel(4);
+        let pipeline = Pipeline::spawn_with_metrics(
+            cfg("plant-a", "s1", 3, Duration::from_secs(60)),
+            out_tx,
+            registry.clone(),
+        )
+        .unwrap();
+        for sequence in 0..3 {
+            pipeline
+                .ingest(make_obs("dev-m", "drive.a", sequence))
+                .await
+                .unwrap();
+        }
+        // 满批立即输出（§31.2），不等待刷新周期。
+        let batch = out_rx.recv().await.expect("满批应立即输出");
+        assert_eq!(batch.observations.len(), 3);
+        // 停机排空剩余 partial：再产出一批。
+        for sequence in 3..5 {
+            pipeline
+                .ingest(make_obs("dev-m", "drive.a", sequence))
+                .await
+                .unwrap();
+        }
+        let stats = pipeline.shutdown().await.unwrap();
+        assert_eq!(stats.batches_emitted, 2);
+        assert_eq!(stats.observations_emitted, 5);
+
+        use crate::metrics::metric_names;
+        use metrics::MetricValue;
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get(metric_names::PIPELINE_BATCHES_FLUSHED_TOTAL),
+            Some(&MetricValue::Count(2)),
+            "批次计数必须与输出批次一致"
+        );
+        assert_eq!(
+            snap.get(metric_names::PIPELINE_OBSERVATIONS_TOTAL),
+            Some(&MetricValue::Count(5)),
+            "观测计数必须 add(批量) 累计"
+        );
+        let Some(MetricValue::Histogram { count, .. }) =
+            snap.get(metric_names::PIPELINE_FLUSH_BACKPRESSURE_WAIT_NS_HIST)
+        else {
+            panic!("背压直方图应已注册");
+        };
+        assert_eq!(*count, 2, "每次成功发送观测一次背压等待");
+    }
+
+    /// 背压场景：输出通道满时批次滞留 outbox，解除后等待时长进入直方图
+    ///（> 0 的观测证明等待窗口被真实记录，而非恒 0 占位）。
+    #[tokio::test]
+    async fn metrics_record_backpressure_wait() {
+        let registry = Arc::new(metrics::MetricsRegistry::new());
+        let mut config = cfg("plant-a", "s1", 1, Duration::from_secs(60));
+        config.input_capacity = 8;
+        // 输出通道容量 1 且暂不消费：首批占位，第二批在 reserve 上背压。
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let pipeline = Pipeline::spawn_with_metrics(config, out_tx, registry.clone()).unwrap();
+        pipeline
+            .ingest(make_obs("dev-bp", "drive.a", 0))
+            .await
+            .unwrap();
+        pipeline
+            .ingest(make_obs("dev-bp", "drive.a", 1))
+            .await
+            .unwrap();
+
+        // 第二批必然经历背压等待；消费后管道继续推进至停机排空。
+        let stats = {
+            let _first = out_rx.recv().await.expect("首批");
+            pipeline.shutdown().await.unwrap()
+        };
+        assert_eq!(stats.batches_emitted, 2);
+
+        use crate::metrics::metric_names;
+        use metrics::MetricValue;
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get(metric_names::PIPELINE_BATCHES_FLUSHED_TOTAL),
+            Some(&MetricValue::Count(2))
+        );
+        let Some(MetricValue::Histogram { sum, count, .. }) =
+            snap.get(metric_names::PIPELINE_FLUSH_BACKPRESSURE_WAIT_NS_HIST)
+        else {
+            panic!("背压直方图应已注册");
+        };
+        assert_eq!(*count, 2);
+        assert!(*sum > 0, "背压等待必须产生非零时长观测");
     }
 }

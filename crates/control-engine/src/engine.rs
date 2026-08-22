@@ -42,6 +42,8 @@ pub(crate) struct EngineContext {
     pub policy: Arc<ControlPolicy>,
     /// 活跃（未结算）请求的共享结果：幂等 Duplicate 时等待首个请求的最终结果。
     pub active: Mutex<HashMap<IdempotencyKey, Arc<SharedResult>>>,
+    /// 指标句柄（§34.2.1；未注入时全 no-op）。
+    pub metrics: crate::metrics::ControlMetrics,
 }
 
 /// 引擎构造配置（§81 依赖装配）。
@@ -58,6 +60,20 @@ pub struct ControlEngineConfig {
     pub audit: Arc<dyn crate::audit::AuditSink>,
     /// 策略（§86）。
     pub policy: Arc<ControlPolicy>,
+    /// 指标注册表（§34.2.1，可选）：`None` 时引擎不埋点。
+    ///
+    /// 用 [`ControlEngineConfig::with_metrics`]( Self::with_metrics) 附加。
+    pub metrics: Option<Arc<metrics::MetricsRegistry>>,
+}
+
+impl ControlEngineConfig {
+    /// 附加指标注册表（§34.2.1）：队列深度、六终态计数、冷却期建立与
+    /// Journal 结算失败经 `registry` 暴露（注册幂等）。未调用时引擎不埋点。
+    #[must_use]
+    pub fn with_metrics(mut self, registry: Arc<metrics::MetricsRegistry>) -> Self {
+        self.metrics = Some(registry);
+        self
+    }
 }
 
 /// 提交上下文（§90：谁、来自哪里）。
@@ -279,6 +295,7 @@ impl ControlEngine {
         if let Err(e) = config.policy.validate() {
             panic!("控制策略非法：{e}");
         }
+        let control_metrics = crate::metrics::ControlMetrics::new(config.metrics.as_ref());
         let context = Arc::new(EngineContext {
             executor: config.executor,
             journal: config.journal,
@@ -288,6 +305,7 @@ impl ControlEngine {
             audit: config.audit,
             policy: config.policy,
             active: Mutex::new(HashMap::new()),
+            metrics: control_metrics,
         });
         Self {
             inner: Arc::new(Inner {
@@ -796,6 +814,12 @@ impl ControlEngine {
                     .lock()
                     .expect("active 锁被毒化")
                     .remove(&key);
+                // §34.2.1：停机拒绝以 Indeterminate 终态结算（未入队成功，
+                // 无深度配对；Journal 结算失败已另行计数）。
+                self.inner
+                    .context
+                    .metrics
+                    .observe_settled(observation_model::ControlStatus::Indeterminate);
                 shared.set(result);
                 Err(SubmitError::EngineClosed)
             }
@@ -1011,6 +1035,11 @@ impl ControlEngine {
             ),
         )
         .await;
+        // §34.2.1：Driver 前拒绝计入 Rejected 终态（未入队，无深度配对）。
+        self.inner
+            .context
+            .metrics
+            .observe_settled(ControlStatus::Rejected);
         ControlReceipt::ready(result)
     }
 
@@ -1091,6 +1120,8 @@ impl ControlEngine {
             ),
         )
         .await;
+        // §34.2.1：孤儿记录以 Rejected（或降级 Indeterminate）终态结算。
+        self.inner.context.metrics.observe_settled(result.status);
         ControlReceipt::ready(result)
     }
 
@@ -1178,6 +1209,7 @@ impl ControlEngine {
         .await;
         // 结算共享结果并移除 active（P1-6：拒绝同样是终态，幂等等待者获得一致
         // 结果，不残留 stale 条目；shared 必为已登记 active 的条目）。
+        self.inner.context.metrics.observe_settled(result.status);
         self.inner
             .context
             .active
