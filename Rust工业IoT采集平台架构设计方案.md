@@ -2331,6 +2331,36 @@ forced process restart during WAL write
 
 性能验收必须同时记录 CPU、RSS、P95/P99 采集延迟，不能只看吞吐。
 
+### 34.2.1 指标埋点要求（Normative）
+
+§34.2 报告项必须有对应运行时指标支撑。组件在代码路径上暴露计数器/直方图，由统一 metrics 门面聚合；指标是验收与现场运维的共同基础设施：
+
+```text
+poll-engine          poll_batches_total / poll_errors_total{reason} /
+                     schedule_delay_ns（直方图：调度触发 vs 计划时刻偏差）
+data-pipeline        batches_flushed_total / observations_total /
+                     flush_backpressure_wait_ns
+local-buffer         wal_inflight（gauge）/ wal_disk_bytes（gauge）/
+                     wal_replayed_total / wal_ack_dropped_total /
+                     wal_persist_ns（直方图）
+mqtt-client          mqtt_inflight（gauge）/ mqtt_published_total /
+                     mqtt_redelivered_total / mqtt_failed_total /
+                     mqtt_publish_ns（直方图）
+control-engine       control_queue_depth{device}（gauge，有界采样）/
+                     control_settled_total{status} / control_cooldown_entered_total /
+                     control_journal_settle_failed_total
+diagnostics          日志丢弃计数（非阻塞队列满）
+```
+
+约定：
+
+- 门面必须零依赖（不引入第三方 metrics 库）、默认实现为进程内原子计数器；
+- 埋点在热路径上只做一次原子操作，禁止加锁与堆分配；
+- 直方图为固定桶边界（ns 级），快照读取为无锁聚合；
+- 未注册的指标读取返回 0，不得 panic；
+- REST 只读暴露 `GET /api/v1/metrics`（`forgelink.metrics.v1`），属管理接口非控制面——只读构建同样可用；响应不含文件路径、地址、凭据。
+
+
 ## 34.3 Timeout / Reconnect
 
 必须满足：
