@@ -197,7 +197,11 @@ impl ControlStack {
 ///
 /// 纯内存构造，不失败。设备目录含**禁用**设备——引擎对禁用设备以
 /// `DEVICE_DISABLED` 明确拒绝，而非"未知设备"（§84 可诊断性）。
-pub(crate) fn assemble(statics: ControlStatic, manager: &Arc<DeviceManager>) -> ControlAttachment {
+pub(crate) fn assemble(
+    statics: ControlStatic,
+    manager: &Arc<DeviceManager>,
+    metrics_registry: &Arc<metrics::MetricsRegistry>,
+) -> ControlAttachment {
     let mut catalog = MemoryDeviceCatalog::new();
     for device_id in manager.device_ids() {
         // device_ids 与注册表同源，get 理论上必命中；防御式跳过而非
@@ -227,7 +231,8 @@ pub(crate) fn assemble(statics: ControlStatic, manager: &Arc<DeviceManager>) -> 
         executor,
         audit: Arc::new(TracingAuditSink),
         policy: statics.policy,
-        metrics: None,
+        // §34.2.1：控制指标与采集组件共享同一注册表（装配参数传入）。
+        metrics: Some(Arc::clone(metrics_registry)),
     });
 
     // REST 适配层：namespace/默认超时来自 control 配置（§32.2 服务端

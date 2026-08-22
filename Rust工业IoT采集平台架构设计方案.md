@@ -2460,10 +2460,15 @@ mqtt-client           MQTT 北向客户端（QoS 1 发布、自动重连退避�
 local-buffer          Local Buffer/WAL（SQLite WAL 崩溃恢复、两级缓冲、幂等补传与 ack 删除）
 rest-api              REST v1 管理接口——只读：设备/资源/属性/健康、错误模型、有界并发
                       （§31.5/§31.6）；控制：POST controls 202 异步受理 + GET control-requests
-                      三态查询、Bearer 认证（§90.2）、错误映射 400/404/409/422/503
+                      三态查询、Bearer 认证（§90.2）、错误映射 400/404/409/422/503；
+                      指标：GET /api/v1/metrics（§34.2.1，管理接口非控制面）
+metrics               指标门面（§34.2.1）：零依赖原子 Counter/Gauge/固定桶 Histogram、
+                      有界注册表与溢出降级、无锁快照；五组件埋点接入
+                      （poll/pipeline/WAL/MQTT/control），collector 共享单一注册表
 collector             Collector 运行时组装（§93/§100：只读采集链路——轮询→映射→组包→WAL→MQTT
                       QoS1 发布；有序停机有限排空，REST 服务异常退出触发停机；control feature：
-                      control 配置段装配 Control Engine，停机第 0.5 步结算在途控制）
+                      control 配置段装配 Control Engine，停机第 0.5 步结算在途控制；
+                      metrics 注册表全组件共享并经 REST 暴露）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 

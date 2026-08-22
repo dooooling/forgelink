@@ -148,6 +148,7 @@ dependencies = [
  "driver-loader",
  "driver-sdk",
  "local-buffer",
+ "metrics",
  "modbus-mock",
  "mqtt-client",
  "observation-model",
