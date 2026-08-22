@@ -33,6 +33,13 @@ impl DeviceInfo {
 /// 本 crate 提供内存版 [`MemoryDeviceCatalog`] 供测试与初期使用。
 pub trait DeviceCatalog: Send + Sync {
     fn device(&self, device_id: &DeviceId) -> Option<DeviceInfo>;
+
+    /// 全部已登记设备 ID（§34.2.1 per-device 指标维度的取值域：装配期
+    /// 静态清单，数量有界且可枚举）。默认空——未实现的目录退化为只有
+    /// 全局聚合维度（不破坏外部实现者）。
+    fn device_ids(&self) -> Vec<DeviceId> {
+        Vec::new()
+    }
 }
 
 /// 内存版设备目录（测试与初期使用）。
@@ -65,6 +72,10 @@ impl MemoryDeviceCatalog {
 impl DeviceCatalog for MemoryDeviceCatalog {
     fn device(&self, device_id: &DeviceId) -> Option<DeviceInfo> {
         self.devices.get(device_id).cloned()
+    }
+
+    fn device_ids(&self) -> Vec<DeviceId> {
+        self.devices.keys().cloned().collect()
     }
 }
 

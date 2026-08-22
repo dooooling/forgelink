@@ -310,6 +310,12 @@ impl CollectorRuntime {
             None => (None, None),
         };
 
+        // 7.6) 指标注册表冻结（§34.2.1 无锁快照，评审 P1）：全部组件装配
+        //      完成（预注册期结束）、REST/采集任务启动前一次性 freeze——
+        //      此后 /api/v1/metrics 的快照读取零锁。运行期不再有注册点
+        //      （per-device gauge 已按静态设备清单预注册）。
+        metrics_registry.freeze();
+
         // 8) REST v1 管理接口（§31.5/§104）：默认禁用，显式配置
         //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
         //    fail-fast（用户显式配置了端口而不可用，不静默降级），且

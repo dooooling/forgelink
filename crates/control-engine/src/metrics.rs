@@ -12,13 +12,14 @@
 //! `queue_depth_device` 按设备拆分队列深度：名称格式
 //! `control_queue_depth_device_{device_id}`。§34.2.1 禁止运行期拼接
 //! **任意**维度值，但本维度的取值来自**静态配置的设备清单**（Device
-//! Catalog 装配期固定、数量有界且可枚举），不是任意外部输入——采用
-//! "装配期不可知、首见注册"的折衷：首次观测某设备时注册其 gauge，
-//! [`MAX_METRICS`](metrics::MAX_METRICS) 兜底超限（理论上不可能：
-//! 设备数有界）降级为只更新全局聚合。
+//! Catalog 装配期固定、数量有界且可枚举），不是任意外部输入——引擎
+//! 构造时枚举目录清单**预注册全部设备 gauge**（评审 P1：首见注册会在
+//! 控制热路径引入锁/堆分配/字符串拼接，违背"埋点只做一次原子操作"，
+//! 且 registry freeze 后运行期注册的指标不进快照）。运行期观测路径：
+//! 一次 HashMap 只读查找 + 原子 add/sub。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use metrics::{Counter, Gauge, MetricsRegistry};
 use observation_model::ControlStatus;
@@ -54,12 +55,15 @@ pub struct ControlMetrics {
     /// 队列深度 gauge（全引擎聚合；并发增减经 Gauge 原生原子
     /// add/sub_saturating，无镜像变量）。
     queue_depth: Option<Gauge>,
-    /// per-device 队列深度 gauge（首见注册，有界化见模块文档）。
+    /// per-device 队列深度 gauge（**启动期按静态设备清单预注册**，评审
+    /// P1：首见注册会在控制热路径引入锁+堆分配+字符串拼接，违背
+    /// §34.2.1"埋点只做一次原子操作"；且与 registry freeze 的一次性语义
+    /// 冲突——运行期注册的指标不进快照）。
     ///
-    /// `None` = 未注入 registry（不建 map）；`Some(map)` 内条目数受
-    /// 设备清单约束 + [`MAX_METRICS`](metrics::MAX_METRICS) 兜底。
-    /// `Arc<Mutex<..>>`：本结构体被 Clone 共享（worker/提交线程各持句柄）。
-    queue_depth_device: Option<(Arc<MetricsRegistry>, Arc<Mutex<HashMap<String, Gauge>>>)>,
+    /// `None` = 未注入 registry 或未提供设备清单（不建 map）。设备清单
+    /// 来自 Device Catalog（装配期固定、数量有界且可枚举），MAX_METRICS
+    /// 兜底超限（返回 no-op 句柄，只影响该维度观测）。
+    queue_depth_device: Option<Arc<HashMap<String, Gauge>>>,
     /// 六个终态计数器。
     settled_succeeded: Option<Counter>,
     settled_failed: Option<Counter>,
@@ -76,18 +80,30 @@ pub struct ControlMetrics {
 impl ControlMetrics {
     /// 注册全部句柄；未提供 registry 时返回全 no-op。
     ///
-    /// `ControlMetrics` 未实现手动 no-op 构造之外的捷径：no-op 装配统一
-    /// 走本函数的 `None` 分支，避免误把空句柄当已注册。
-    pub fn new(registry: Option<&Arc<MetricsRegistry>>) -> Self {
+    /// `device_ids`：静态设备清单（§34.2.1 per-device 维度的取值域），
+    /// 装配期从 Device Catalog 枚举传入——启动时一次性预注册全部设备的
+    /// 队列深度 gauge，运行期热路径零锁零分配。未传（空切片等价）则
+    /// 只保留全局聚合维度。
+    pub fn new(registry: Option<&Arc<MetricsRegistry>>, device_ids: &[String]) -> Self {
         let Some(registry) = registry else {
             return Self::default();
         };
+        let queue_depth_device = if device_ids.is_empty() {
+            None
+        } else {
+            let mut map = HashMap::with_capacity(device_ids.len());
+            for device_id in device_ids {
+                let name = format!(
+                    "{}{device_id}",
+                    metric_names::CONTROL_QUEUE_DEPTH_DEVICE_PREFIX
+                );
+                map.insert(device_id.clone(), registry.gauge(&name));
+            }
+            Some(Arc::new(map))
+        };
         Self {
             queue_depth: Some(registry.gauge(metric_names::CONTROL_QUEUE_DEPTH_GAUGE)),
-            // per-device gauge 首见注册：registry 引用 + map 常驻，条目在
-            // 首次观测时经 registry 注册创建（MAX_METRICS 兜底超限返回
-            // no-op 句柄，深度更新降级为只动全局聚合）。
-            queue_depth_device: Some((Arc::clone(registry), Arc::new(Mutex::new(HashMap::new())))),
+            queue_depth_device,
             settled_succeeded: Some(
                 registry.counter(metric_names::CONTROL_SETTLED_SUCCEEDED_TOTAL),
             ),
@@ -107,26 +123,11 @@ impl ControlMetrics {
         }
     }
 
-    /// 取（首见时注册）指定设备的队列深度 gauge。
-    ///
-    /// 名称 = [`metric_names::CONTROL_QUEUE_DEPTH_DEVICE_PREFIX`] +
-    /// `device_id`。设备 ID 来自静态设备清单（数量有界），registry 的
-    /// MAX_METRICS 兜底超限（返回 no-op 句柄——只影响该维度观测，
-    /// 不影响正确性）。锁内操作仅发生在首见注册（低频）；命中路径是
-    /// 一次 HashMap 查找 + 句柄克隆，不在 registry 锁上。
+    /// 取指定设备预注册的队列深度 gauge（启动期已建表，运行期只读查找：
+    /// 一次 HashMap 命中 + 句柄克隆，零锁零分配；未在清单中的设备返回
+    /// `None`——理论上不可达，DeviceQueue 由同一清单构造）。
     fn device_gauge(&self, device_id: &str) -> Option<Gauge> {
-        let (registry, map) = self.queue_depth_device.as_ref()?;
-        let mut map = map.lock().expect("queue_depth_device 锁被毒化");
-        if let Some(gauge) = map.get(device_id) {
-            return Some(gauge.clone());
-        }
-        let name = format!(
-            "{}{device_id}",
-            metric_names::CONTROL_QUEUE_DEPTH_DEVICE_PREFIX
-        );
-        let gauge = registry.gauge(&name);
-        map.insert(device_id.to_owned(), gauge.clone());
-        Some(gauge)
+        self.queue_depth_device.as_ref()?.get(device_id).cloned()
     }
 
     /// 入队成功：全局与 per-device 队列深度 +1。

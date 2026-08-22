@@ -114,9 +114,10 @@ async fn run_loop(
     let mut ticker = tokio::time::interval(Duration::from_millis(target.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut backoff = config.backoff();
-    // 首个 tick 立即触发（interval 语义），计划时刻即任务启动时刻，不产生
-    // 有意义的调度偏差——跳过观测（评审 P1：首次观测会记录接近一个完整
-    // interval 的假延迟，污染 p99）。
+    // 首个 tick 立即触发（interval 语义），计划时刻即任务启动时刻，无
+    // 有意义的调度偏差——**只跳过观测，不跳过采集**（评审 P1 回归修复：
+    // 此前 `continue` 跳过了整个首轮 call.run()，低频周期设备重启后会
+    // 白等一个完整 interval 才首次采集）。
     let mut first_tick = true;
 
     loop {
@@ -130,15 +131,15 @@ async fn run_loop(
                 break;
             }
             scheduled = ticker.tick() => {
-                if first_tick {
-                    first_tick = false;
-                    continue;
+                if !first_tick {
+                    // 调度延迟 = 实际唤醒 − 计划时刻（唤醒晚于计划为正偏差）。
+                    let late =
+                        tokio::time::Instant::now().saturating_duration_since(scheduled);
+                    if let Some(hist) = metrics.schedule_delay_ns.as_ref() {
+                        hist.observe_ns(late.as_nanos() as u64);
+                    }
                 }
-                // 调度延迟 = 实际唤醒 − 计划时刻（唤醒晚于计划为正偏差）。
-                let late = tokio::time::Instant::now().saturating_duration_since(scheduled);
-                if let Some(hist) = metrics.schedule_delay_ns.as_ref() {
-                    hist.observe_ns(late.as_nanos() as u64);
-                }
+                first_tick = false;
             }
         }
 

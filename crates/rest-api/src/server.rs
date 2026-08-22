@@ -14,6 +14,7 @@
 //!   `control` feature 且 [`RestApiServer::spawn_with_control`] 装配时
 //!   存在；[`RestApiServer::spawn`] 与只读构建下控制路由不可达——404/405）。
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -631,11 +632,20 @@ async fn metrics_snapshot(
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    let metrics = registry
+    let mut metrics: BTreeMap<String, MetricView> = registry
         .snapshot()
         .into_iter()
         .map(|(name, value)| (name, MetricView::from(value)))
         .collect();
+    // §34.2.1 diagnostics 日志丢弃计数：diagnostics 是 L0 零依赖 crate
+    // 不反向依赖 metrics 门面，其进程级自诊断原子量由 REST 快照在此桥接
+    // 暴露（评审 P1：仅落 `dropped_log_count()` 不进统一快照等于没交付）。
+    metrics.insert(
+        "diagnostics_dropped_logs_total".to_owned(),
+        MetricView::Count {
+            value: diagnostics::dropped_log_count(),
+        },
+    );
     Json(MetricsResponse {
         schema: MetricsResponse::SCHEMA,
         captured_at_ns: crate::now_ns(),
@@ -792,10 +802,15 @@ mod tests {
         let (status, body) = get(app, "/api/v1/metrics").await;
         assert_eq!(status, StatusCode::OK, "空注册表是合法状态（200 非 404）");
         assert_eq!(body["schema"], "forgelink.metrics.v1");
+        // 注册表为空时响应仍含 diagnostics 桥接的自诊断计数（§34.2.1，
+        // 评审 P1：日志丢弃计数必须经统一端点可见）——恰为 1 项。
+        let metrics_obj = body["metrics"].as_object().expect("metrics 对象");
+        assert_eq!(metrics_obj.len(), 1, "空 registry 时仅 diagnostics 桥接项");
         assert_eq!(
-            body["metrics"].as_object().map(|m| m.len()),
-            Some(0),
-            "空注册表应序列化为空对象"
+            metrics_obj
+                .get("diagnostics_dropped_logs_total")
+                .map(|v| v["value"].clone()),
+            Some(serde_json::json!(0))
         );
     }
 

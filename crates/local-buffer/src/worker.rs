@@ -226,7 +226,7 @@ pub(crate) fn telemetry_topic(batch: &ObservationBatch) -> Result<String, LocalB
 /// 不修改数据库（避免启动时全表 UPDATE 的写入放大）。
 fn open_db(
     config: &LocalBufferConfig,
-) -> Result<(Connection, Vec<MemRecord>, i64, u64, i64), LocalBufferError> {
+) -> Result<(Connection, Vec<MemRecord>, i64, u64, i64, i64), LocalBufferError> {
     let conn = Connection::open(&config.db_path).map_err(|e| {
         // 非 SQLite 文件（SQLITE_NOTADB）与打不开（路径/权限）分开描述。
         if matches!(e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::NotADatabase)
@@ -420,6 +420,12 @@ fn open_db(
         |r| r.get(0),
     )?;
 
+    // 全库未确认记录总数（§34.2.1 wal_inflight 基线，评审 P1）：in-flight
+    // 语义 = WAL 未确认积压**全集**（磁盘含未分页加载的部分），不得用
+    // 内存分页窗口长度（mem.len()）代替——否则磁盘积压 > memory_records
+    // 时 gauge 严重少算，ACK 清空内存窗口后 gauge 归零而磁盘仍有大量待补传。
+    let total_unacked: i64 = conn.query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))?;
+
     // 恢复：分页加载前 `memory_records` 条（P1-3，内存窗口有界）；
     // 按本地递增序号升序 = §31.4 补传顺序。
     let mut stmt = conn.prepare(
@@ -442,7 +448,14 @@ fn open_db(
     }
     drop(stmt);
     let last_loaded = records.last().map(|r| r.local_seq).unwrap_or(0);
-    Ok((conn, records, last_loaded, bytes as u64, recover_watermark))
+    Ok((
+        conn,
+        records,
+        last_loaded,
+        bytes as u64,
+        recover_watermark,
+        total_unacked,
+    ))
 }
 
 /// 分页补充加载（P1-3）：内存持有（`mem` + `inflight`）始终
@@ -625,13 +638,13 @@ fn check_pending_confirm(conn: &mut Connection, state: &mut WorkerState) -> bool
 /// 启动数据以元组传入（open_db 结果），保持参数数量在 Clippy
 /// 阈值内。
 fn worker_loop(
-    opened: (Connection, Vec<MemRecord>, i64, u64, i64),
+    opened: (Connection, Vec<MemRecord>, i64, u64, i64, i64),
     config: LocalBufferConfig,
     mut rx: mpsc::Receiver<Cmd>,
     closed: &AtomicBool,
     wal_metrics: WalMetrics,
 ) {
-    let (conn, records, last_loaded_seq, bytes, recover_watermark) = opened;
+    let (conn, records, last_loaded_seq, bytes, recover_watermark, total_unacked) = opened;
     let mut state = WorkerState {
         mem: records.into(),
         inflight: HashMap::new(),
@@ -649,8 +662,10 @@ fn worker_loop(
         "Local Buffer 启动：已恢复未确认记录（分页加载，内存窗口 = memory_records）"
     );
     // 恢复的未确认记录计入 in-flight 基线（§34.2.1）：ACK / 过期清理时
-    // 同步扣减，镜像计数不漂移。磁盘占用基线同步入账（估算成本口径）。
-    wal_metrics.observe_restored(state.mem.len() as i64, bytes);
+    // 同步扣减，镜像计数不漂移。基线用**全库未确认总数**而非内存分页
+    // 窗口长度（评审 P1：磁盘积压 > memory_records 时窗口长度严重少算，
+    // gauge 会在 ACK 清空首窗口后虚假归零）。磁盘占用基线同步入账。
+    wal_metrics.observe_restored(total_unacked, bytes);
 
     let mut conn = conn;
     loop {

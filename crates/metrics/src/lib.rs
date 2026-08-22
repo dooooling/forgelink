@@ -253,11 +253,14 @@ type FrozenCells = Arc<[(String, MetricCell)]>;
 
 pub struct MetricsRegistry {
     inner: Mutex<RegistryInner>,
-    /// 冻结后的不可变单元格列表（[`Self::freeze`] 生成；`None` = 未冻结，
-    /// snapshot 走持锁拷贝路径）。`Mutex<Option<Arc<..>>>`：freeze 只在
-    /// 装配完成时调用一次，snapshot 持锁时间是一次 Arc clone——远短于
-    /// 未冻结路径的全量 BTreeMap 克隆。
-    frozen: Mutex<Option<FrozenCells>>,
+    /// 冻结后的不可变单元格列表（[`Self::freeze`] 一次性写入；运行期
+    /// snapshot 只读，**零锁**——评审 P1：`Mutex<Option<..>>` 的每次
+    /// `.lock()` 仍是锁，违背 §34.2.1"快照读取为无锁聚合"）。
+    ///
+    /// freeze 语义：一次性阶段转换（装配完成 → 运行期）。冻结后注册
+    /// 仍可用（句柄返回、热路径原子量照常工作），但新指标不进快照直到
+    /// 再次 freeze——因此约定**启动阶段预注册全部指标 → freeze 一次**。
+    frozen: std::sync::OnceLock<FrozenCells>,
 }
 
 struct RegistryInner {
@@ -274,7 +277,7 @@ impl MetricsRegistry {
                 metrics: BTreeMap::new(),
                 overflow_count: AtomicU64::new(0),
             }),
-            frozen: Mutex::new(None),
+            frozen: std::sync::OnceLock::new(),
         }
     }
 
@@ -347,30 +350,30 @@ impl MetricsRegistry {
 
     /// 冻结注册表（§34.2.1 无锁快照的前提，评审 P1）。
     ///
-    /// 装配完成（全部组件构造完毕）、进入运行期前调用一次：把注册表
-    /// 拷贝为不可变 `Arc` 列表。此后 [`Self::snapshot`] 只遍历该列表做
-    /// 原子加载——**零锁**；未调用时 snapshot 退化为持锁拷贝路径（正确性
-    /// 不受影响，仅不满足无锁语义）。冻结后注册仍可用（返回句柄），但
-    /// 新指标**不出现在快照中**直到再次冻结——注册期与运行期分离的约定
-    /// 见模块文档。
+    /// 装配完成（全部组件构造完毕）、进入运行期前调用**一次**：把注册表
+    /// 拷贝为不可变 `Arc` 列表。此后 [`Self::snapshot`]/[`Self::value_of`]
+    /// 只遍历该列表做原子加载——**零锁零互斥**（评审 P1：OnceLock 读取
+    /// 是普通内存加载）。
     ///
-    /// 幂等：重复调用以最后一次为准。
+    /// 一次性阶段转换：首次 freeze 后再次调用为 no-op（`OnceLock::set`
+    /// 失败即忽略）——与"启动预注册全部指标 → freeze 一次"的装配约定
+    /// 配套；运行期新增注册（如测试）不会出现在快照中。
     pub fn freeze(&self) {
         let inner = self.inner.lock().expect("metrics 锁被毒化");
         let frozen: FrozenCells = inner.metrics.clone().into_iter().collect();
         drop(inner);
-        *self.frozen.lock().expect("frozen 锁被毒化") = Some(frozen);
+        // OnceLock 已有值时 set 失败——保留首次冻结结果（幂等语义）。
+        let _ = self.frozen.set(frozen);
     }
 
     /// 快照读取（§34.2.1：无锁聚合 + 未注册读取返回 0）。
     ///
-    /// 已冻结：遍历不可变列表做原子加载（零锁、零堆分配除输出外）；
-    /// 未冻结：退化为持锁拷贝路径（装配期/测试场景）。**未注册的指标名
-    /// 在快照中以 0 值出现**（评审 P1 契约对齐：`snapshot_of(&name)`
-    /// 场景见 [`Self::value_of`]；本方法仍只列出已注册指标——"未注册
-    /// 返回 0"指查询语义而非全量枚举）。
+    /// 已冻结（生产路径）：遍历不可变列表做原子加载，**不碰任何锁**；
+    /// 未冻结（装配期/测试）：退化为持锁拷贝路径。**未注册的指标名
+    /// 在快照中以 0 值出现**（评审 P1 契约对齐：查询语义见
+    /// [`Self::value_of`]；本方法仍只列出已注册指标）。
     pub fn snapshot(&self) -> BTreeMap<String, MetricValue> {
-        if let Some(frozen) = self.frozen.lock().expect("frozen 锁被毒化").as_ref() {
+        if let Some(frozen) = self.frozen.get() {
             return frozen
                 .iter()
                 .map(|(name, cell)| (name.clone(), cell.to_value()))
@@ -392,8 +395,7 @@ impl MetricsRegistry {
     /// 已冻结走无锁列表查找；未冻结走注册表。未注册名返回 `Count(0)`
     /// （gauge/histogram 语义无法从名称推断，统一以 Count(0) 表达"零值"）。
     pub fn value_of(&self, name: &str) -> MetricValue {
-        let found = if let Some(frozen) = self.frozen.lock().expect("frozen 锁被毒化").as_ref()
-        {
+        let found = if let Some(frozen) = self.frozen.get() {
             frozen
                 .iter()
                 .find(|(n, _)| n == name)
@@ -554,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn freeze_enables_snapshot_and_new_registration_hidden_until_refreeze() {
+    fn freeze_enables_snapshot_and_is_one_shot() {
         let r = MetricsRegistry::new();
         let c = r.counter("before_freeze_total");
         c.inc();
@@ -568,12 +570,14 @@ mod tests {
         late.inc();
         assert!(
             !r.snapshot().contains_key("after_freeze_total"),
-            "冻结后新注册不出现在快照直到再次 freeze"
+            "冻结后新注册不出现在快照（OnceLock 一次性语义）"
         );
+        // 二次 freeze 是 no-op（OnceLock::set 失败即忽略）——与"启动预注册
+        // 全部指标 → freeze 一次"的装配约定配套。
         r.freeze();
-        assert_eq!(
-            r.snapshot().get("after_freeze_total"),
-            Some(&MetricValue::Count(1))
+        assert!(
+            !r.snapshot().contains_key("after_freeze_total"),
+            "重复 freeze 不得改变首次冻结结果"
         );
     }
 

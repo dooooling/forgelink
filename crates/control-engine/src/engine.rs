@@ -295,7 +295,12 @@ impl ControlEngine {
         if let Err(e) = config.policy.validate() {
             panic!("控制策略非法：{e}");
         }
-        let control_metrics = crate::metrics::ControlMetrics::new(config.metrics.as_ref());
+        // §34.2.1 per-device 维度：启动期按目录静态清单预注册全部设备的
+        // 队列深度 gauge（评审 P1：运行期首见注册会在控制热路径引入锁与
+        // 堆分配，且冻结快照不含运行期注册的指标）。
+        let device_ids = config.catalog.device_ids();
+        let control_metrics =
+            crate::metrics::ControlMetrics::new(config.metrics.as_ref(), &device_ids);
         let context = Arc::new(EngineContext {
             executor: config.executor,
             journal: config.journal,
