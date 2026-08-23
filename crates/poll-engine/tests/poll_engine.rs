@@ -1063,3 +1063,80 @@ async fn no_registry_still_delivers_events() {
     assert!(matches!(first, Some(PollEvent::Batch(_))));
     scheduler.shutdown().await;
 }
+
+/// 设备请求往返延迟直方图 `poll_request_ns_hist`（§34.2 报告必录项
+/// 「设备请求延迟」的指标支撑）：成功往返与超时截断的往返都必须产生
+/// 观测，且未注入 registry 时零影响由 no-op 路径保证。
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_track_request_latency_hist() {
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let (tx, mut rx) = mpsc::channel(64);
+    let target = PollTarget {
+        device_id: "dev-metrics-latency".to_owned(),
+        interval_ms: 200,
+        items: items(1),
+    };
+    let fast_config = PollConfig {
+        request_timeout: Duration::from_secs(5),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        shutdown_drain_timeout: Duration::from_secs(2),
+    };
+
+    // 阶段一：立即成功的驱动 → 至少一次成功往返观测。
+    let mut scheduler = PollScheduler::with_metrics(registry.clone());
+    scheduler
+        .spawn(
+            target.clone(),
+            mock_driver(Duration::ZERO, 0, vec![ok_result(0)]),
+            fast_config,
+            tx,
+        )
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("应收到成功批次");
+    assert!(matches!(first, Some(PollEvent::Batch(_))));
+    scheduler.shutdown().await;
+
+    use metrics::MetricValue;
+    let snap = registry.snapshot();
+    let Some(MetricValue::Histogram { count, sum, .. }) = snap.get("poll_request_ns_hist") else {
+        panic!("请求延迟直方图应已注册");
+    };
+    assert!(*count >= 1, "成功路径应至少观测一次往返");
+    assert!(*sum > 0, "真实往返耗时之和必须为正");
+    let count_after_success = *count;
+
+    // 阶段二：慢驱动（200ms）+ 40ms 请求超时 → 超时按截断值同样计入。
+    let slow_config = PollConfig {
+        request_timeout: Duration::from_millis(40),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        shutdown_drain_timeout: Duration::from_secs(2),
+    };
+    let (tx2, _rx2) = mpsc::channel(64);
+    let mut scheduler = PollScheduler::with_metrics(registry.clone());
+    scheduler
+        .spawn(
+            target,
+            mock_driver(Duration::from_millis(200), 0, vec![ok_result(0)]),
+            slow_config,
+            tx2,
+        )
+        .unwrap();
+    // 首个 tick 立即发起调用，40ms 超时即产生一次截断观测。
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    scheduler.shutdown().await;
+
+    let snap = registry.snapshot();
+    let Some(MetricValue::Histogram { count, .. }) = snap.get("poll_request_ns_hist") else {
+        panic!("直方图应仍存在");
+    };
+    assert!(
+        *count > count_after_success,
+        "超时截断的往返必须观测（{count_after_success} -> {count}）"
+    );
+}

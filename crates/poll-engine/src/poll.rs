@@ -143,7 +143,7 @@ async fn run_loop(
             }
         }
 
-        match call.run(target, driver, config, cancel).await {
+        match call.run(target, driver, config, cancel, metrics).await {
             Ok(outcome) => {
                 backoff.reset();
                 if !send_batch(target, events, cancel, outcome, metrics).await {
@@ -174,7 +174,7 @@ async fn run_loop(
                         }
                         _ = tokio::time::sleep(wait) => {}
                     }
-                    match call.run(target, driver, config, cancel).await {
+                    match call.run(target, driver, config, cancel, metrics).await {
                         Ok(outcome) => {
                             backoff.reset();
                             if !send_batch(target, events, cancel, outcome, metrics).await {
@@ -324,12 +324,16 @@ impl BatchCall {
     }
 
     /// 执行一次批量读取：`spawn_blocking` 隔离 + `request_timeout` 超时。
+    ///
+    /// 每次调用收尾时观测设备请求往返延迟（§34.2 必录「设备请求延迟」）：
+    /// 成功、驱动错误、panic 与超时（按超时上限截断）均计入同一分布。
     async fn run(
         &mut self,
         target: &PollTarget,
         driver: &Arc<Mutex<Box<dyn PollDriver>>>,
         config: &PollConfig,
         cancel: &CancellationToken,
+        metrics: &PollMetrics,
     ) -> Result<BatchOutcome, TaskError> {
         // 1. 收尾上一次（可能超时的）在途调用，期间响应取消；结果已作废。
         if let Some(handle) = &mut self.slot {
@@ -352,7 +356,11 @@ impl BatchCall {
             guard.read_batch(&items)
         });
 
-        match tokio::time::timeout(config.request_timeout, &mut handle).await {
+        // 等待结果收尾（成功/错误/panic/超时四出口统一在此之后观测一次
+        // 完整往返耗时，避免遗漏分支）。
+        let result = tokio::time::timeout(config.request_timeout, &mut handle).await;
+        metrics.observe_request_latency(started.elapsed());
+        match result {
             // 驱动返回整体错误。
             Ok(Ok(Err(error))) => Err(TaskError::Driver(error)),
             // 驱动调用 panic（跨 FFI 已收口，此为防御）。

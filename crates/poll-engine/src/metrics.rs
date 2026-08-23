@@ -7,6 +7,7 @@
 //! - 错误类别按固定枚举编码进常量名（可重试 / 永久 / 超时）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use metrics::{Counter, Histogram, MetricsRegistry};
 
@@ -22,6 +23,9 @@ pub(crate) mod metric_names {
     pub const POLL_ERRORS_TIMEOUT_TOTAL: &str = "poll_errors_timeout_total";
     /// 调度触发与计划时刻偏差（ns 直方图；tokio 运行时拥塞/阻塞可见性）。
     pub const SCHEDULE_DELAY_NS_HIST: &str = "schedule_delay_ns_hist";
+    /// 设备批量读取往返耗时（ns 直方图；§34.2 报告必录项「设备请求延迟」
+    /// 的指标支撑——成功、错误与超时均计入）。
+    pub const POLL_REQUEST_NS_HIST: &str = "poll_request_ns_hist";
 }
 
 /// 本组件的指标句柄集合（装配期注册一次；`None` = 不埋点）。
@@ -35,6 +39,7 @@ pub struct PollMetrics {
     pub errors_permanent: Option<Counter>,
     pub errors_timeout: Option<Counter>,
     pub schedule_delay_ns: Option<Histogram>,
+    pub request_latency_ns: Option<Histogram>,
 }
 
 impl PollMetrics {
@@ -49,6 +54,16 @@ impl PollMetrics {
             errors_permanent: Some(registry.counter(metric_names::POLL_ERRORS_PERMANENT_TOTAL)),
             errors_timeout: Some(registry.counter(metric_names::POLL_ERRORS_TIMEOUT_TOTAL)),
             schedule_delay_ns: Some(registry.histogram(metric_names::SCHEDULE_DELAY_NS_HIST)),
+            request_latency_ns: Some(registry.histogram(metric_names::POLL_REQUEST_NS_HIST)),
+        }
+    }
+
+    /// 记录一次设备批量读取往返耗时（ns）。成功、驱动错误与 panic 都是
+    /// 完成的一次往返；超时按超时上限截断计入（被截断的真实延迟，不
+    /// 虚增精度）——分布反映含故障场景的真实设备请求体验。
+    pub(crate) fn observe_request_latency(&self, elapsed: Duration) {
+        if let Some(hist) = self.request_latency_ns.as_ref() {
+            hist.observe_ns(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
         }
     }
 
@@ -75,5 +90,6 @@ impl PollMetrics {
         errors_permanent: None,
         errors_timeout: None,
         schedule_delay_ns: None,
+        request_latency_ns: None,
     };
 }
