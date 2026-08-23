@@ -1,0 +1,45 @@
+# ForgeLink Collector 最小配置示例（§101 Standalone YAML）。
+#
+# 单设备最小可跑：Modbus TCP 模拟器（或真实设备）+ 本机 mosquitto。
+# 启动：collector collector.yaml；REST 显式启用后经
+# `GET http://127.0.0.1:18080/api/v1/health` 健康检查（§34.5）。
+
+site_id: plant-a
+
+# Driver Native Plugin（§19/§20）：路径相对当前工作目录。
+driver:
+  plugin: drivers/modbus/driver_modbus.dll   # Linux: libdriver_modbus.so
+  manifest:
+    id: modbus-tcp
+    name: Modbus TCP
+    version: "0.1.0"
+    abi: { major: 1, minor: 0 }
+
+profiles_dir: profiles
+
+devices:
+  - id: vfd-01
+    driver: modbus-tcp
+    profile: inovance-md500
+    connection:
+      mode: tcp
+      host: 127.0.0.1
+      port: 15020
+      timeout_ms: 1000
+      reconnect: true
+      reconnect_max_attempts: 2
+      reconnect_delay_ms: 50
+    enabled: true
+
+northbound:
+  mqtt:
+    broker_host: 127.0.0.1
+    broker_port: 1883
+    client_id: collector-plant-a-01
+
+# REST 管理接口（默认禁用，显式 listen 才启动；端口 0 = OS 分配）。
+rest:
+  listen: "127.0.0.1:18080"
+
+buffer:
+  db_path: ./collector-wal.db
