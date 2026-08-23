@@ -977,6 +977,7 @@ dependencies = [
  "async-trait",
  "axum",
  "control-engine",
+ "diagnostics",
  "driver-sdk",
  "metrics",
  "mqtt-client",
