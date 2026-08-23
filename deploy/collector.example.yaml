@@ -43,3 +43,24 @@ rest:
 
 buffer:
   db_path: ./collector-wal.db
+
+# ── S7 设备示例（V0.2，替换上方 driver/devices 段使用）──
+# driver:
+#   plugin: drivers/s7comm/driver_s7comm.dll   # Linux: libdriver_s7comm.so
+#   manifest:
+#     id: s7comm
+#     name: Siemens S7comm
+#     version: "0.1.0"
+#     abi: { major: 1, minor: 0 }
+# devices:
+#   - id: plc-01
+#     driver: s7comm
+#     profile: siemens-s7-demo
+#     connection:
+#       mode: tcp
+#       host: 192.168.0.1
+#       port: 102
+#       rack: 0
+#       slot: 2          # S7-300/400 典型 2；S7-1200/1500 典型 0 或 1
+#       timeout_ms: 1000
+#     enabled: true
