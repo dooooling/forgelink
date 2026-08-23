@@ -46,7 +46,7 @@ impl Area {
 
 /// 数据宽度类型（§11 `S7Type`）：由地址语法后缀承载，与值语义解释
 /// （expected_type）正交。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum S7Type {
     /// 位（1 bit）。
     Bit,
@@ -101,6 +101,14 @@ pub enum AddressError {
     InvalidSyntax(String),
     /// 数值越界（db=0 或 >65535、bit>7、偏移超 3 字节地址域）。
     OutOfRange(String),
+}
+
+impl std::fmt::Display for AddressError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSyntax(msg) | Self::OutOfRange(msg) => write!(f, "{msg}"),
+        }
+    }
 }
 
 /// Any 指针地址域可表示的最大字节偏移（3 字节大端，低 3 位为位号）。
