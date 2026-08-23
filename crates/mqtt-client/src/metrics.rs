@@ -88,12 +88,23 @@ impl MqttMetrics {
         }
     }
 
-    /// 记录一次失败结算（任何以错误收场的发布）。
+    /// 记录一次失败结算（任何以错误收场的发布）：失败计数 +1 且
+    /// in-flight -1（配对结算——调用方须保证该请求已 `observe_accepted`）。
     pub(crate) fn observe_failed(&self) {
         if let Some(counter) = self.failed.as_ref() {
             counter.inc();
         }
         self.bump_inflight(-1);
+    }
+
+    /// 记录一次**未计入 in-flight 域**的请求失败（评审 P1 计数域结构化
+    /// 配套）：失败计数 +1 但不动 gauge——通道内请求从未
+    /// `observe_accepted`，结算时不得 -1（否则负基线）。典型场景：
+    /// 重连耗尽时 `fail_all_queued` 对仍停在通道内的请求结算。
+    pub(crate) fn observe_failed_uncounted(&self) {
+        if let Some(counter) = self.failed.as_ref() {
+            counter.inc();
+        }
     }
 
     /// 记录一次成功确认（PUBACK 到达，§31.4）。

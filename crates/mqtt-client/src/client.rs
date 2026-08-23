@@ -127,6 +127,13 @@ struct PublishRequest {
     /// 时据此观测发布往返耗时（§34.2.1 `mqtt_publish_ns_hist`；断线重发
     /// 后确认的耗时同样覆盖——同一 resolve 路径）。
     accepted_at: Instant,
+    /// 该请求是否已计入 in-flight 指标域（评审 P1：计数配对必须结构化
+    /// ——pending 中存在"计数过"与"未计数过"两类请求（用户/重发请求
+    /// 经 `observe_accepted()` 计入；停机离线经 `push_front` 直接插入、
+    /// deregister retain 删除的是他人已计数条目），而全部结算路径默认
+    /// 它们都计数过，产生永久 phantom inflight）。只有 counted=true 的
+    /// 请求在结算时才 -1。
+    metrics_counted: bool,
     ack_tx: oneshot::Sender<Result<(), MqttClientError>>,
 }
 
@@ -166,6 +173,9 @@ struct AwaitingAck {
     /// 请求被 worker 接受的时刻（自 [`PublishRequest`] 转入）：PUBACK
     /// resolve 时观测发布往返耗时（§34.2.1 `mqtt_publish_ns_hist`）。
     accepted_at: Instant,
+    /// 自 [`PublishRequest.metrics_counted`] 转入：只有计入 in-flight
+    /// 域的请求在结算时才 -1（评审 P1 计数配对结构化）。
+    metrics_counted: bool,
     ack_tx: oneshot::Sender<Result<(), MqttClientError>>,
 }
 
@@ -409,6 +419,9 @@ impl MqttClient {
             // 起始时刻取构造点（入队前）：PUBACK resolve 时观测完整
             // 往返（§34.2.1 `mqtt_publish_ns_hist`）。
             accepted_at: Instant::now(),
+            // 计数发生在 worker `accept_request`/重发推进的入队边界
+            // （评审 P1：计数域结构化——通道内请求未计数）。
+            metrics_counted: false,
             ack_tx,
         };
         self.request_tx
@@ -1418,10 +1431,30 @@ fn accept_request(
                 && let Some(ids) = &request.status_ids
             {
                 last_online.remove(ids);
-                pending.retain(|r| !(r.online_status && r.status_ids.as_ref() == Some(ids)));
+                // 显式移除被注销设备的在途在线请求并**逐条结算指标**
+                // （评审 P1：此前 `retain` 静默丢弃已计数条目——accepted
+                // +1 后无人 -1，留下永久 phantom inflight）。只有计数过
+                // 的条目才结算。
+                let mut removed = Vec::new();
+                pending.retain(|r| {
+                    if r.online_status && r.status_ids.as_ref() == Some(ids) {
+                        removed.push(r.metrics_counted);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for counted in removed {
+                    if counted {
+                        mqtt_metrics.observe_failed();
+                    }
+                }
                 pending_online_republish.retain(|d| d != ids);
             }
             mqtt_metrics.observe_accepted();
+            // 计数边界标记（评审 P1）：此后该请求的任何结算路径都 -1。
+            let mut request = request;
+            request.metrics_counted = true;
             pending.push_back(request);
         }
         Err(e) => {
@@ -1474,6 +1507,8 @@ fn forward_pending(
                     leftover: false,
                     parked_pkid: None,
                     accepted_at: req.accepted_at,
+                    // 计数标记随请求转入（评审 P1：结算域判定依据）。
+                    metrics_counted: req.metrics_counted,
                     ack_tx: req.ack_tx,
                 });
                 forwarded += 1;
@@ -1483,7 +1518,9 @@ fn forward_pending(
                 // 转发失败（异常路径）：以明确错误结算该请求（调用方
                 // 不得删除 WAL，§31.4），并继续处理后续请求。
                 let failed = pending.pop_front().expect("front 与 pop 之间无人修改");
-                mqtt_metrics.observe_failed();
+                if failed.metrics_counted {
+                    mqtt_metrics.observe_failed();
+                }
                 let _ = failed.ack_tx.send(Err(MqttClientError::PublishFailed {
                     reason: e.to_string(),
                 }));
@@ -1515,6 +1552,8 @@ fn make_online_status_request(site_id: &str, device_id: &str) -> Option<PublishR
         status_ids: Some((site_id.to_owned(), device_id.to_owned())),
         deregister: false,
         accepted_at: Instant::now(),
+        // 计数在 `step_online_republish` 的入队边界发生（评审 P1）。
+        metrics_counted: false,
         ack_tx,
     })
 }
@@ -1523,6 +1562,11 @@ fn make_online_status_request(site_id: &str, device_id: &str) -> Option<PublishR
 /// DISCONNECT 不触发 LWT，必须显式发布离线，否则设备将长期显示在线）。
 /// `online_status = false`：离线发布不进入在线跟踪（`forward_pending`
 /// 不会将其写入 `last_online`）。
+///
+/// 停机离线请求**不进入 in-flight 计数域**（`metrics_counted = false`，
+/// 评审 P1）：它经 `push_front` 直接插入 pending、无用户等待方
+///（ack_tx 即刻丢弃），结算路径不得对其 -1——否则停机批量离线会把
+/// gauge 打成负基线。
 fn make_offline_status_request(site_id: &str, device_id: &str) -> Option<PublishRequest> {
     let topic = status_topic(site_id, device_id).ok()?;
     let payload = status_envelope(site_id, device_id, "offline");
@@ -1535,6 +1579,7 @@ fn make_offline_status_request(site_id: &str, device_id: &str) -> Option<Publish
         status_ids: Some((site_id.to_owned(), device_id.to_owned())),
         deregister: false,
         accepted_at: Instant::now(),
+        metrics_counted: false,
         ack_tx,
     })
 }
@@ -1580,6 +1625,9 @@ fn step_online_republish(
         };
         if let Some(request) = make_online_status_request(&site_id, &device_id) {
             mqtt_metrics.observe_accepted();
+            // 计数边界标记（评审 P1）：与用户请求同一结算域。
+            let mut request = request;
+            request.metrics_counted = true;
             pending.push_back(request);
         }
     }
@@ -1728,7 +1776,9 @@ fn on_await_ack_event(
             .position(|e| e.parked_pkid == Some(previous))
         {
             let entry = awaiting_ack.remove(index).expect("position 与 remove 一致");
-            mqtt_metrics.observe_failed();
+            if entry.metrics_counted {
+                mqtt_metrics.observe_failed();
+            }
             let _ = entry
                 .ack_tx
                 .send(Err(MqttClientError::CollisionOverwritten));
@@ -1761,7 +1811,9 @@ fn resolve_puback(awaiting_ack: &mut VecDeque<AwaitingAck>, pkid: u16, mqtt_metr
         // §34.2.1：发布往返耗时（请求接受 → PUBACK resolve；断线重发后
         // 确认的耗时同样覆盖——同一 resolve 路径）。
         mqtt_metrics.observe_publish_latency(entry.accepted_at.elapsed());
-        mqtt_metrics.observe_published();
+        if entry.metrics_counted {
+            mqtt_metrics.observe_published();
+        }
         let _ = entry.ack_tx.send(Ok(()));
         trace!(
             component = "mqtt-client",
@@ -1823,16 +1875,24 @@ fn fail_all_queued(
     err: MqttClientError,
     mqtt_metrics: &MqttMetrics,
 ) {
+    // 通道内请求**尚未进入计数域**（accept_request 才 +1，评审 P1）：
+    // 失败计数照记（用户需要知道发布失败），但不 -1——否则负基线。
     while let Ok(req) = request_rx.try_recv() {
-        mqtt_metrics.observe_failed();
+        mqtt_metrics.observe_failed_uncounted();
         let _ = req.ack_tx.send(Err(err.clone()));
     }
+    // pending/awaiting_ack 中只有标记过计数的条目才结算（停机离线
+    // push_front 的请求未计数，不得打成负基线）。
     while let Some(req) = pending.pop_front() {
-        mqtt_metrics.observe_failed();
+        if req.metrics_counted {
+            mqtt_metrics.observe_failed();
+        }
         let _ = req.ack_tx.send(Err(err.clone()));
     }
     while let Some(entry) = awaiting_ack.pop_front() {
-        mqtt_metrics.observe_failed();
+        if entry.metrics_counted {
+            mqtt_metrics.observe_failed();
+        }
         let _ = entry.ack_tx.send(Err(err.clone()));
     }
 }
@@ -2350,6 +2410,94 @@ mod tests {
         release.store(true, std::sync::atomic::Ordering::Relaxed);
 
         client.shutdown().await.unwrap();
+        broker.stop().await;
+    }
+
+    /// 评审 P1 回归：`publish_offline` 的 deregister 移除在途 online
+    /// 请求时必须逐条结算 in-flight（此前 `retain` 静默丢弃已计数条目
+    /// ——phantom inflight）。场景：online 进入 pending（+1）→ offline
+    /// 到达移除它并入队自身（+1）→ offline 确认（-1）→ gauge 必须
+    /// 归 0（修复前残留 +1）。
+    #[tokio::test]
+    async fn deregister_online_request_settles_inflight() {
+        use std::sync::Arc;
+        let registry = Arc::new(metrics::MetricsRegistry::new());
+        let broker = MockBroker::start().await;
+        // 扣住第 1 条（online）的 PUBACK，制造"online 在途"窗口。
+        let release = broker.hold_puback(1);
+        let client =
+            MqttClient::spawn_with_metrics(test_config(&broker, "client-dereg"), registry.clone())
+                .unwrap();
+
+        let inflight = || {
+            registry
+                .snapshot()
+                .get("mqtt_inflight_gauge")
+                .cloned()
+                .expect("inflight gauge 已注册")
+        };
+
+        // online 入队（accepted +1），被 puback_hold 扣住 → 在途。
+        let online = client.publish_online("plant-a", "cnc-01").await.unwrap();
+        wait_until(|| matches!(inflight(), metrics::MetricValue::Gauge(1))).await;
+
+        // offline 到达：deregister 移除在途 online（须 -1）并入队自身（+1）
+        // → 净值仍为 1（此时唯一在途的是 offline）。
+        let offline = client.publish_offline("plant-a", "cnc-01").await.unwrap();
+        wait_until(|| matches!(inflight(), metrics::MetricValue::Gauge(1))).await;
+
+        // 放行 online 确认（其条目已被移除，PUBACK 未匹配仅记日志——
+        // §31.4 协议异常路径语义）；确认 offline → gauge 必须归 0。
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        offline.acked().await.unwrap();
+        wait_until(|| matches!(inflight(), metrics::MetricValue::Gauge(0))).await;
+        drop(online);
+
+        client.shutdown().await.unwrap();
+        broker.stop().await;
+    }
+
+    /// 评审 P1 回归：停机自动离线请求**不进入** in-flight 计数域——
+    /// 正常发布确认后停机（批量离线 push_front 无 accepted +1），全部
+    /// 离线 PUBACK 后 gauge 不得出现负基线或漂移。
+    #[tokio::test]
+    async fn shutdown_offline_requests_leave_no_negative_baseline() {
+        use std::sync::Arc;
+        let registry = Arc::new(metrics::MetricsRegistry::new());
+        let broker = MockBroker::start().await;
+        let client = MqttClient::spawn_with_metrics(
+            test_config(&broker, "client-shutdown"),
+            registry.clone(),
+        )
+        .unwrap();
+
+        // 两台设备上线并确认（+1/-1 配对，gauge 归 0）。
+        for i in 0..2 {
+            client
+                .publish_online("plant-a", &format!("dev-{i}"))
+                .await
+                .unwrap()
+                .acked()
+                .await
+                .unwrap();
+        }
+        wait_until(|| {
+            matches!(
+                registry.snapshot().get("mqtt_inflight_gauge"),
+                Some(metrics::MetricValue::Gauge(0))
+            )
+        })
+        .await;
+
+        // 停机：worker 为两台设备生成离线请求并转发确认。若离线请求被
+        // 误计数（无 accepted 却有 published -1），gauge 会变负；修复后
+        // 恒为 0。
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            registry.snapshot().get("mqtt_inflight_gauge"),
+            Some(&metrics::MetricValue::Gauge(0)),
+            "停机离线不得产生负基线"
+        );
         broker.stop().await;
     }
 
@@ -3011,6 +3159,7 @@ mod tests {
                 parked_pkid: None,
                 ack_tx,
                 accepted_at: Instant::now(),
+                metrics_counted: true,
             }
         };
         // 模拟二次断线瞬间的队列（插入顺序刻意打乱）：
@@ -3065,6 +3214,7 @@ mod tests {
             parked_pkid,
             ack_tx: oneshot::channel().0,
             accepted_at: Instant::now(),
+            metrics_counted: true,
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：已写出（pkid 1，未确认）
@@ -3175,6 +3325,7 @@ mod tests {
             parked_pkid,
             ack_tx: oneshot::channel().0,
             accepted_at: Instant::now(),
+            metrics_counted: true,
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3288,6 +3439,7 @@ mod tests {
             parked_pkid,
             ack_tx: oneshot::channel().0,
             accepted_at: Instant::now(),
+            metrics_counted: true,
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3382,6 +3534,7 @@ mod tests {
             parked_pkid,
             ack_tx: oneshot::channel().0,
             accepted_at: Instant::now(),
+            metrics_counted: true,
         };
         let mut awaiting: VecDeque<AwaitingAck> = VecDeque::new();
         awaiting.push_back(entry(Some(1), None)); // A：在途（pkid 1，未确认）
@@ -3394,6 +3547,7 @@ mod tests {
             parked_pkid: None,
             ack_tx: e_ack_tx,
             accepted_at: Instant::now(),
+            metrics_counted: true,
         });
         awaiting.push_back(entry(None, None)); //    F：第二个碰撞消息（pkid 2）
         awaiting.push_back(entry(None, None)); //    G：通道中新转发
