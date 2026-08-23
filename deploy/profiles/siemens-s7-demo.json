@@ -1,0 +1,66 @@
+{
+  "id": "siemens-s7-demo",
+  "vendor": "Siemens",
+  "family": "S7",
+  "models": ["S7-1200", "S7-1500", "S7-300"],
+  "domain": "plc",
+  "driver_id": "s7comm",
+  "properties": [
+    {
+      "path": "plc.motor.running",
+      "driver_address": "db1.dbx0.0",
+      "raw_type": "bool",
+      "value_type": "bool",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "exact",
+      "readable": true,
+      "writable": true,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.process.value",
+      "driver_address": "db1.dbd4",
+      "raw_type": "f32",
+      "value_type": "f64",
+      "unit": null,
+      "scale": 0.1,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.counter.total",
+      "driver_address": "md100",
+      "raw_type": "i32",
+      "value_type": "i64",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 1000,
+      "min": null,
+      "max": null
+    }
+  ],
+  "commands": [],
+  "capabilities": {
+    "supported_properties": [
+      "plc.motor.running",
+      "plc.process.value",
+      "plc.counter.total"
+    ],
+    "supported_commands": [],
+    "acquisition": {},
+    "limits": {}
+  }
+}

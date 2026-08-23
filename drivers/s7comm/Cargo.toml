@@ -1,0 +1,22 @@
+[package]
+name = "driver-s7comm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+driver-sdk = { path = "../../crates/driver-sdk" }
+observation-model = { path = "../../crates/observation-model" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+driver-loader = { path = "../../crates/driver-loader" }
+libloading = "0.8"
+s7comm-mock = { path = "../../crates/s7comm-mock" }
+poll-engine = { path = "../../crates/poll-engine" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

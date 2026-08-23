@@ -2448,6 +2448,12 @@ driver-loader         Native Plugin 加载、ABI 校验与句柄生命周期
 profile-engine        Profile 校验、加载、注册与读写转换
 domain-model          Domain 路径校验与 Observation 映射
 poll-engine           周期调度、超时、指数退避、取消与阻塞隔离
+driver-s7comm         Siemens S7comm Driver V0.2（§34.6 路线图，读+写）：
+                      ISO-on-TCP（TPKT/COTP）+ Setup 协商 + Read/Write Var；
+                      地址文法 db/m/i/q（含位寻址，I 区只读，§11）；读侧同区
+                      允许跳洞合并、位项精确相邻游程；写侧精确相邻合并、
+                      空洞/重叠拆分升序覆盖；分块受协商 PDU 预算与项数上限
+                      约束；宽度由语法后缀承载、值解释由 expected_type 决定
 driver-modbus         Modbus TCP/RTU Driver：读取 MVP；写功能 FC05/06/15/16（帧编解码、
                       响应回显校验、精确相邻批量合并、多寄存器字序镜像读侧）
 control-engine        Control Engine 基础（§81-§90：统一入口、幂等键去重、每设备有界队列、
