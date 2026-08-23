@@ -11,3 +11,11 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
+
+# 发布构建（§34.2 性能基线要求 `cargo build --release`）：thin LTO 取
+# 跨 crate 内联收益且链接时间远低于 fat LTO；codegen-units=1 换取边际
+# 优化与构建确定性。不改动 panic 策略（FFI 边界的 catch_unwind 隔离，
+# §17.7，依赖 unwind）；不启用 strip（保留符号利于现场事故回溯）。
+[profile.release]
+lto = "thin"
+codegen-units = 1
