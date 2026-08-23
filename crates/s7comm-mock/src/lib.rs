@@ -156,6 +156,12 @@ impl MockBehavior {
         }
     }
 
+    /// 便捷：设置响应延迟。
+    pub fn with_response_delay(mut self, delay: Duration) -> Self {
+        self.response_delay = Some(delay);
+        self
+    }
+
     /// 便捷：填充一段连续 DB 字节。
     pub fn with_db_bytes(mut self, db: u16, start: u32, bytes: &[u8]) -> Self {
         for (i, b) in bytes.iter().enumerate() {

@@ -245,7 +245,20 @@ fn assemble_item(planned: &batch::PlannedItem, response: &ItemResponse) -> RawRe
             now,
         );
     }
-    match decode::decode_read(planned.ty, planned.expected_type.clone(), &response.payload) {
+    // 合并区间按项偏移切片（响应载荷是整段 span，非单点）。
+    let start = planned.offset_in_data;
+    let width = planned.ty.width_bytes() as usize;
+    let Some(slice) = response.payload.get(start..start + width) else {
+        return error_result_with_ts(
+            planned.item_id,
+            &S7Error::invalid_response(format!(
+                "响应载荷越界：偏移 {start} 宽度 {width}，总长 {}",
+                response.payload.len()
+            )),
+            now,
+        );
+    };
+    match decode::decode_read(planned.ty, planned.expected_type.clone(), slice) {
         Ok(out) => RawReadResult {
             item_id: planned.item_id,
             value: Some(match out {

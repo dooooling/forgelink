@@ -219,6 +219,8 @@ pub struct WritePlan {
     pub ty: S7Type,
     /// 起始字节偏移。
     pub start_byte: u32,
+    /// 位号（仅 `S7Type::Bit` 有效；位写恒单点独立计划）。
+    pub bit: u8,
     /// 拼接后的载荷（不含对齐填充）。
     pub payload: Vec<u8>,
     /// 参与合并的上层 item_id（按写入顺序）。
@@ -241,7 +243,7 @@ impl WritePlan {
             area_code: self.area_code,
             db: self.db,
             byte_offset: self.start_byte,
-            bit: 0,
+            bit: self.bit,
         }
     }
 }
@@ -250,13 +252,14 @@ impl WritePlan {
 ///
 /// 返回 `(计划列表, 编码/只读拒绝项的预填失败结果)`：这类单项失败在
 /// 规划期剔除并预填结果（镜像 modbus——不发出必然失败的请求）。
+/// 位写恒单点独立计划：不同位号无法合并进单条 BIT 指针。
 ///
 /// # Errors
 ///
 /// 地址解析失败返回 `invalid_address`（整体失败）。I 区为过程映像输入
 /// （现场驱动），写入显式拒绝。
-/// 写规划中间聚合条目：`(起始字节, item_id, 值载荷)`。
-type EncodedEntry = (u32, u64, Vec<u8>);
+/// 写规划中间聚合条目：`(起始字节, 位号, item_id, 值载荷)`。
+type EncodedEntry = (u32, u8, u64, Vec<u8>);
 /// 编码失败预填结果：`(item_id, 错误)`。
 type FailedWrite = (u64, S7Error);
 
@@ -285,7 +288,7 @@ pub fn plan_write_batch(
                 groups
                     .entry((area_code_of(addr.area), addr.db, addr.ty))
                     .or_default()
-                    .push((addr.byte, req.id, enc.payload));
+                    .push((addr.byte, addr.bit, req.id, enc.payload));
             }
             Err(e) => failed.push((req.id, e)),
         }
@@ -294,12 +297,28 @@ pub fn plan_write_batch(
     let mut plans = Vec::new();
     for ((area_code, db, ty), mut entries) in groups {
         entries.sort_by_key(|(start, ..)| *start);
+        if matches!(ty, S7Type::Bit) {
+            // 位写恒单点独立计划（不同位号无法合并进单条 BIT 指针；
+            // 同字节的多个位写各自独立，互不覆盖）。
+            for (byte, bit, id, payload) in entries {
+                plans.push(WritePlan {
+                    area_code,
+                    db,
+                    ty,
+                    start_byte: byte,
+                    bit,
+                    payload,
+                    item_ids: vec![id],
+                });
+            }
+            continue;
+        }
         // 精确相邻游程切分：任何空洞/重叠断开（升序保证后写覆盖确定）。
-        let mut runs: Vec<Vec<(u32, u64, Vec<u8>)>> = Vec::new();
+        let mut runs: Vec<Vec<EncodedEntry>> = Vec::new();
         for entry in entries {
             match runs.last_mut() {
                 Some(run) => {
-                    let (last_start, _, last_payload) = run.last().expect("游程非空");
+                    let (last_start, _, _, last_payload) = run.last().expect("游程非空");
                     if *last_start + last_payload.len() as u32 == entry.0 {
                         run.push(entry);
                         continue;
@@ -311,11 +330,11 @@ pub fn plan_write_batch(
         }
         // 游程按预算聚合为计划（预算以"值个数"计，pad 不计入载荷）。
         for run in runs {
-            let mut current: Vec<(u32, u64, Vec<u8>)> = Vec::new();
+            let mut current: Vec<EncodedEntry> = Vec::new();
             for piece in run {
                 let count = current.len() + 1;
                 let bytes: usize =
-                    current.iter().map(|(_, _, p)| p.len()).sum::<usize>() + piece.2.len();
+                    current.iter().map(|(_, _, _, p)| p.len()).sum::<usize>() + piece.3.len();
                 if !current.is_empty()
                     && (count > max_items_per_pdu
                         || bytes + 4 * count > write_data_budget(negotiated_pdu, count))
@@ -331,7 +350,7 @@ pub fn plan_write_batch(
 }
 
 fn flush_write(
-    chunk: &mut Vec<(u32, u64, Vec<u8>)>,
+    chunk: &mut Vec<EncodedEntry>,
     plans: &mut Vec<WritePlan>,
     area_code: u8,
     db: u16,
@@ -343,7 +362,7 @@ fn flush_write(
     let start_byte = chunk[0].0;
     let mut payload = Vec::new();
     let mut item_ids = Vec::with_capacity(chunk.len());
-    for (_, id, piece) in chunk.drain(..) {
+    for (_, _, id, piece) in chunk.drain(..) {
         payload.extend_from_slice(&piece);
         item_ids.push(id);
     }
@@ -352,6 +371,7 @@ fn flush_write(
         db,
         ty,
         start_byte,
+        bit: 0,
         payload,
         item_ids,
     });
