@@ -192,10 +192,7 @@ impl MockBroker {
     /// 积累（长跑基准防内存膨胀），但 [`Self::publish_total`] 计数与
     /// [`Self::subscribe`] 的订阅分发不受影响。默认开启。
     pub fn set_capture_enabled(&self, enabled: bool) {
-        self.state
-            .lock()
-            .expect("state 锁中毒")
-            .capture_enabled = enabled;
+        self.state.lock().expect("state 锁中毒").capture_enabled = enabled;
     }
 
     /// 测试钩子：开关新连接受理。关闭时新到连接立即被丢弃（不计入
@@ -203,10 +200,7 @@ impl MockBroker {
     /// 表现为连接建立后立即被对端关闭，进入重连退避；恢复开启后新
     /// 连接正常受理。默认开启。
     pub fn set_accepts_enabled(&self, enabled: bool) {
-        self.state
-            .lock()
-            .expect("state 锁中毒")
-            .accepts_enabled = enabled;
+        self.state.lock().expect("state 锁中毒").accepts_enabled = enabled;
     }
 
     /// 捕获到的全部 Will（按连接顺序）。
@@ -833,16 +827,14 @@ mod tests {
         broker.set_accepts_enabled(false);
 
         // 连接可建立但立即被对端关闭：读不到任何字节（EOF）。
-        let mut stream = TcpStream::connect(broker.addr()).await.expect("TCP 连接失败");
+        let mut stream = TcpStream::connect(broker.addr())
+            .await
+            .expect("TCP 连接失败");
         let mut buf = [0u8; 4];
         let n = stream.read(&mut buf).await.unwrap_or(0);
         assert_eq!(n, 0, "受理闸门关闭时连接应被立即关闭");
         drop(stream);
-        assert_eq!(
-            broker.connections(),
-            0,
-            "被拒绝的连接不得计入 connections"
-        );
+        assert_eq!(broker.connections(), 0, "被拒绝的连接不得计入 connections");
 
         broker.set_accepts_enabled(true);
         // 内部自带断言（CONNACK 异常即 panic），成功返回即已握手。
@@ -879,13 +871,10 @@ mod tests {
         );
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
         // 放行标志置位后由连接读循环轮询补发挂起的 PUBACK。
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            client.stream.read_exact(&mut ack),
-        )
-        .await
-        .expect("放行后应补发 PUBACK")
-        .expect("读取 PUBACK 失败");
+        tokio::time::timeout(Duration::from_secs(2), client.stream.read_exact(&mut ack))
+            .await
+            .expect("放行后应补发 PUBACK")
+            .expect("读取 PUBACK 失败");
         assert_eq!(ack[0], 0x40, "应为 PUBACK 固定头");
 
         assert_eq!(broker.publish_total(), 1);
