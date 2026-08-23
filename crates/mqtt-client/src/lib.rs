@@ -74,6 +74,7 @@
 
 mod client;
 mod config;
+mod metrics;
 // Mock MQTT Broker：本 crate 测试与上层（collector 端到端测试）共用。
 // 默认仅测试编译；开启 `test-utils` feature 后对外公开（§34 验收）。
 #[cfg(any(test, feature = "test-utils"))]
@@ -84,3 +85,4 @@ pub use client::{
 };
 pub use config::{MqttClientConfig, TlsMode, WillConfig};
 pub use data_pipeline::ObservationBatch;
+pub use metrics::MqttMetrics;

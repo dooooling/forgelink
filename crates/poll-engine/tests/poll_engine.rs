@@ -458,6 +458,7 @@ async fn external_cancel_token_stops_loop() {
         PollConfig::default(),
         cancel.clone(),
         tx,
+        poll_engine::metrics::PollMetrics::NOOP,
     ));
     cancel.cancel();
     let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -675,6 +676,7 @@ async fn poll_loop_rejects_invalid_config_without_panic() {
         PollConfig::default(),
         cancel.clone(),
         tx,
+        poll_engine::metrics::PollMetrics::NOOP,
     ));
     let result = tokio::time::timeout(Duration::from_secs(1), handle).await;
     result.expect("任务应正常返回").expect("任务不应 panic");
@@ -889,4 +891,175 @@ async fn shutdown_with_timeout_aborts_underlying_task() {
         matches!(after, Ok(None)),
         "底层轮询任务必须已被真正取消：事件通道应即时关闭（脱管任务会让通道保持打开）"
     );
+}
+
+// ---- 指标埋点（§34.2.1） ------------------------------------------------------
+
+/// 注入 registry 后：成功批次计入 `poll_batches_total`，可重试失败计入
+/// `poll_errors_retryable_total`；调度偏差直方图有观测值。
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_count_batches_and_retryable_errors() {
+    let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+    let (tx, mut rx) = mpsc::channel(64);
+    let target = PollTarget {
+        device_id: "dev-metrics-a".to_owned(),
+        interval_ms: 20,
+        items: items(1),
+    };
+    // 首次失败（可重试）→ 退避 5ms → 成功。
+    let config = PollConfig {
+        request_timeout: Duration::from_secs(5),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        shutdown_drain_timeout: Duration::from_secs(2),
+    };
+
+    let mut scheduler = PollScheduler::with_metrics(registry.clone());
+    scheduler
+        .spawn(
+            target,
+            mock_driver(Duration::ZERO, 1, vec![ok_result(0)]),
+            config,
+            tx,
+        )
+        .unwrap();
+
+    // 等待：1 个 Failed + 2 个 Batch（首次 tick 失败重试成功后下一周期再来一批）。
+    let mut batches = 0usize;
+    let mut failures = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while (batches < 2 || failures < 1) && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(PollEvent::Batch(_))) => batches += 1,
+            Ok(Some(PollEvent::Failed { .. })) => failures += 1,
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    scheduler.shutdown().await;
+
+    assert_eq!(batches, 2, "应观察到两个成功批次");
+    assert_eq!(failures, 1, "应观察到一次可重试失败");
+
+    let snap = registry.snapshot();
+    use metrics::MetricValue;
+    assert_eq!(
+        snap.get("poll_batches_total"),
+        Some(&MetricValue::Count(2)),
+        "poll_batches_total 必须与成功批次一致"
+    );
+    assert_eq!(
+        snap.get("poll_errors_retryable_total"),
+        Some(&MetricValue::Count(1)),
+        "可重试错误必须计数"
+    );
+    // 永久/超时类别未发生：计数值必须为 0（句柄在装配期已注册，快照恒含）。
+    assert_eq!(
+        snap.get("poll_errors_permanent_total"),
+        Some(&MetricValue::Count(0))
+    );
+    assert_eq!(
+        snap.get("poll_errors_timeout_total"),
+        Some(&MetricValue::Count(0))
+    );
+
+    // 调度偏差直方图已注册且至少有一次观测（首个 tick 之后每周期观测一次）。
+    let Some(MetricValue::Histogram { count, .. }) = snap.get("schedule_delay_ns_hist") else {
+        panic!("调度偏差直方图应已注册");
+    };
+    assert!(*count >= 1, "应至少观测一次调度偏差，实际 {count}");
+}
+
+/// 永久错误计入 `poll_errors_permanent_total`（不进退避，回到周期节律）。
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_count_permanent_errors() {
+    let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+    let (tx, mut rx) = mpsc::channel(64);
+    let target = PollTarget {
+        device_id: "dev-metrics-b".to_owned(),
+        interval_ms: 20,
+        items: items(1),
+    };
+    let config = PollConfig {
+        request_timeout: Duration::from_secs(5),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        shutdown_drain_timeout: Duration::from_secs(2),
+    };
+
+    let mut scheduler = PollScheduler::with_metrics(registry.clone());
+    // retryable=false：永久错误。
+    scheduler
+        .spawn(
+            target,
+            mock_driver_with_counters(Duration::ZERO, 1, false, vec![ok_result(0)]).0,
+            config,
+            tx,
+        )
+        .unwrap();
+
+    // 等到失败事件与后续节律内的成功批次。
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut got_failure = false;
+    while !got_failure && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(PollEvent::Failed { error, .. })) => {
+                assert!(!error.retryable, "前置：应为永久错误");
+                got_failure = true;
+            }
+            Ok(Some(PollEvent::Batch(_))) => {}
+            _ => break,
+        }
+    }
+    scheduler.shutdown().await;
+    assert!(got_failure, "应观察到一次永久失败");
+
+    use metrics::MetricValue;
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.get("poll_errors_permanent_total"),
+        Some(&MetricValue::Count(1)),
+        "永久错误必须单独计数"
+    );
+    assert_eq!(
+        snap.get("poll_errors_retryable_total"),
+        Some(&MetricValue::Count(0)),
+        "可重试类别不得误计"
+    );
+}
+
+/// 未注入 registry（`PollScheduler::new`）：全部既有路径正常工作，
+/// 且组件自身零埋点行为不变（回归保护：no-op 句柄不影响事件流）。
+#[tokio::test(flavor = "multi_thread")]
+async fn no_registry_still_delivers_events() {
+    let (tx, mut rx) = mpsc::channel(64);
+    let target = PollTarget {
+        device_id: "dev-metrics-c".to_owned(),
+        interval_ms: 20,
+        items: items(1),
+    };
+    let config = PollConfig {
+        request_timeout: Duration::from_secs(5),
+        backoff_base_ms: 5,
+        backoff_max_ms: 20,
+        backoff_factor: 2,
+        shutdown_drain_timeout: Duration::from_secs(2),
+    };
+
+    let mut scheduler = PollScheduler::new();
+    scheduler
+        .spawn(
+            target,
+            mock_driver(Duration::ZERO, 0, vec![ok_result(0)]),
+            config,
+            tx,
+        )
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("无 registry 时事件必须照常送达");
+    assert!(matches!(first, Some(PollEvent::Batch(_))));
+    scheduler.shutdown().await;
 }

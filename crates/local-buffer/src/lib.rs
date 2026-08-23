@@ -78,6 +78,7 @@
 //!   同样 Corrupt（不跳过校验在旧表上建表）。
 
 pub mod config;
+pub mod metrics;
 
 mod error;
 mod worker;
@@ -85,6 +86,7 @@ mod worker;
 pub use config::{CapacityPolicy, LocalBufferConfig};
 pub use data_pipeline::ObservationBatch;
 pub use error::{CapacityKind, LocalBufferError};
+pub use metrics::WalMetrics;
 
 use std::{
     sync::{Arc, atomic::AtomicBool},
@@ -149,7 +151,24 @@ impl LocalBuffer {
     /// 打不开）、数据库损坏 / schema 非法（[`LocalBufferError::Corrupt`]）、
     /// 线程启动失败（[`LocalBufferError::WorkerFailed`]）。
     pub async fn open(config: LocalBufferConfig) -> Result<Self, LocalBufferError> {
-        let (tx, handle, ready, closed) = worker::spawn(config)?;
+        Self::open_inner(config, metrics::WalMetrics::new(None)).await
+    }
+
+    /// 打开（或恢复）Local Buffer 并注入指标注册表（§34.2.1）：在途
+    /// gauge、补传计数与落盘耗时直方图经 `registry` 暴露。语义与
+    /// [`Self::open`] 完全一致。
+    pub async fn open_with_metrics(
+        config: LocalBufferConfig,
+        registry: Arc<::metrics::MetricsRegistry>,
+    ) -> Result<Self, LocalBufferError> {
+        Self::open_inner(config, metrics::WalMetrics::new(Some(&registry))).await
+    }
+
+    async fn open_inner(
+        config: LocalBufferConfig,
+        wal_metrics: metrics::WalMetrics,
+    ) -> Result<Self, LocalBufferError> {
+        let (tx, handle, ready, closed) = worker::spawn(config, wal_metrics)?;
         ready.await.map_err(|_| LocalBufferError::WorkerFailed {
             reason: "worker 线程在就绪前退出".into(),
         })??;

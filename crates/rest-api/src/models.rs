@@ -206,3 +206,57 @@ impl ApiSnapshot {
             || (self.buffer.inflight > 0 && self.mqtt.last_failed_at_ns.is_some())
     }
 }
+
+/// 单个指标快照值（§34.2.1；`kind` 判别三种语义）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MetricView {
+    /// 累加计数（`*_total`）。
+    Count { value: u64 },
+    /// 即时量（`*_gauge`）。
+    Gauge { value: i64 },
+    /// 直方图：固定桶边界（ns）与各桶计数、总和、次数。
+    Histogram {
+        bounds: Vec<u64>,
+        counts: Vec<u64>,
+        sum: u64,
+        count: u64,
+    },
+}
+
+/// 指标快照响应（`GET /api/v1/metrics`，§34.2.1）。
+///
+/// 管理接口非控制面：只读构建同样可用；值来自进程内注册表快照，
+/// 不含文件路径/地址/凭据（§90.1 安全基线）。
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricsResponse {
+    pub schema: &'static str,
+    /// 快照时刻（UTC Unix Epoch ns）。
+    pub captured_at_ns: i64,
+    /// 已注册指标的当前值（名称 → 值；空注册表序列化为 `{}`）。
+    pub metrics: BTreeMap<String, MetricView>,
+}
+
+impl MetricsResponse {
+    pub const SCHEMA: &'static str = "forgelink.metrics.v1";
+}
+
+impl From<metrics::MetricValue> for MetricView {
+    fn from(value: metrics::MetricValue) -> Self {
+        match value {
+            metrics::MetricValue::Count(v) => Self::Count { value: v },
+            metrics::MetricValue::Gauge(v) => Self::Gauge { value: v },
+            metrics::MetricValue::Histogram {
+                bounds,
+                counts,
+                sum,
+                count,
+            } => Self::Histogram {
+                bounds: bounds.to_vec(),
+                counts,
+                sum,
+                count,
+            },
+        }
+    }
+}

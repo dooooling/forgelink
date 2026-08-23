@@ -10,10 +10,12 @@ description = "周期轮询调度引擎（§22）：设备级异步轮询、超�
 diagnostics = { path = "../diagnostics" }
 driver-loader = { path = "../driver-loader" }
 driver-sdk = { path = "../driver-sdk" }
+metrics = { path = "../metrics" }
 observation-model = { path = "../observation-model" }
 tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 
 [dev-dependencies]
+metrics = { path = "../metrics" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }

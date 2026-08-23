@@ -14,6 +14,7 @@
 //!   `control` feature 且 [`RestApiServer::spawn_with_control`] 装配时
 //!   存在；[`RestApiServer::spawn`] 与只读构建下控制路由不可达——404/405）。
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,13 +31,13 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore, watch};
 use tracing::{Instrument, debug, error, info, warn};
 
-use crate::HEALTH_PATH;
 use crate::error::{ApiError, ErrorCode, RequestId, to_response};
 use crate::models::{
-    ApiSnapshot, DeviceResponse, DevicesResponse, HealthResponse, HealthStatus, PropertiesResponse,
-    ResourcesResponse,
+    ApiSnapshot, DeviceResponse, DevicesResponse, HealthResponse, HealthStatus, MetricView,
+    MetricsResponse, PropertiesResponse, ResourcesResponse,
 };
 use crate::state::{ApiState, map_state_error};
+use crate::{HEALTH_PATH, METRICS_PATH};
 
 /// 统一 handler 返回类型：错误携带 `request_id`（§31.6）。
 pub(crate) type ApiResult<T> = Result<T, ApiErrorResponse>;
@@ -65,6 +66,10 @@ pub struct RestConfig {
     pub listen: SocketAddr,
     /// 最大并发请求数（有界并发，默认 64）。
     pub max_concurrency: usize,
+    /// §34.2.1 指标注册表（管理接口 `GET /api/v1/metrics` 的数据源）。
+    /// 缺省 `None`：端点返回 503（未装配可区分于路径错误）。与 control
+    /// feature 正交——只读装配同样可注入。
+    pub metrics: Option<std::sync::Arc<metrics::MetricsRegistry>>,
 }
 
 impl Default for RestConfig {
@@ -72,6 +77,7 @@ impl Default for RestConfig {
         Self {
             listen: "127.0.0.1:8080".parse().expect("静态地址合法"),
             max_concurrency: 64,
+            metrics: None,
         }
     }
 }
@@ -114,12 +120,13 @@ impl RestApiServer {
     /// 应显式失败启动（不静默降级）。
     pub async fn spawn(
         state: Arc<dyn ApiState>,
-        config: RestConfig,
+        mut config: RestConfig,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
         let listener = TcpListener::bind(config.listen).await?;
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
-        let app = router(state, concurrency);
+        let metrics = config.metrics.take();
+        let app = router_with_options(state, metrics, concurrency);
         Self::serve(listener, app, config).await
     }
 
@@ -141,13 +148,14 @@ impl RestApiServer {
     pub async fn spawn_with_control(
         state: Arc<dyn ApiState>,
         control: crate::control::ControlGateway,
-        config: RestConfig,
+        mut config: RestConfig,
     ) -> Result<Self, std::io::Error> {
         Self::validate_config(&config)?;
         Self::validate_control_listen(config.listen)?;
         let listener = TcpListener::bind(config.listen).await?;
         let concurrency = Arc::new(Semaphore::new(config.max_concurrency));
-        let app = router_with_control(state, control, concurrency);
+        // 控制路由与 metrics 正交：控制装配同样可携带指标注册表。
+        let app = router_with_control(state, control, config.metrics.take(), concurrency);
         Self::serve(listener, app, config).await
     }
 
@@ -315,7 +323,21 @@ impl RestApiServer {
 /// （启用 `control` feature 时也仅 [`Self::spawn_with_control`] 挂载，
 /// 本函数保持纯只读语义，供既有调用方与测试复用）。
 pub(crate) fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
-    base_router(state, concurrency)
+    router_with_options(state, None, concurrency)
+}
+
+/// 统一路由组装入口：只读路由 + 可选 metrics 注册表（§34.2.1）。
+///
+/// 未匹配路径（404）与不支持的 method（405）都返回统一 §31.6 错误
+/// 载荷（含 request_id）；`/controls` 等控制路由不存在于本只读契约
+/// （启用 `control` feature 时也仅 [`Self::spawn_with_control`] 挂载，
+/// 本函数保持纯只读语义，供既有调用方与测试复用）。
+pub(crate) fn router_with_options(
+    state: Arc<dyn ApiState>,
+    metrics: Option<std::sync::Arc<metrics::MetricsRegistry>>,
+    concurrency: Arc<Semaphore>,
+) -> Router {
+    base_router(state, concurrency, metrics)
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
         // request_id 层必须在全部路由合并之后应用：axum 的 `.layer` 只
@@ -327,30 +349,43 @@ pub(crate) fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> R
 /// 组装只读 + 控制路由（§31.5 控制链路；`control` feature 门控）。
 ///
 /// 控制路由与只读路由共用同一并发门控（全局有界，§90.1）；fallback 与
-/// `request_id` 层在合并后统一应用。
+/// `request_id` 层在合并后统一应用。`metrics` 与控制正交（§34.2.1）。
 #[cfg(feature = "control")]
 pub(crate) fn router_with_control(
     state: Arc<dyn ApiState>,
     control: crate::control::ControlGateway,
+    metrics: Option<std::sync::Arc<metrics::MetricsRegistry>>,
     concurrency: Arc<Semaphore>,
 ) -> Router {
-    base_router(state, concurrency.clone())
+    base_router(state, concurrency.clone(), metrics)
         .merge(crate::control::control_router(control, concurrency))
         .fallback(fallback_not_found)
         .method_not_allowed_fallback(fallback_method_not_allowed)
         .layer(middleware::from_fn(request_id_layer))
 }
 
-/// 只读路由集合（不含 fallback 与中间件；由 [`router`] /
+/// 只读路由集合（不含 fallback 与中间件；由 [`router_with_options`] /
 /// [`router_with_control`] 统一收尾）。
-fn base_router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
+///
+/// `metrics` 为 §34.2.1 指标注册表（管理接口，非控制面）：`None` 时
+/// `/api/v1/metrics` 返回 503（未装配可区分于路径错误）。
+fn base_router(
+    state: Arc<dyn ApiState>,
+    concurrency: Arc<Semaphore>,
+    metrics: Option<std::sync::Arc<metrics::MetricsRegistry>>,
+) -> Router {
     Router::new()
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/devices/{device_id}", get(device))
         .route("/api/v1/devices/{device_id}/resources", get(resources))
         .route("/api/v1/devices/{device_id}/properties", get(properties))
         .route(HEALTH_PATH, get(health))
-        .with_state(AppState { state, concurrency })
+        .route(METRICS_PATH, get(metrics_snapshot))
+        .with_state(AppState {
+            state,
+            concurrency,
+            metrics,
+        })
 }
 
 /// 未匹配路径（404，§31.6 统一错误载荷）。
@@ -386,6 +421,8 @@ async fn fallback_method_not_allowed(axum::Extension(id): axum::Extension<Reques
 struct AppState {
     state: Arc<dyn ApiState>,
     concurrency: Arc<Semaphore>,
+    /// §34.2.1 指标注册表（管理接口；None = 未装配，端点 503）。
+    metrics: Option<std::sync::Arc<metrics::MetricsRegistry>>,
 }
 
 /// 请求进入时生成 `request_id` 并注入日志 span（§31.6 贯穿日志）。
@@ -580,6 +617,43 @@ async fn health(
     }))
 }
 
+/// 指标快照（§34.2.1；管理接口，非控制面）。
+///
+/// 未装配注册表时返回 503（运维可区分"未装配"与"路径错误"）；空注册表
+/// 返回 200 + 空 `metrics` 对象。快照读取无锁语义，不阻塞组件热路径。
+async fn metrics_snapshot(
+    State(state): State<AppState>,
+    axum::Extension(id): axum::Extension<RequestId>,
+) -> Response {
+    let Some(registry) = &state.metrics else {
+        return ApiErrorResponse(id, ApiError::unavailable("指标未装配")).into_response();
+    };
+    let _permit = match acquire(&state.concurrency, &id).await {
+        Ok(permit) => permit,
+        Err(response) => return response.into_response(),
+    };
+    let mut metrics: BTreeMap<String, MetricView> = registry
+        .snapshot()
+        .into_iter()
+        .map(|(name, value)| (name, MetricView::from(value)))
+        .collect();
+    // §34.2.1 diagnostics 日志丢弃计数：diagnostics 是 L0 零依赖 crate
+    // 不反向依赖 metrics 门面，其进程级自诊断原子量由 REST 快照在此桥接
+    // 暴露（评审 P1：仅落 `dropped_log_count()` 不进统一快照等于没交付）。
+    metrics.insert(
+        "diagnostics_dropped_logs_total".to_owned(),
+        MetricView::Count {
+            value: diagnostics::dropped_log_count(),
+        },
+    );
+    Json(MetricsResponse {
+        schema: MetricsResponse::SCHEMA,
+        captured_at_ns: crate::now_ns(),
+        metrics,
+    })
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -655,6 +729,17 @@ mod tests {
         router(state, Arc::new(Semaphore::new(64)))
     }
 
+    /// 带 metrics 注册表的测试装配（§34.2.1 metrics 端点）。
+    fn app_with_metrics(
+        state: Arc<dyn ApiState>,
+        registry: std::sync::Arc<metrics::MetricsRegistry>,
+    ) -> Router {
+        router_with_options(state, Some(registry), Arc::new(Semaphore::new(64)))
+            .fallback(fallback_not_found)
+            .method_not_allowed_fallback(fallback_method_not_allowed)
+            .layer(middleware::from_fn(request_id_layer))
+    }
+
     async fn get(router: Router, path: &str) -> (StatusCode, Value) {
         let res = router
             .oneshot(
@@ -671,6 +756,73 @@ mod tests {
             .await
             .expect("读取响应");
         (status, serde_json::from_slice(&bytes).expect("响应为 JSON"))
+    }
+
+    // ---- §34.2.1 GET /api/v1/metrics ------------------------------------
+
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_registry_snapshot() {
+        let registry = std::sync::Arc::new(metrics::MetricsRegistry::new());
+        let counter = registry.counter("poll_batches_total");
+        counter.inc();
+        counter.add(2);
+        registry.gauge("wal_inflight_gauge").set(7);
+        let hist = registry.histogram("schedule_delay_ns_hist");
+        hist.observe_ns(30_000);
+
+        let app = app_with_metrics(Arc::new(StaticState(snapshot())), registry);
+        let (status, body) = get(app, "/api/v1/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["schema"], "forgelink.metrics.v1");
+        assert!(
+            body["captured_at_ns"].is_u64(),
+            "captured_at_ns 应为 ns 时间戳"
+        );
+        assert_eq!(body["metrics"]["poll_batches_total"]["kind"], "count");
+        assert_eq!(body["metrics"]["poll_batches_total"]["value"], 3);
+        assert_eq!(body["metrics"]["wal_inflight_gauge"]["kind"], "gauge");
+        assert_eq!(body["metrics"]["wal_inflight_gauge"]["value"], 7);
+        assert_eq!(
+            body["metrics"]["schedule_delay_ns_hist"]["kind"],
+            "histogram"
+        );
+        assert_eq!(body["metrics"]["schedule_delay_ns_hist"]["count"], 1);
+        assert!(
+            body["metrics"]["schedule_delay_ns_hist"]["bounds"].is_array(),
+            "直方图应输出固定桶边界"
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_empty_registry_returns_empty_object() {
+        let app = app_with_metrics(
+            Arc::new(StaticState(snapshot())),
+            std::sync::Arc::new(metrics::MetricsRegistry::new()),
+        );
+        let (status, body) = get(app, "/api/v1/metrics").await;
+        assert_eq!(status, StatusCode::OK, "空注册表是合法状态（200 非 404）");
+        assert_eq!(body["schema"], "forgelink.metrics.v1");
+        // 注册表为空时响应仍含 diagnostics 桥接的自诊断计数（§34.2.1，
+        // 评审 P1：日志丢弃计数必须经统一端点可见）——恰为 1 项。
+        let metrics_obj = body["metrics"].as_object().expect("metrics 对象");
+        assert_eq!(metrics_obj.len(), 1, "空 registry 时仅 diagnostics 桥接项");
+        assert_eq!(
+            metrics_obj
+                .get("diagnostics_dropped_logs_total")
+                .map(|v| v["value"].clone()),
+            Some(serde_json::json!(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_absent_without_registry_is_503_envelope() {
+        // 未注入 registry 的服务器：管理端点按 §31.6 信封返回 503
+        // （SERVICE_UNAVAILABLE）而非 404/panic——运维可据此区分"未装配"
+        // 与"路径错误"。
+        let app = app(Arc::new(StaticState(snapshot())));
+        let (status, body) = get(app, "/api/v1/metrics").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["schema"], "forgelink.error.v1");
     }
 
     #[tokio::test]
@@ -958,6 +1110,7 @@ mod tests {
             RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: 4,
+                metrics: None,
             },
         )
         .await
@@ -976,6 +1129,7 @@ mod tests {
             RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: 4,
+                metrics: None,
             },
         )
         .await
@@ -1056,6 +1210,7 @@ mod tests {
             RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: 4,
+                metrics: None,
             },
         )
         .await
@@ -1095,6 +1250,7 @@ mod tests {
             RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: 0,
+                metrics: None,
             },
         )
         .await;
@@ -1114,6 +1270,7 @@ mod tests {
             RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: Semaphore::MAX_PERMITS + 1,
+                metrics: None,
             },
         )
         .await;

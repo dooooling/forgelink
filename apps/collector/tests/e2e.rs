@@ -30,25 +30,13 @@ async fn e2e_modbus_to_mqtt_full_chain() {
         .await
         .expect("Collector 启动成功");
 
-    // 等待至少两个批次（50ms 与 100ms 两个采集组各一轮），断言值映射。
-    let first = rx.recv().await.expect("应收到首个批次");
-    let second = rx.recv().await.expect("应收到第二个批次");
-    for (payload, expect_seq) in [(&first.payload, 0u64), (&second.payload, 1u64)] {
-        let batch = common::parse_batch(payload);
-        assert_eq!(batch["schema"], "forgelink.telemetry.v1");
-        assert_eq!(batch["site_id"], "plant-a");
-        assert_eq!(batch["device_id"], "vfd-01");
-        assert_eq!(batch["sequence"], expect_seq);
-        // §31.3/§31.4：连接瞬时断开时未确认批次由客户端自动重发
-        // （QoS 1 at-least-once），重发批次 `replayed=true` 且保留原
-        // message_id/sequence——CI 慢环境偶发，属合法语义而非失败。
-        // 本会话新鲜性由 message_id 内嵌的 `collector_session_id`
-        // 保证：跨会话 WAL 污染必然携带不同 session（重发不改变
-        // message_id，仍属于当前会话）。
-        let message_id = batch["message_id"].as_str().expect("message_id");
-        assert!(message_id.contains(&format!("{}", expect_seq)));
-    }
-    // 两个批次必须同属一个会话（message_id 长度前缀编码解析 session）。
+    // 等待收齐**两个不同 sequence** 的批次（50ms 与 100ms 两个采集组各
+    // 一轮）。§31.3/§31.4：QoS 1 at-least-once——连接瞬时断开时未确认
+    // 批次由客户端自动重发（`replayed=true` 且保留原 message_id/sequence），
+    // CI 慢环境偶发。因此不能假设"收到的前两条消息分别是 seq 0 和 1"：
+    // 合法的重复消息会打乱顺序/重复出现。按 sequence 去重收集，直到
+    // 收齐 {0, 1}；本会话新鲜性由 message_id 内嵌的 collector_session_id
+    // 保证（跨会话 WAL 污染必然携带不同 session）。
     let session_of = |payload: &[u8]| -> String {
         let batch = common::parse_batch(payload);
         let message_id = batch["message_id"].as_str().expect("message_id");
@@ -56,18 +44,50 @@ async fn e2e_modbus_to_mqtt_full_chain() {
         let len: usize = message_id[..colon].parse().expect("长度数字");
         message_id[colon + 1..colon + 1 + len].to_owned()
     };
-    assert_eq!(
-        session_of(&first.payload),
-        session_of(&second.payload),
-        "两个批次必须同属当前会话（无跨会话 WAL 污染）"
-    );
+    let mut seen: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
+    // 首条消息同样入集合（它可能就是 seq 0）。
+    {
+        let first = rx.recv().await.expect("应收到首个批次");
+        let batch = common::parse_batch(&first.payload);
+        assert_eq!(batch["schema"], "forgelink.telemetry.v1");
+        assert_eq!(batch["site_id"], "plant-a");
+        assert_eq!(batch["device_id"], "vfd-01");
+        let session = session_of(&first.payload);
+        let seq = batch["sequence"].as_u64().expect("sequence");
+        seen.insert(seq, first.payload);
+        // 收集直到凑齐两个不同 sequence（重复消息跳过；30s 上限防挂起）。
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        while seen.len() < 2 {
+            let payload = match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(msg)) => msg.payload,
+                _ => panic!("30s 内未收齐两个不同 sequence 的批次"),
+            };
+            let batch = common::parse_batch(&payload);
+            assert_eq!(session_of(&payload), session, "所有消息必须同属当前会话");
+            seen.insert(batch["sequence"].as_u64().expect("sequence"), payload);
+        }
+    }
+    // 两个采集组（50ms/100ms 轮询）各产出批次：收到的两个不同 sequence
+    // 必须是该会话的最初两批（0 与 1）——QoS 1 重发只会重复已有 seq，
+    // 不会产生新 seq。
+    let mut seqs: Vec<u64> = seen.keys().copied().collect();
+    seqs.sort_unstable();
+    assert_eq!(seqs, vec![0, 1], "应收齐该会话的前两个批次 sequence 0 与 1");
+    for (expect_seq, payload) in &seen {
+        let batch = common::parse_batch(payload);
+        let message_id = batch["message_id"].as_str().expect("message_id");
+        assert!(
+            message_id.contains(&expect_seq.to_string()),
+            "message_id 应内嵌 sequence {expect_seq}: {message_id}"
+        );
+    }
 
     // 值映射（§37.1 + §7.3）：40001=5000→50.0 Hz、40002=2000→20.0 A、
     // coil:1=true（按批次内容验证，避免两个批次顺序假设）。
     let mut saw_frequency = false;
     let mut saw_current = false;
     let mut saw_status = false;
-    for p in [&first.payload, &second.payload] {
+    for p in seen.values() {
         let batch = common::parse_batch(p);
         for obs in batch["observations"].as_array().expect("observations 数组") {
             match obs["path"].as_str().expect("path") {

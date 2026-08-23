@@ -1217,6 +1217,7 @@ mod tests {
         crate::server::router_with_control(
             Arc::new(EmptyState),
             gateway,
+            None,
             Arc::new(tokio::sync::Semaphore::new(64)),
         )
     }
@@ -1247,6 +1248,7 @@ mod tests {
             executor,
             audit: Arc::new(MemoryAuditSink::new()),
             policy: Arc::new(policy),
+            metrics: None,
         });
         ControlGateway::new(
             Arc::new(EngineControlAdapter::new(engine, NS, 5_000)),
@@ -1445,6 +1447,7 @@ mod tests {
         crate::server::router_with_control(
             Arc::new(EmptyState),
             gateway,
+            None,
             Arc::new(tokio::sync::Semaphore::new(64)),
         )
     }
@@ -1496,6 +1499,7 @@ mod tests {
             crate::server::RestConfig {
                 listen: "127.0.0.1:0".parse().expect("静态地址合法"),
                 max_concurrency: 8,
+                metrics: None,
             },
         )
         .await
@@ -1552,6 +1556,7 @@ mod tests {
             crate::server::RestConfig {
                 listen: "192.168.1.10:8080".parse().expect("静态地址合法"),
                 max_concurrency: 8,
+                metrics: None,
             },
         )
         .await;
@@ -1582,6 +1587,7 @@ mod tests {
                 crate::server::RestConfig {
                     listen: listen.parse().expect("静态地址合法"),
                     max_concurrency: 8,
+                    metrics: None,
                 },
             )
             .await

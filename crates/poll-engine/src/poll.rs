@@ -14,9 +14,10 @@ use tracing::{debug, info, warn};
 use crate::config::PollConfig;
 use crate::driver::PollDriver;
 use crate::events::{PollBatch, PollEvent};
+use crate::metrics::PollMetrics;
 
 /// 请求超时错误码（§17.6 标准错误类别：`driver_*` 前缀）。
-const ERROR_TIMEOUT_CODE: &str = "driver_request_timeout";
+pub(crate) const ERROR_TIMEOUT_CODE: &str = "driver_request_timeout";
 
 /// 驱动阻塞调用 panic 的错误码。
 const ERROR_PANIC_CODE: &str = "driver_read_panicked";
@@ -57,12 +58,15 @@ impl PollTarget {
 ///   超时记录告警并报告未完成回收，不无限阻塞停机）；
 /// - 本函数为公开 API：入口处再次校验配置（`interval_ms` 为 0 等非法值仅告警并
 ///   返回，不触发 Tokio panic）。
+///
+/// `metrics`：本任务的指标句柄集合（§34.2.1）；未注入时全部 no-op。
 pub async fn poll_loop(
     target: PollTarget,
     driver: Arc<Mutex<Box<dyn PollDriver>>>,
     config: PollConfig,
     cancel: CancellationToken,
     events: mpsc::Sender<PollEvent>,
+    metrics: PollMetrics,
 ) {
     // 防御性校验：公开入口不应能被非法配置触发 panic 或空转（§34）。
     if let Err(error) = target.validate().and_then(|_| config.validate()) {
@@ -86,7 +90,10 @@ pub async fn poll_loop(
     );
 
     let mut call = BatchCall::default();
-    run_loop(&target, &driver, &config, &cancel, &events, &mut call).await;
+    run_loop(
+        &target, &driver, &config, &cancel, &events, &mut call, &metrics,
+    )
+    .await;
 
     // 有序停机：取消令牌已触发（或通道关闭），等待最后在途的阻塞调用完成
     // （受 `shutdown_drain_timeout` 上限约束，超时记录告警并按未完成回收）。
@@ -101,26 +108,45 @@ async fn run_loop(
     cancel: &CancellationToken,
     events: &mpsc::Sender<PollEvent>,
     call: &mut BatchCall,
+    metrics: &PollMetrics,
 ) {
     // 错过的 tick 不补发（§22/§34 有界负载：读取耗时或退避期间不产生补偿式突发）。
     let mut ticker = tokio::time::interval(Duration::from_millis(target.interval_ms));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut backoff = config.backoff();
+    // 首个 tick 立即触发（interval 语义），计划时刻即任务启动时刻，无
+    // 有意义的调度偏差——**只跳过观测，不跳过采集**（评审 P1 回归修复：
+    // 此前 `continue` 跳过了整个首轮 call.run()，低频周期设备重启后会
+    // 白等一个完整 interval 才首次采集）。
+    let mut first_tick = true;
 
     loop {
-        // 正常节奏：等待周期 tick（首次立即触发）。
+        // 正常节奏：等待周期 tick。调度偏差观测（§34.2.1）：`tick()` 返回
+        // 值是该次 tick 的**计划时刻**（scheduled），实际唤醒时刻与其差值
+        // 即调度延迟（评审 P1：此前用"本轮开始前预写的 planned"计算，
+        // 测的是上一轮处理耗时/剩余 slack，不是唤醒偏差，p99 数据不可信）。
         tokio::select! {
             _ = cancel.cancelled() => {
                 info!(component = "poll-engine", device_id = %target.device_id, "设备轮询任务已取消");
                 break;
             }
-            _ = ticker.tick() => {}
+            scheduled = ticker.tick() => {
+                if !first_tick {
+                    // 调度延迟 = 实际唤醒 − 计划时刻（唤醒晚于计划为正偏差）。
+                    let late =
+                        tokio::time::Instant::now().saturating_duration_since(scheduled);
+                    if let Some(hist) = metrics.schedule_delay_ns.as_ref() {
+                        hist.observe_ns(late.as_nanos() as u64);
+                    }
+                }
+                first_tick = false;
+            }
         }
 
         match call.run(target, driver, config, cancel).await {
             Ok(outcome) => {
                 backoff.reset();
-                if !send_batch(target, events, cancel, outcome).await {
+                if !send_batch(target, events, cancel, outcome, metrics).await {
                     break;
                 }
             }
@@ -129,6 +155,7 @@ async fn run_loop(
                 break;
             }
             Err(TaskError::Driver(error)) => {
+                metrics.observe_error(&error.retryable, &error.code);
                 let retryable = error.retryable;
                 if !send_failure(target, events, cancel, &error).await {
                     break;
@@ -150,7 +177,7 @@ async fn run_loop(
                     match call.run(target, driver, config, cancel).await {
                         Ok(outcome) => {
                             backoff.reset();
-                            if !send_batch(target, events, cancel, outcome).await {
+                            if !send_batch(target, events, cancel, outcome, metrics).await {
                                 return;
                             }
                             break;
@@ -160,6 +187,7 @@ async fn run_loop(
                             return;
                         }
                         Err(TaskError::Driver(error)) => {
+                            metrics.observe_error(&error.retryable, &error.code);
                             if !send_failure(target, events, cancel, &error).await {
                                 return;
                             }
@@ -188,7 +216,11 @@ async fn send_batch(
     events: &mpsc::Sender<PollEvent>,
     cancel: &CancellationToken,
     outcome: BatchOutcome,
+    metrics: &PollMetrics,
 ) -> bool {
+    if let Some(counter) = metrics.batches_total.as_ref() {
+        counter.inc();
+    }
     let elapsed_ms = (outcome.elapsed_ns / 1_000_000) as u64;
     debug!(
         component = "poll-engine",

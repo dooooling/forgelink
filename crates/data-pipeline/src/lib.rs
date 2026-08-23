@@ -29,8 +29,10 @@
 
 mod batch;
 mod config;
+mod metrics;
 mod pipeline;
 
 pub use batch::{ObservationBatch, TELEMETRY_SCHEMA};
 pub use config::PipelineConfig;
+pub use metrics::PipelineMetrics;
 pub use pipeline::{DrainStats, Pipeline, PipelineError};

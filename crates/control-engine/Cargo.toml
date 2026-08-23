@@ -9,6 +9,7 @@ description = "Control Engine（§81-§90）：统一控制链路——认证/�
 [dependencies]
 async-trait = "0.1"
 driver-sdk = { path = "../driver-sdk" }
+metrics = { path = "../metrics" }
 observation-model = { path = "../observation-model" }
 profile-engine = { path = "../profile-engine" }
 serde = { version = "1", features = ["derive"] }
@@ -19,5 +20,6 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
 
 [dev-dependencies]
+metrics = { path = "../metrics" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

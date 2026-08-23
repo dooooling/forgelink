@@ -1239,3 +1239,151 @@ async fn shutdown_racing_commands_never_worker_failed() {
         "停机完成后 push 必须失败（Closed）"
     );
 }
+
+// ---- 指标埋点（§34.2.1） ------------------------------------------------------
+
+/// gauge 增减配对：push 后 in-flight = 1，ack 后 = 0；落盘耗时直方图
+/// 与补传计数同步生效。
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_track_inflight_gauge_and_persist_hist() {
+    use metrics::MetricValue;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let buffer = local_buffer::LocalBuffer::open_with_metrics(
+        config(dir.path(), 100, 1 << 30, CapacityPolicy::Reject),
+        registry.clone(),
+    )
+    .await
+    .expect("open");
+
+    // push 两条：in-flight = 2，直方图两次观测。
+    buffer
+        .push(batch(&msg("mm-1"), "cnc-01", 0))
+        .await
+        .expect("push");
+    buffer
+        .push(batch(&msg("mm-2"), "cnc-02", 1))
+        .await
+        .expect("push");
+
+    {
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get("wal_inflight_gauge"),
+            Some(&MetricValue::Gauge(2)),
+            "push 后在途记录数必须为 2"
+        );
+        let Some(MetricValue::Histogram { count, .. }) = snap.get("wal_persist_ns_hist") else {
+            panic!("落盘直方图应已注册");
+        };
+        assert_eq!(*count, 2, "每条成功落盘观测一次");
+    }
+
+    // 取出第一条（非补传）：补传计数不变。
+    let first = buffer.next().await.expect("next").expect("队列非空");
+    assert!(!first.batch.replayed);
+
+    // ACK：in-flight = 1。
+    buffer.ack(first.local_seq).await.expect("ack");
+    {
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get("wal_inflight_gauge"),
+            Some(&MetricValue::Gauge(1)),
+            "ACK 删除后在途记录数必须回落到 1"
+        );
+    }
+
+    // 幂等重复 push（同 message_id 已在磁盘、未 ACK）：不产生新的落盘
+    // 观测、不推高 in-flight。
+    buffer
+        .push(batch(&msg("mm-2"), "cnc-02", 1))
+        .await
+        .expect("重复 push 幂等");
+    {
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get("wal_inflight_gauge"),
+            Some(&MetricValue::Gauge(1)),
+            "幂等命中不得改变在途计数"
+        );
+        let Some(MetricValue::Histogram { count, .. }) = snap.get("wal_persist_ns_hist") else {
+            panic!("落盘直方图应已注册");
+        };
+        assert_eq!(*count, 2, "幂等命中不得产生落盘观测");
+    }
+
+    // 第二条 ACK：in-flight 归零（增减配对闭环）。
+    let second = buffer.next().await.expect("next").expect("队列非空");
+    assert_eq!(second.batch.message_id, msg("mm-2"));
+    buffer.ack(second.local_seq).await.expect("ack");
+    {
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.get("wal_inflight_gauge"),
+            Some(&MetricValue::Gauge(0)),
+            "全部确认后在途计数必须归零"
+        );
+    }
+
+    buffer.shutdown().await.expect("shutdown");
+}
+
+/// 补传计数：重启恢复的积压取出时 `replayed = true` 且计入
+/// `wal_replayed_total`；首次取出的新记录不计。
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_count_replayed_after_reopen() {
+    use metrics::MetricValue;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+
+    // 第一次会话：写入一条并释放句柄（未 ACK，等价异常退出）。
+    {
+        let cfg = config(&path, 100, 1 << 30, CapacityPolicy::Reject);
+        let buffer = local_buffer::LocalBuffer::open(cfg).await.expect("open");
+        buffer
+            .push(batch(&msg("mr-1"), "cnc-01", 0))
+            .await
+            .expect("push");
+        // 显式停机：记录保留在 SQLite（§31.4 未确认数据不删除）。
+        buffer.shutdown().await.expect("shutdown");
+    }
+
+    // 第二次会话：注入 registry 重开——恢复积压应标记补传并计数。
+    let registry = Arc::new(metrics::MetricsRegistry::new());
+    let buffer = local_buffer::LocalBuffer::open_with_metrics(
+        config(&path, 100, 1 << 30, CapacityPolicy::Reject),
+        registry.clone(),
+    )
+    .await
+    .expect("reopen");
+    let stored = buffer.next().await.expect("next").expect("恢复记录存在");
+    assert!(stored.batch.replayed, "恢复积压必须标记补传（§31.4）");
+    buffer.ack(stored.local_seq).await.expect("ack");
+
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.get("wal_replayed_total"),
+        Some(&MetricValue::Count(1)),
+        "补传取出必须计数"
+    );
+    // 恢复加载的历史记录不经历本次落盘：直方图无观测。
+    assert!(
+        !snap.contains_key("wal_persist_ns_hist")
+            || matches!(
+                snap.get("wal_persist_ns_hist"),
+                Some(MetricValue::Histogram { count: 0, .. })
+            ),
+        "恢复路径不得产生落盘观测"
+    );
+    // 恢复基线入账（1）后 ACK 扣减：gauge 归零，不得漂移为负。
+    assert_eq!(
+        snap.get("wal_inflight_gauge"),
+        Some(&MetricValue::Gauge(0)),
+        "恢复基线入账 + ACK 后在途计数归零"
+    );
+
+    buffer.shutdown().await.expect("shutdown");
+}

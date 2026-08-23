@@ -10,7 +10,7 @@ env:
 
 jobs:
   ci:
-    name: fmt / check / test / doc
+    name: fmt / check / test / doc (ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,3 +44,27 @@ jobs:
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps
+
+  # 目标平台含 Windows x64（§34.5 三平台验收）：至少在 CI 强制一个 Windows
+  # job 抓平台差异——路径分隔符、句柄释放时序（local-buffer 已踩过）、信号
+  # 语义等。覆盖与 Ubuntu 相同的测试面（--all-features 含 feature 门控测试）。
+  ci-windows:
+    name: check / test (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.95
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check (--all-targets --all-features)
+        run: cargo check --workspace --all-targets --all-features
+
+      # 真实进程强杀 WAL 崩溃恢复（§103 kill -9 验收）在 Windows 上依赖
+      # 句柄释放重试，正是本 job 要强制覆盖的场景。
+      - name: cargo test (--all-features, wal_crash)
+        run: cargo test -p local-buffer --all-features --test wal_crash
+
+      - name: cargo test (--workspace --all-features)
+        run: cargo test --workspace --all-features

@@ -42,6 +42,7 @@ mod engine;
 mod engine_tests;
 mod executor;
 mod journal;
+mod metrics;
 mod policy;
 mod precondition;
 mod queue;
@@ -61,6 +62,7 @@ pub use journal::{
     FileJournal, IdempotencyKey, InMemoryJournal, JournalDecision, JournalEntry, JournalError,
     payload_hash,
 };
+pub use metrics::ControlMetrics;
 pub use policy::{
     ALL_RISK_LEVELS, CommandPriority, ControlPolicy, OperationKind, Priority, risk_default_role,
 };

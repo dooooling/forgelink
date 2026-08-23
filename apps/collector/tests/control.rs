@@ -163,6 +163,18 @@ async fn control_write_end_to_end_updates_register() {
         "控制写入应落地到 Mock 寄存器"
     );
 
+    // §34.2.1：metrics 端点暴露共享注册表——控制写入的终态计数应可见。
+    let (_, metrics) = http(addr, "GET", "/api/v1/metrics", None, None);
+    assert_eq!(metrics["schema"], "forgelink.metrics.v1");
+    assert_eq!(
+        metrics["metrics"]["control_settled_succeeded_total"]["value"], 1,
+        "控制成功结算计数应经共享 registry 可见: {metrics}"
+    );
+    assert_eq!(
+        metrics["metrics"]["mqtt_published_total"]["kind"], "count",
+        "采集侧指标（MQTT 发布）与控制指标同源"
+    );
+
     runtime.shutdown().await.expect("优雅停机");
     broker.stop().await;
 }

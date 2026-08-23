@@ -89,6 +89,9 @@ local-buffer = { path = "../../crates/local-buffer", optional = true }
 # REST v1 只读管理接口（rest-api feature）。
 rest-api = { path = "../../crates/rest-api", optional = true }
 
+# §34.2.1 指标门面：REST /api/v1/metrics 数据源，采集与控制组件共享。
+metrics = { path = "../../crates/metrics" }
+
 # 控制链路依赖（仅 control-engine/control feature 时编译进产物）：
 async-trait = { version = "0.1", optional = true }
 control-engine = { path = "../../crates/control-engine", optional = true }

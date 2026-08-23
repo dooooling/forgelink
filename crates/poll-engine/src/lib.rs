@@ -20,6 +20,7 @@
 pub mod config;
 pub mod driver;
 pub mod events;
+pub mod metrics;
 pub mod poll;
 pub mod scheduler;
 

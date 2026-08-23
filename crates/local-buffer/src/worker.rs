@@ -23,6 +23,7 @@ use crate::{
     StoredBatch,
     config::{CapacityPolicy, LocalBufferConfig},
     error::{CapacityKind, LocalBufferError},
+    metrics::WalMetrics,
 };
 
 /// 通道容量（有界，§34.2）。worker 消费很快（内存操作 + SQLite），
@@ -225,7 +226,7 @@ pub(crate) fn telemetry_topic(batch: &ObservationBatch) -> Result<String, LocalB
 /// 不修改数据库（避免启动时全表 UPDATE 的写入放大）。
 fn open_db(
     config: &LocalBufferConfig,
-) -> Result<(Connection, Vec<MemRecord>, i64, u64, i64), LocalBufferError> {
+) -> Result<(Connection, Vec<MemRecord>, i64, u64, i64, i64), LocalBufferError> {
     let conn = Connection::open(&config.db_path).map_err(|e| {
         // 非 SQLite 文件（SQLITE_NOTADB）与打不开（路径/权限）分开描述。
         if matches!(e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::NotADatabase)
@@ -419,6 +420,12 @@ fn open_db(
         |r| r.get(0),
     )?;
 
+    // 全库未确认记录总数（§34.2.1 wal_inflight 基线，评审 P1）：in-flight
+    // 语义 = WAL 未确认积压**全集**（磁盘含未分页加载的部分），不得用
+    // 内存分页窗口长度（mem.len()）代替——否则磁盘积压 > memory_records
+    // 时 gauge 严重少算，ACK 清空内存窗口后 gauge 归零而磁盘仍有大量待补传。
+    let total_unacked: i64 = conn.query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))?;
+
     // 恢复：分页加载前 `memory_records` 条（P1-3，内存窗口有界）；
     // 按本地递增序号升序 = §31.4 补传顺序。
     let mut stmt = conn.prepare(
@@ -441,7 +448,14 @@ fn open_db(
     }
     drop(stmt);
     let last_loaded = records.last().map(|r| r.local_seq).unwrap_or(0);
-    Ok((conn, records, last_loaded, bytes as u64, recover_watermark))
+    Ok((
+        conn,
+        records,
+        last_loaded,
+        bytes as u64,
+        recover_watermark,
+        total_unacked,
+    ))
 }
 
 /// 分页补充加载（P1-3）：内存持有（`mem` + `inflight`）始终
@@ -517,7 +531,13 @@ pub(crate) type SpawnResult = (
 /// 启动 worker 专用线程（§103：磁盘操作在专用阻塞 Worker，不阻塞
 /// Tokio）。`open_db` 也在该线程内完成，通过 `ready` 通道返回结果
 ///（损坏 / 非法配置在 `LocalBuffer::open` 明确报错）。
-pub(crate) fn spawn(config: LocalBufferConfig) -> Result<SpawnResult, LocalBufferError> {
+///
+/// `wal_metrics`：§34.2.1 指标句柄集合（未注入时全 no-op）；句柄是
+/// `Send + Sync` 的原子量轻量克隆，随闭包移入专用阻塞线程使用。
+pub(crate) fn spawn(
+    config: LocalBufferConfig,
+    wal_metrics: WalMetrics,
+) -> Result<SpawnResult, LocalBufferError> {
     config.validate()?;
     let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -528,7 +548,7 @@ pub(crate) fn spawn(config: LocalBufferConfig) -> Result<SpawnResult, LocalBuffe
         .spawn(move || match open_db(&config) {
             Ok(opened) => {
                 let _ = ready_tx.send(Ok(()));
-                worker_loop(opened, config, rx, &closed_thread);
+                worker_loop(opened, config, rx, &closed_thread, wal_metrics);
             }
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -618,12 +638,13 @@ fn check_pending_confirm(conn: &mut Connection, state: &mut WorkerState) -> bool
 /// 启动数据以元组传入（open_db 结果），保持参数数量在 Clippy
 /// 阈值内。
 fn worker_loop(
-    opened: (Connection, Vec<MemRecord>, i64, u64, i64),
+    opened: (Connection, Vec<MemRecord>, i64, u64, i64, i64),
     config: LocalBufferConfig,
     mut rx: mpsc::Receiver<Cmd>,
     closed: &AtomicBool,
+    wal_metrics: WalMetrics,
 ) {
-    let (conn, records, last_loaded_seq, bytes, recover_watermark) = opened;
+    let (conn, records, last_loaded_seq, bytes, recover_watermark, total_unacked) = opened;
     let mut state = WorkerState {
         mem: records.into(),
         inflight: HashMap::new(),
@@ -640,6 +661,11 @@ fn worker_loop(
         bytes,
         "Local Buffer 启动：已恢复未确认记录（分页加载，内存窗口 = memory_records）"
     );
+    // 恢复的未确认记录计入 in-flight 基线（§34.2.1）：ACK / 过期清理时
+    // 同步扣减，镜像计数不漂移。基线用**全库未确认总数**而非内存分页
+    // 窗口长度（评审 P1：磁盘积压 > memory_records 时窗口长度严重少算，
+    // gauge 会在 ACK 清空首窗口后虚假归零）。磁盘占用基线同步入账。
+    wal_metrics.observe_restored(total_unacked, bytes);
 
     let mut conn = conn;
     loop {
@@ -657,10 +683,16 @@ fn worker_loop(
         progress |= check_pending_confirm(&mut conn, &mut state);
 
         // 保留时间（§103）：队列中滞留超期的未确认记录显式丢弃
-        //（告警；§31.4 在途记录不受影响，等待 ACK / requeue）。
+        //（告警日志，计入"过期丢弃"），不阻塞新数据。
         let cutoff = crate::now_ns() as i64 - config.retention.as_nanos() as i64;
         match cleanup_expired(&mut conn, &mut state, cutoff) {
-            Ok(n) => progress |= n > 0,
+            Ok((n, expired_bytes)) => {
+                progress |= n > 0;
+                // 过期清理与 ACK 同为"离开未确认集合"，同步扣减 in-flight
+                // 与磁盘占用 gauge（§34.2.1 gauge 配对语义）；过期丢弃计入
+                // `wal_ack_dropped_total`（已落盘但最终未送达即被丢弃）。
+                wal_metrics.observe_expired(n, expired_bytes);
+            }
             Err(e) => {
                 // 记录失败状态：清理失败时用短退避重试（评审 P2-1），
                 // 避免计算出的 0 超时空转烧 CPU。
@@ -687,7 +719,7 @@ fn worker_loop(
                 );
             }
         }
-        match flush_pending_push(&mut conn, &mut state, &config) {
+        match flush_pending_push(&mut conn, &mut state, &config, &wal_metrics) {
             Ok(n) => progress |= n > 0,
             Err(e) => {
                 // 磁盘错误：把错误分发给等待中的请求（显式失败，不静默
@@ -757,13 +789,14 @@ fn worker_loop(
                         // 重试会不断累积等待者，达到上限后误判永久错误
                         // 触发停机；滞留请求还占用等待队列长度）。
 
-                        let outcome = push_inner(&mut conn, &mut state, &config, batch, reply);
+                        let outcome =
+                            push_inner(&mut conn, &mut state, &config, batch, reply, &wal_metrics);
                         if matches!(outcome, PushOutcome::Backpressured) {
                             // reply 已随请求保存，等待队列消化时回复。
                         }
                     }
                     Cmd::Next { reply, delivered } => {
-                        let result = handle_next(&mut conn, &mut state);
+                        let result = handle_next(&mut conn, &mut state, &wal_metrics);
                         let taken = result
                             .as_ref()
                             .ok()
@@ -792,7 +825,7 @@ fn worker_loop(
                         }
                     }
                     Cmd::Ack { local_seq, reply } => {
-                        let result = handle_ack(&mut conn, &mut state, local_seq);
+                        let result = handle_ack(&mut conn, &mut state, local_seq, &wal_metrics);
                         if reply.send(result).is_err() {
                             warn!(
                                 component = "local-buffer",
@@ -881,6 +914,7 @@ fn flush_pending_push(
     conn: &mut Connection,
     state: &mut WorkerState,
     config: &LocalBufferConfig,
+    wal_metrics: &WalMetrics,
 ) -> Result<usize, LocalBufferError> {
     let mut flushed = 0;
     while let Some(front) = state.pending_push.front() {
@@ -889,7 +923,7 @@ fn flush_pending_push(
             break; // 空间未释放，等待后续命令（如 ACK）腾出。
         }
         let pending = state.pending_push.pop_front().expect("front 已检查");
-        match insert_record(conn, &pending.record) {
+        match insert_record_timed(conn, &pending.record, wal_metrics) {
             Ok(()) => {
                 // P1-1：取回 AUTOINCREMENT 分配的本地序号并写回记录，
                 // 否则 local_seq = 0 无法被 next / ack 正确关联。
@@ -938,12 +972,12 @@ fn capacity_full(state: &WorkerState, config: &LocalBufferConfig, requested: u64
 ///
 /// **事务提交成功后才更新内存状态**（评审 P2-3）：中途删除失败时
 /// 内存队列与容量统计保持不变（记录仍可访问、容量不失真），错误
-/// 向上传播由 worker 记录告警。
+/// 向上传播由 worker 记录告警。返回 (清理条数, 释放的估算磁盘字节)。
 fn cleanup_expired(
     conn: &mut Connection,
     state: &mut WorkerState,
     cutoff_ns: i64,
-) -> Result<usize, LocalBufferError> {
+) -> Result<(usize, u64), LocalBufferError> {
     // 评审 P2-5：不假设队头时间戳单调（SystemTime 回拨后，队列
     // 后部的记录可能更早过期）——`take_while` 会被未过期的队头
     // 阻断，过期记录无法及时释放容量；改为过滤全部记录。
@@ -954,7 +988,7 @@ fn cleanup_expired(
         .cloned()
         .collect();
     if expired.is_empty() {
-        return Ok(0);
+        return Ok((0, 0));
     }
     // 事务内删除磁盘（提交成功前不修改任何内存状态）。
     let tx = conn.transaction()?;
@@ -975,9 +1009,10 @@ fn cleanup_expired(
         component = "local-buffer",
         error_code = "local_buffer_expired_discard",
         deleted = expired.len(),
+        freed_bytes = removed_bytes,
         "保留时间到期，发送队列中的记录被显式丢弃（§103 过期策略；在途记录不受影响）"
     );
-    Ok(expired.len())
+    Ok((expired.len(), removed_bytes))
 }
 
 /// 推送一个 Batch（幂等：同 `message_id` 已存在时直接成功，不覆盖
@@ -989,6 +1024,7 @@ fn push_inner(
     config: &LocalBufferConfig,
     batch: ObservationBatch,
     reply: oneshot::Sender<Result<(), LocalBufferError>>,
+    wal_metrics: &WalMetrics,
 ) -> PushOutcome {
     let topic = match telemetry_topic(&batch) {
         Ok(t) => t,
@@ -1072,7 +1108,9 @@ fn push_inner(
     if requested > config.disk_max_bytes {
         // 单条记录成本已超过磁盘上限（评审 P1-1）：任何状态下
         // `bytes + requested > disk_max_bytes` 恒成立，背压等待将
-        // 永久阻塞并拖住后续请求——任何策略都立即显式拒绝。
+        // 永久阻塞并拖住后续请求——任何策略都立即显式拒绝。计入
+        // 容量路径丢弃（§34.2.1：显式拒绝 = 该 Batch 无法送达）。
+        wal_metrics.observe_capacity_rejected(1);
         let _ = reply.send(Err(LocalBufferError::CapacityExceeded {
             kind: CapacityKind::Disk,
             limit: config.disk_max_bytes,
@@ -1092,11 +1130,13 @@ fn push_inner(
             // 背压等待队列有界（P2-3，与内存窗口同界）：防止满盘时
             // 请求无限累积导致内存无界增长——超出后即使策略为
             // Backpressure 也显式拒绝（不静默覆盖、不无限堆积）。
+            wal_metrics.observe_capacity_rejected(1);
             let _ = reply.send(Err(err()));
             return PushOutcome::Handled;
         }
         match config.capacity_policy {
             CapacityPolicy::Reject => {
+                wal_metrics.observe_capacity_rejected(1);
                 let _ = reply.send(Err(err()));
                 return PushOutcome::Handled;
             }
@@ -1114,7 +1154,7 @@ fn push_inner(
 
     // 入队 + 落盘（同一流程内完成，内存与磁盘一致；SQLite 事务保证
     // 崩溃后记录仍在——未 ACK 数据不丢失）。
-    match insert_record(conn, &record) {
+    match insert_record_timed(conn, &record, wal_metrics) {
         Ok(()) => {
             // 取回本地递增序号（AUTOINCREMENT，§31.4 补传顺序依据）。
             let mut record = record;
@@ -1157,6 +1197,21 @@ fn insert_record(conn: &mut Connection, record: &MemRecord) -> Result<(), LocalB
     Ok(())
 }
 
+/// 落盘并观测耗时与磁盘占用（§34.2.1 `wal_persist_ns_hist` /
+/// `wal_disk_bytes_gauge`）；成功时 in-flight gauge +1、磁盘占用
+/// gauge +成本（新记录进入未确认集合并占用 WAL）。仅此包装路径计
+/// 指标——恢复加载、幂等命中等非落盘路径不产生观测。
+fn insert_record_timed(
+    conn: &mut Connection,
+    record: &MemRecord,
+    wal_metrics: &WalMetrics,
+) -> Result<(), LocalBufferError> {
+    let started = std::time::Instant::now();
+    insert_record(conn, record)?;
+    wal_metrics.observe_persisted(started.elapsed().as_nanos() as u64, record_cost(record));
+    Ok(())
+}
+
 /// 取最早未发送记录（内存队列头 = 本地序号最小 = §31.4 补传顺序）。
 /// 返回的 Batch 为深拷贝：`sent_count > 0`（曾取出）或属于本次会话
 /// 恢复的积压（`local_seq <= recover_watermark`，P2-2 会话内补传
@@ -1169,6 +1224,7 @@ fn insert_record(conn: &mut Connection, record: &MemRecord) -> Result<(), LocalB
 fn handle_next(
     conn: &mut Connection,
     state: &mut WorkerState,
+    wal_metrics: &WalMetrics,
 ) -> Result<Option<StoredBatch>, LocalBufferError> {
     let Some(record) = state.mem.pop_front() else {
         // 内存耗尽但磁盘分页加载失败：返回错误而非 `None`，避免
@@ -1190,6 +1246,7 @@ fn handle_next(
     };
     if record.sent_count > 0 || record.local_seq <= state.recover_watermark {
         batch.replayed = true; // 补传（§31.4）：保留原 message_id/时间。
+        wal_metrics.observe_replayed();
     }
     let sent_count = record.sent_count + 1;
     if let Err(e) = conn.execute(
@@ -1224,13 +1281,16 @@ fn handle_ack(
     conn: &mut Connection,
     state: &mut WorkerState,
     local_seq: i64,
+    wal_metrics: &WalMetrics,
 ) -> Result<(), LocalBufferError> {
     let deleted = conn.execute("DELETE FROM batches WHERE local_seq = ?1", [local_seq])?;
     if deleted > 0
         && let Some(record) = state.inflight.remove(&local_seq)
     {
-        // 容量统计用估算成本，ACK 释放也按同一口径扣减。
+        // 容量统计用估算成本，ACK 释放也按同一口径扣减（磁盘占用 gauge
+        // 与容量记账同路径配对）。
         state.bytes = state.bytes.saturating_sub(record_cost(&record));
+        wal_metrics.observe_acked(record_cost(&record));
     }
     Ok(())
 }

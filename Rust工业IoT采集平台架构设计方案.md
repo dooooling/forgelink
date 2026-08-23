@@ -2331,6 +2331,36 @@ forced process restart during WAL write
 
 性能验收必须同时记录 CPU、RSS、P95/P99 采集延迟，不能只看吞吐。
 
+### 34.2.1 指标埋点要求（Normative）
+
+§34.2 报告项必须有对应运行时指标支撑。组件在代码路径上暴露计数器/直方图，由统一 metrics 门面聚合；指标是验收与现场运维的共同基础设施：
+
+```text
+poll-engine          poll_batches_total / poll_errors_total{reason} /
+                     schedule_delay_ns（直方图：调度触发 vs 计划时刻偏差）
+data-pipeline        batches_flushed_total / observations_total /
+                     flush_backpressure_wait_ns
+local-buffer         wal_inflight（gauge）/ wal_disk_bytes（gauge）/
+                     wal_replayed_total / wal_ack_dropped_total /
+                     wal_persist_ns（直方图）
+mqtt-client          mqtt_inflight（gauge）/ mqtt_published_total /
+                     mqtt_redelivered_total / mqtt_failed_total /
+                     mqtt_publish_ns（直方图）
+control-engine       control_queue_depth{device}（gauge，有界采样）/
+                     control_settled_total{status} / control_cooldown_entered_total /
+                     control_journal_settle_failed_total
+diagnostics          日志丢弃计数（非阻塞队列满）
+```
+
+约定：
+
+- 门面必须零依赖（不引入第三方 metrics 库）、默认实现为进程内原子计数器；
+- 埋点在热路径上只做一次原子操作，禁止加锁与堆分配；
+- 直方图为固定桶边界（ns 级），快照读取为无锁聚合；
+- 未注册的指标读取返回 0，不得 panic；
+- REST 只读暴露 `GET /api/v1/metrics`（`forgelink.metrics.v1`），属管理接口非控制面——只读构建同样可用；响应不含文件路径、地址、凭据。
+
+
 ## 34.3 Timeout / Reconnect
 
 必须满足：
@@ -2430,10 +2460,15 @@ mqtt-client           MQTT 北向客户端（QoS 1 发布、自动重连退避�
 local-buffer          Local Buffer/WAL（SQLite WAL 崩溃恢复、两级缓冲、幂等补传与 ack 删除）
 rest-api              REST v1 管理接口——只读：设备/资源/属性/健康、错误模型、有界并发
                       （§31.5/§31.6）；控制：POST controls 202 异步受理 + GET control-requests
-                      三态查询、Bearer 认证（§90.2）、错误映射 400/404/409/422/503
+                      三态查询、Bearer 认证（§90.2）、错误映射 400/404/409/422/503；
+                      指标：GET /api/v1/metrics（§34.2.1，管理接口非控制面）
+metrics               指标门面（§34.2.1）：零依赖原子 Counter/Gauge/固定桶 Histogram、
+                      有界注册表与溢出降级、无锁快照；五组件埋点接入
+                      （poll/pipeline/WAL/MQTT/control），collector 共享单一注册表
 collector             Collector 运行时组装（§93/§100：只读采集链路——轮询→映射→组包→WAL→MQTT
                       QoS1 发布；有序停机有限排空，REST 服务异常退出触发停机；control feature：
-                      control 配置段装配 Control Engine，停机第 0.5 步结算在途控制）
+                      control 配置段装配 Control Engine，停机第 0.5 步结算在途控制；
+                      metrics 注册表全组件共享并经 REST 暴露）
 modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 ```
 

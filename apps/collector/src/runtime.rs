@@ -194,11 +194,18 @@ impl CollectorRuntime {
         }
 
         // 4) 数据管道 / 本地缓冲 / MQTT（§31.2/§103/§31）。
+        //    §34.2.1：进程内共享单一指标注册表，全部组件埋点同源，
+        //    REST /api/v1/metrics 暴露同一快照。
+        let metrics_registry = Arc::new(metrics::MetricsRegistry::new());
         let pipeline_cfg = config
             .pipeline
             .to_pipeline_config(&config.site_id, &session_id)?;
         let (out_tx, out_rx) = mpsc::channel(pipeline_cfg.max_batch_size);
-        let pipeline = data_pipeline::Pipeline::spawn(pipeline_cfg, out_tx)?;
+        let pipeline = data_pipeline::Pipeline::spawn_with_metrics(
+            pipeline_cfg,
+            out_tx,
+            metrics_registry.clone(),
+        )?;
         let pipeline_arc = Arc::new(pipeline);
 
         let buffer_cfg = config.buffer.to_buffer_config()?;
@@ -212,10 +219,13 @@ impl CollectorRuntime {
                 "缓冲数据库父目录不存在（重启恢复依赖目录持久化，请提前创建）"
             );
         }
-        let buffer = Arc::new(local_buffer::LocalBuffer::open(buffer_cfg).await?);
+        let buffer = Arc::new(
+            local_buffer::LocalBuffer::open_with_metrics(buffer_cfg, metrics_registry.clone())
+                .await?,
+        );
 
         let mqtt_cfg = config.northbound.mqtt.to_client_config(&config.site_id)?;
-        let mqtt = mqtt_client::MqttClient::spawn(mqtt_cfg)?;
+        let mqtt = mqtt_client::MqttClient::spawn_with_metrics(mqtt_cfg, metrics_registry.clone())?;
         let mqtt_arc = Arc::new(mqtt);
 
         // 5) 在线状态（§31.1：retained status envelope，每设备；断线后
@@ -249,7 +259,7 @@ impl CollectorRuntime {
         // 6) Poll Scheduler：按读取项分组启动轮询任务（§22/§34.3）。
         let poll_cfg = config.poll.to_poll_config();
         let (events_tx, events_rx) = mpsc::channel(256);
-        let mut scheduler = PollScheduler::new();
+        let mut scheduler = PollScheduler::with_metrics(metrics_registry.clone());
         let mut device_meta: Vec<(String, bool, usize, usize)> = Vec::new();
         for device_id in manager.device_ids() {
             let instance = manager.get(device_id).expect("已注册");
@@ -294,11 +304,17 @@ impl CollectorRuntime {
         #[cfg(feature = "control")]
         let (gateway, control_stack) = match control_static {
             Some(statics) => {
-                let attachment = crate::control::assemble(statics, &manager_arc);
+                let attachment = crate::control::assemble(statics, &manager_arc, &metrics_registry);
                 (Some(attachment.gateway), Some(attachment.stack))
             }
             None => (None, None),
         };
+
+        // 7.6) 指标注册表冻结（§34.2.1 无锁快照，评审 P1）：全部组件装配
+        //      完成（预注册期结束）、REST/采集任务启动前一次性 freeze——
+        //      此后 /api/v1/metrics 的快照读取零锁。运行期不再有注册点
+        //      （per-device gauge 已按静态设备清单预注册）。
+        metrics_registry.freeze();
 
         // 8) REST v1 管理接口（§31.5/§104）：默认禁用，显式配置
         //    `rest.listen` 才启动（§90.1 只监听 loopback）。绑定失败
@@ -330,6 +346,7 @@ impl CollectorRuntime {
                                 rest_api::RestConfig {
                                     listen,
                                     max_concurrency: config.rest.max_concurrency,
+                                    metrics: Some(metrics_registry.clone()),
                                 },
                             )
                             .await
@@ -340,6 +357,7 @@ impl CollectorRuntime {
                                 rest_api::RestConfig {
                                     listen,
                                     max_concurrency: config.rest.max_concurrency,
+                                    metrics: Some(metrics_registry.clone()),
                                 },
                             )
                             .await
@@ -353,6 +371,7 @@ impl CollectorRuntime {
                         rest_api::RestConfig {
                             listen,
                             max_concurrency: config.rest.max_concurrency,
+                            metrics: Some(metrics_registry.clone()),
                         },
                     )
                     .await
