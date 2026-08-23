@@ -26,7 +26,11 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 仍在建设中的能力：
 
 - `edge-server`、`manager` 尚未开始运行时组装
-- 尚未完成三平台真实部署、性能基准和长时间稳定性验收
+- 性能验收的**执行**待目标硬件：基准工具已交付（`apps/bench` 的
+  `forgelink-bench`，操作手册见 [docs/benchmark.md](./docs/benchmark.md)），
+  正式验收（x64 数值、72h soak）与 Linux ARM64 板载七项检查按手册执行；
+  Windows x64 / Linux x64 部署包由 CI 构建上传，ARM64 经
+  [scripts/build-linux-arm64.sh](./scripts/build-linux-arm64.sh) 交叉构建
 
 架构依据见：
 

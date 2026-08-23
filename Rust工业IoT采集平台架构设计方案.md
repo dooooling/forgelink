@@ -2478,6 +2478,25 @@ modbus-mock           测试共用 Mock Modbus TCP server（非生产）
 edge-server / manager 的完整运行时组装、三平台部署、性能基准和长时间稳定性验收。
 ```
 
+> **更新（性能基准与三平台部署·工具与部署物交付）**：
+>
+> - 性能基准工具 `forgelink-bench`（`apps/bench`）已交付：编排 workload
+>   （批量生成 Profile/配置）→ 子进程 collector → 指标采样（REST 快照差值
+>   + Linux `/proc` RSS/CPU）→ MQTT 订阅流式记账 → §34.2 验收表逐项判定
+>   报告（JSON+Markdown）。八场景覆盖 smoke/throughput/schedule/fault-net/
+>   fault-timeout/fault-broker/crash-wal/soak；北向双 broker 模式（进程内
+>   MockBroker / 真实 broker 的 rumqttc 通配订阅）统一记账数据源。
+> - 三平台部署物：Windows x64 与 Linux x64 由 CI 构建 release 产物并按
+>   §19/§20 布局打包上传（`scripts/package.*`）；Linux ARM64 **暂不进 CI**
+>   （实施决策），由 `scripts/build-linux-arm64.sh` + `docs/deploy-arm64.md`
+>   支持板载交叉构建与验收。
+> - 正式性能验收由人工在 §34.2 Reference Benchmark Profile 目标硬件上执行
+>   （操作手册 `docs/benchmark.md`）；CI 仅运行 smoke 场景防退化。三平台
+>   记录模板见 `docs/platform-acceptance.md`。
+> - Windows x64 为功能/稳定性复验平台，不采集 RSS/CPU 性能指标且报告显式
+>   标注——不改变本节上文对 x64 基线的要求。正式验收执行（x64 数值验收、
+>   72h soak、ARM64 板载七项）待目标硬件就绪后按手册完成。
+
 本节只记录实现进度，不改变前述 Normative 契约和 MVP 验收标准。
 
 ---
