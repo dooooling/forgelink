@@ -559,10 +559,20 @@ fn handle_connection(
 
 /// 便捷：配置 host/port 的连接 JSON（Modbus Driver `mode=tcp`）。
 pub fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
+    tcp_config_at(
+        &server.addr.ip().to_string(),
+        server.addr.port(),
+        timeout_ms,
+    )
+}
+
+/// 便捷：按显式地址配置连接 JSON（[`tcp_config`] 的直传变体，供无法
+/// 持有 [`MockServer`] 句柄的调用方使用——如 bench 的 workload 生成）。
+pub fn tcp_config_at(host: &str, port: u16, timeout_ms: u64) -> String {
     serde_json::json!({
         "mode": "tcp",
-        "host": server.addr.ip().to_string(),
-        "port": server.addr.port(),
+        "host": host,
+        "port": port,
         "timeout_ms": timeout_ms,
         "reconnect": true,
         "reconnect_max_attempts": 2,
