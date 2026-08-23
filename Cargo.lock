@@ -382,6 +382,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-s7comm"
+version = "0.1.0"
+dependencies = [
+ "driver-loader",
+ "driver-sdk",
+ "libloading",
+ "observation-model",
+ "poll-engine",
+ "s7comm-mock",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "driver-sdk"
 version = "0.1.0"
 dependencies = [
