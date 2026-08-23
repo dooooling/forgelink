@@ -1458,8 +1458,12 @@ fn accept_request(
             pending.push_back(request);
         }
         Err(e) => {
-            // 入队前拒绝（非法主题 / 超限载荷）：计入失败结算。
-            mqtt_metrics.observe_failed();
+            // 入队前拒绝（非法主题 / 超限载荷）：失败计数照记，但该请求
+            // 从未 observe_accepted（metrics_counted 仍为 false），不得
+            // -1（评审 P2：此前误用带 inflight 结算的 observe_failed——
+            // 公共路径被 publish_inner 前置校验挡住到不了这里，属防御性
+            // 分支的计数域错配）。
+            mqtt_metrics.observe_failed_uncounted();
             let _ = request.ack_tx.send(Err(e));
         }
     }
