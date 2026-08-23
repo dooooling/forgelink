@@ -1,0 +1,66 @@
+{
+  "id": "inovance-md500",
+  "vendor": "Inovance",
+  "family": "MD500",
+  "models": ["MD500"],
+  "domain": "drive",
+  "driver_id": "modbus-tcp",
+  "properties": [
+    {
+      "path": "drive.output.frequency",
+      "driver_address": "1!40001",
+      "raw_type": "u16",
+      "value_type": "f64",
+      "unit": "Hz",
+      "scale": 0.01,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": true,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "drive.output.current",
+      "driver_address": "1!40002",
+      "raw_type": "u16",
+      "value_type": "f64",
+      "unit": "A",
+      "scale": 0.01,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "drive.run.status",
+      "driver_address": "1!coil:1",
+      "raw_type": "bool",
+      "value_type": "bool",
+      "unit": null,
+      "scale": 0.0,
+      "offset": 0.0,
+      "write_rounding": "exact",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 1000,
+      "min": null,
+      "max": null
+    }
+  ],
+  "commands": [],
+  "capabilities": {
+    "supported_properties": [
+      "drive.output.frequency",
+      "drive.output.current",
+      "drive.run.status"
+    ],
+    "supported_commands": [],
+    "acquisition": {},
+    "limits": {}
+  }
+}

@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# 发布打包产物（scripts/package.* 输出）
+/dist/
+
 # Editor / OS files
 *.swp
 *.swo

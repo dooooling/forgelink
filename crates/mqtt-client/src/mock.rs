@@ -35,14 +35,23 @@ pub struct CapturedWill {
 }
 
 /// Mock broker 全局可观察状态。
-#[derive(Default)]
+///
+/// `capture_enabled` / `accepts_enabled` 语义上默认开启，而 `bool` 的
+/// derive 默认是 `false`，因此 [`Default`] 手写实现而非派生。
 struct MockState {
-    /// 累计接受过的连接数（含重连）。
+    /// 累计接受过的连接数（含重连；受理闸门关闭期间的连接不计入）。
     connections: usize,
     /// 未收到 DISCONNECT 报文即断开的连接数。
     abnormal_disconnects: usize,
-    /// 收到的全部 PUBLISH（按连接顺序）。
+    /// 收到的全部 PUBLISH（按连接顺序；捕获关闭时不再积累）。
     publishes: Vec<CapturedPublish>,
+    /// 收到的 PUBLISH 总数（与捕获开关无关，恒递增——长跑基准关闭
+    /// 捕获后仍需全局计数支撑 `puback_hold_n` 等按序号定位的钩子）。
+    publish_total: usize,
+    /// 是否把 PUBLISH 存入 `publishes`（基准长跑关闭以防内存膨胀）。
+    capture_enabled: bool,
+    /// 是否受理新连接（关闭 = 模拟 broker 停机但端口仍监听）。
+    accepts_enabled: bool,
     /// 每次 CONNECT 中携带的 Will（若有）。
     wills: Vec<CapturedWill>,
     /// 测试订阅者（精确主题匹配）。
@@ -65,6 +74,26 @@ struct MockState {
     /// 客户端下一条发布回绕撞上未确认槽位触发 `Outgoing::AwaitAck`）。
     /// 挂起不阻塞连接读循环（后续报文照常接收、确认）。
     puback_hold_n: Option<(usize, Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+impl Default for MockState {
+    fn default() -> Self {
+        Self {
+            connections: 0,
+            abnormal_disconnects: 0,
+            publishes: Vec::new(),
+            publish_total: 0,
+            capture_enabled: true,
+            accepts_enabled: true,
+            wills: Vec::new(),
+            subscribers: Vec::new(),
+            connection_tasks: Vec::new(),
+            drop_connection_after_publish: None,
+            drop_connection_sequence: None,
+            puback_delay: Duration::ZERO,
+            puback_hold_n: None,
+        }
+    }
 }
 
 struct Subscriber {
@@ -149,9 +178,29 @@ impl MockBroker {
         self.state.lock().expect("state 锁中毒").connections
     }
 
-    /// 捕获到的全部 PUBLISH。
+    /// 捕获到的全部 PUBLISH（捕获关闭后不再增长，仅含关闭前已存入的）。
     pub fn publishes(&self) -> Vec<CapturedPublish> {
         self.state.lock().expect("state 锁中毒").publishes.clone()
+    }
+
+    /// 收到的 PUBLISH 总数（与捕获开关无关，恒递增）。
+    pub fn publish_total(&self) -> usize {
+        self.state.lock().expect("state 锁中毒").publish_total
+    }
+
+    /// 测试钩子：开关 PUBLISH 捕获存储。关闭后 [`Self::publishes`] 不再
+    /// 积累（长跑基准防内存膨胀），但 [`Self::publish_total`] 计数与
+    /// [`Self::subscribe`] 的订阅分发不受影响。默认开启。
+    pub fn set_capture_enabled(&self, enabled: bool) {
+        self.state.lock().expect("state 锁中毒").capture_enabled = enabled;
+    }
+
+    /// 测试钩子：开关新连接受理。关闭时新到连接立即被丢弃（不计入
+    /// [`Self::connections`]）：模拟 broker 停机但端口仍监听——客户端
+    /// 表现为连接建立后立即被对端关闭，进入重连退避；恢复开启后新
+    /// 连接正常受理。默认开启。
+    pub fn set_accepts_enabled(&self, enabled: bool) {
+        self.state.lock().expect("state 锁中毒").accepts_enabled = enabled;
     }
 
     /// 捕获到的全部 Will（按连接顺序）。
@@ -251,6 +300,13 @@ impl MockBroker {
                 // 瞬时错误（如连接被对端立即关闭）不终止服务端。
                 Err(_) => continue,
             };
+            // 受理闸门关闭：立即丢弃新连接（不计入连接计数、不进入握手），
+            // 客户端表现为连接建立后立即被关闭——模拟 broker 停机但端口
+            // 仍监听，恢复开启后新连接正常受理。
+            if !state.lock().expect("state 锁中毒").accepts_enabled {
+                drop(stream);
+                continue;
+            }
             let state = state.clone();
             let state_for_conn = state.clone();
             let acceptor = acceptor.clone();
@@ -379,7 +435,12 @@ async fn handle_connection(
                 };
                 {
                     let mut state = state.lock().expect("state 锁中毒");
-                    state.publishes.push(captured.clone());
+                    // 全局计数与存储解耦：长跑基准关闭捕获后计数与订阅
+                    // 分发照常，`publishes` 不再积累。
+                    state.publish_total += 1;
+                    if state.capture_enabled {
+                        state.publishes.push(captured.clone());
+                    }
                     deliver(&state, captured);
                     // 测试钩子：第 N 个 PUBLISH 不回复 PUBACK 直接断开
                     //（先记录报文；重连后 rumqttc 会重发相同报文）。
@@ -418,8 +479,9 @@ async fn handle_connection(
                     let held = {
                         let mut state = state.lock().expect("state 锁中毒");
                         match state.puback_hold_n.take() {
-                            // 全局序号 = 已记录报文数（当前报文已 push）。
-                            Some((n, flag)) if n == state.publishes.len() => Some(flag),
+                            // 全局序号 = 收到的 PUBLISH 总数（当前报文已计数；
+                            // 与捕获开关无关，关闭捕获后钩子仍按真实序号定位）。
+                            Some((n, flag)) if n == state.publish_total => Some(flag),
                             other => {
                                 state.puback_hold_n = other;
                                 None
@@ -719,5 +781,103 @@ where
             panic!("wait_until 超时：条件未满足");
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::MqttClient;
+    use crate::config::MqttClientConfig;
+
+    /// 捕获关闭后 `publishes` 不再积累，但全局计数与订阅分发照常
+    /// （长跑基准依赖此语义：存储关闭、记账走订阅通道）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_disabled_keeps_total_and_subscription() {
+        let broker = MockBroker::start().await;
+        let mut rx = broker.subscribe("bench/capture").await;
+        broker.set_capture_enabled(false);
+
+        let addr = broker.addr();
+        let config = MqttClientConfig::new("bench-cap-off", addr.ip().to_string(), addr.port());
+        let client = MqttClient::spawn(config).expect("客户端启动失败");
+        client
+            .publish("bench/capture", b"payload-1".to_vec())
+            .await
+            .expect("发布入队失败")
+            .acked()
+            .await
+            .expect("PUBACK 确认失败");
+
+        wait_until(|| broker.publish_total() == 1).await;
+        assert!(
+            broker.publishes().is_empty(),
+            "捕获关闭后 publishes 不得积累"
+        );
+        let received = rx.recv().await.expect("订阅分发不受捕获开关影响");
+        assert_eq!(received.payload, b"payload-1");
+        client.shutdown().await.expect("客户端停机失败");
+    }
+
+    /// 受理闸门关闭时新连接立即被丢弃且不计入 `connections`；恢复开启后
+    /// 新连接正常握手（模拟 broker 停机窗口与恢复）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepts_disabled_rejects_then_recovers() {
+        let broker = MockBroker::start().await;
+        broker.set_accepts_enabled(false);
+
+        // 连接可建立但立即被对端关闭：读不到任何字节（EOF）。
+        let mut stream = TcpStream::connect(broker.addr())
+            .await
+            .expect("TCP 连接失败");
+        let mut buf = [0u8; 4];
+        let n = stream.read(&mut buf).await.unwrap_or(0);
+        assert_eq!(n, 0, "受理闸门关闭时连接应被立即关闭");
+        drop(stream);
+        assert_eq!(broker.connections(), 0, "被拒绝的连接不得计入 connections");
+
+        broker.set_accepts_enabled(true);
+        // 内部自带断言（CONNACK 异常即 panic），成功返回即已握手。
+        let _ = RawClient::connect_with_will(broker.addr(), None).await;
+        assert_eq!(broker.connections(), 1);
+    }
+
+    /// `puback_hold_n` 必须按全局计数定位（与捕获开关无关）：捕获关闭时
+    /// `publishes.len()` 恒为 0，若实现误用它判序，第 1 条的 PUBACK 会
+    /// 立即回发而不会挂起——本测试以"150ms 内不得收到 PUBACK"固化该契约。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hold_puback_tracks_total_when_capture_disabled() {
+        let broker = MockBroker::start().await;
+        broker.set_capture_enabled(false);
+        let flag = broker.hold_puback(1);
+
+        let mut client = RawClient::connect_with_will(broker.addr(), None).await;
+        // QoS 1 PUBLISH：topic "a"、packet id 1、payload "x"（remaining = 6）。
+        client
+            .stream
+            .write_all(&[0x33, 0x06, 0x00, 0x01, b'a', 0x00, 0x01, b'x'])
+            .await
+            .expect("PUBLISH 发送失败");
+
+        let mut ack = [0u8; 4];
+        let early = tokio::time::timeout(
+            Duration::from_millis(150),
+            client.stream.read_exact(&mut ack),
+        )
+        .await;
+        assert!(
+            early.is_err(),
+            "PUBACK 应被挂起（误用 publishes.len() 判序时会立即收到确认）"
+        );
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        // 放行标志置位后由连接读循环轮询补发挂起的 PUBACK。
+        tokio::time::timeout(Duration::from_secs(2), client.stream.read_exact(&mut ack))
+            .await
+            .expect("放行后应补发 PUBACK")
+            .expect("读取 PUBACK 失败");
+        assert_eq!(ack[0], 0x40, "应为 PUBACK 固定头");
+
+        assert_eq!(broker.publish_total(), 1);
+        assert!(broker.publishes().is_empty(), "全程捕获关闭");
     }
 }

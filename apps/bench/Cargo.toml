@@ -1,0 +1,40 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+
+# 性能基准工具（§34.2 验收三件套之一：工具 + 报告生成 + 操作手册）。
+# 编排器进程模型：生成 workload → 子进程拉起 collector 二进制 → 经 REST
+# 采指标、经 MQTT 订阅流式记账、定时采 /proc → 出验收报告（§34.7）。
+[[bin]]
+name = "forgelink-bench"
+path = "src/main.rs"
+
+[dependencies]
+# 配置类型复用：程序化构造 CollectorConfig 后序列化为 YAML 供子进程加载。
+collector = { path = "../collector" }
+# 设备模拟器与北向记账数据源。
+modbus-mock = { path = "../../crates/modbus-mock" }
+mqtt-client = { path = "../../crates/mqtt-client", features = ["test-utils"] }
+# 真实 broker 模式的订阅端（与 mqtt-client 同版本，锁一致）。
+rumqttc = { version = "0.24", default-features = false, features = ["use-rustls"] }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "net",
+    "io-util",
+    "process",
+    "sync",
+] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

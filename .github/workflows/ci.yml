@@ -10,7 +10,7 @@ env:
 
 jobs:
   ci:
-    name: fmt / check / test / doc (ubuntu)
+    name: fmt / check / test / doc / package / bench-smoke (ubuntu)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,19 +37,58 @@ jobs:
 
       # 真实进程强杀 WAL 崩溃恢复（§103 kill -9 验收）：由 test-utils
       # feature 门控，默认 cargo test --workspace 不执行——单独启用
-      # 该 feature 运行关键验收测试（Windows 句柄释放延迟已带重试；
-      # Linux SIGKILL 下 WAL 恢复 0 丢失）。
+      # 该 feature 运行关键验收测试（Linux SIGKILL 下 WAL 恢复 0 丢失；
+      # Windows 句柄释放延迟已带重试，见 windows job）。
       - name: cargo test (wal_crash, test-utils)
         run: cargo test -p local-buffer --all-features --test wal_crash
 
       - name: cargo doc
         run: cargo doc --workspace --no-deps
 
+      # ── 发布产物与基准冒烟（§34.5 部署 / §34.7 关账验收）──
+      # 与测试同 job 复用一次 release 构建：产物打包与 bench-smoke 共享，
+      # 避免独立 job 的重复冷构建。
+
+      - name: cargo build --release（发布产物）
+        run: cargo build --release -p collector -p driver-modbus -p bench
+
+      - name: 打包部署产物（§19/§20 布局）
+        run: ./scripts/package.sh
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: forgelink-linux-x86_64
+          path: dist/forgelink-*-linux-x86_64/
+
+      # 基准工具端到端测试（debug 缩配全链路，防退化锚点）。
+      - name: bench e2e 测试
+        run: cargo test -p bench --test e2e
+
+      # 冒烟基准：release 二进制跑真实编排（smoke 模式下性能项 SKIP，
+      # 只验证 workload→采集→WAL→MQTT→记账→报告链路与 0 丢失底线）；
+      # exit code 参与 gating。
+      - name: bench smoke（90s 冒烟场景）
+        run: >
+          ./target/release/forgelink-bench smoke
+          --collector-bin target/release/collector
+          --duration-secs 90
+          --output-dir bench-report
+          --work-dir "$RUNNER_TEMP/forgelink-bench-smoke"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        continue-on-error: true
+        with:
+          name: bench-smoke-report
+          path: bench-report/
+
   # 目标平台含 Windows x64（§34.5 三平台验收）：至少在 CI 强制一个 Windows
   # job 抓平台差异——路径分隔符、句柄释放时序（local-buffer 已踩过）、信号
-  # 语义等。覆盖与 Ubuntu 相同的测试面（--all-features 含 feature 门控测试）。
+  # 语义等。覆盖与 Ubuntu 相同的测试面（--all-features 含 feature 门控测试）；
+  # 另产出 Windows x64 部署包（性能数值验收不在本平台，见 §34.2）。
   ci-windows:
-    name: check / test (windows)
+    name: check / test / package (windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -68,3 +107,15 @@ jobs:
 
       - name: cargo test (--workspace --all-features)
         run: cargo test --workspace --all-features
+
+      - name: cargo build --release（发布产物）
+        run: cargo build --release -p collector -p driver-modbus
+
+      - name: 打包部署产物（§19/§20 布局）
+        run: ./scripts/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: forgelink-windows-x86_64
+          path: dist/forgelink-*-windows-x86_64/

@@ -61,6 +61,13 @@ pub struct MockBehavior {
     pub response_delay: Option<Duration>,
     /// 是否在响应前立即断开连接（模拟断线）。
     pub drop_connection: bool,
+    /// 概率超时注入 `(分子, 分母)`：请求按该比例命中"静默不响应"路径
+    /// ——不回包也不关连接（客户端按自身超时判定设备无响应，随后可在
+    /// 同一连接上继续后续请求），模拟设备偶发无响应。`(1, 100)` = 1%；
+    /// 分子为 0 等价未启用；分母必须非 0。命中与否由连接内 xorshift-32
+    /// 伪随机判定（固定种子派生自从站号，同一请求序列跨次运行可复现，
+    /// 不引入外部 rand 依赖）。命中时该请求不计入写捕获。
+    pub timeout_rate: Option<(u32, u32)>,
     /// 声明错误的字节计数：Byte Count 与实际数据长度不符（模拟坏实现）。
     pub declare_wrong_byte_count: bool,
     /// 畸形异常响应模式（配合 `exception_at` 使用）。
@@ -78,6 +85,7 @@ impl MockBehavior {
             exception_at: HashMap::new(),
             response_delay: None,
             drop_connection: false,
+            timeout_rate: None,
             declare_wrong_byte_count: false,
             malformed_exception: None,
             request_count: Arc::new(AtomicU32::new(0)),
@@ -116,6 +124,32 @@ impl MockBehavior {
     pub fn with_response_delay(mut self, delay: Duration) -> Self {
         self.response_delay = Some(delay);
         self
+    }
+
+    /// 便捷：设置概率超时注入（见 [`MockBehavior::timeout_rate`]）。
+    pub fn with_timeout_rate(mut self, numerator: u32, denominator: u32) -> Self {
+        self.timeout_rate = Some((numerator, denominator));
+        self
+    }
+}
+
+/// 连接内 xorshift-32 伪随机（非零状态）：概率超时注入的确定性序列源。
+struct XorShift32(u32);
+
+impl XorShift32 {
+    /// 从从站号派生固定非零种子：同一连接上的请求序列跨次运行可复现。
+    fn new(unit: u8) -> Self {
+        let seed = (u32::from(unit) ^ 0x9E37_79B9) | 1;
+        Self(seed)
+    }
+
+    fn next(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.0 = x;
+        x
     }
 }
 
@@ -267,6 +301,8 @@ fn handle_connection(
     // 必须恢复阻塞模式才能用 read_exact 等待完整帧。
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // 概率超时注入的确定性随机序列（种子派生自首个请求的从站号）。
+    let mut rng: Option<XorShift32> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
             return;
@@ -295,6 +331,19 @@ fn handle_connection(
 
         let mut guard = behavior.lock().expect("行为锁");
         guard.request_count.fetch_add(1, Ordering::Relaxed);
+
+        // 概率超时注入：命中即静默跳过响应且不关连接——客户端按自身
+        // 超时判定设备无响应，随后可在同一连接上继续后续请求。随机源
+        // 在连接内惰性初始化（种子派生自从站号，序列可复现）。
+        if let Some((num, den)) = guard.timeout_rate
+            && num > 0
+            && den > 0
+        {
+            let roll = rng.get_or_insert_with(|| XorShift32::new(unit)).next();
+            if roll % den < num {
+                continue;
+            }
+        }
 
         // 断线模拟：直接关闭。
         if guard.drop_connection {
@@ -510,10 +559,20 @@ fn handle_connection(
 
 /// 便捷：配置 host/port 的连接 JSON（Modbus Driver `mode=tcp`）。
 pub fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
+    tcp_config_at(
+        &server.addr.ip().to_string(),
+        server.addr.port(),
+        timeout_ms,
+    )
+}
+
+/// 便捷：按显式地址配置连接 JSON（[`tcp_config`] 的直传变体，供无法
+/// 持有 [`MockServer`] 句柄的调用方使用——如 bench 的 workload 生成）。
+pub fn tcp_config_at(host: &str, port: u16, timeout_ms: u64) -> String {
     serde_json::json!({
         "mode": "tcp",
-        "host": server.addr.ip().to_string(),
-        "port": server.addr.port(),
+        "host": host,
+        "port": port,
         "timeout_ms": timeout_ms,
         "reconnect": true,
         "reconnect_max_attempts": 2,
@@ -715,5 +774,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// 发送一帧 FC03 读请求（不等待响应）。
+    fn send_read(stream: &mut TcpStream, txn: u16, unit: u8) {
+        let frame = [
+            (txn >> 8) as u8,
+            txn as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x06,
+            unit,
+            0x03,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        stream.write_all(&frame).expect("发送请求失败");
+    }
+
+    /// `(1, 1)` 全命中：请求一律静默且**不关连接**——错误类别必须是读
+    /// 超时而非 EOF，后续请求在同一连接上继续被（同样）静默处理。
+    #[test]
+    fn timeout_rate_full_hit_stays_silent_and_connected() {
+        let server = MockServer::start(MockBehavior::new().with_timeout_rate(1, 1));
+        let mut stream = TcpStream::connect(server.addr).expect("连接 mock 失败");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("设置读超时失败");
+
+        for txn in 1..=2u16 {
+            send_read(&mut stream, txn, 7);
+            let mut header = [0u8; 7];
+            let err = stream.read_exact(&mut header).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ),
+                "第 {txn} 个请求应为读超时（静默）而非断连: {err:?}"
+            );
+        }
+        assert_eq!(server.request_count(), 2, "请求计数不受静默影响");
+    }
+
+    /// `(1, 2)` 部分命中：命中与否的序列由连接内 xorshift-32 决定。本
+    /// 测试以本地同构实现复算期望序列并逐请求比对——固化"同一从站号
+    /// 同一请求序列跨次运行可复现"的契约，防止算法被无意改动。
+    #[test]
+    fn timeout_rate_partial_hits_are_reproducible() {
+        let server = MockServer::start(MockBehavior::new().with_timeout_rate(1, 2));
+        let unit = 9u8;
+        let mut stream = TcpStream::connect(server.addr).expect("连接 mock 失败");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("设置读超时失败");
+
+        // 本地复算期望命中序列（与 XorShift32::new(unit) 同种子同迭代）。
+        let mut x = (u32::from(unit) ^ 0x9E37_79B9) | 1;
+        let mut hits = Vec::new();
+        for _ in 0..8 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            // 判定谓词与实现一致：roll % den < num，此处 (1, 2) 即偶数命中。
+            hits.push(x % 2 == 0);
+        }
+
+        for (i, txn) in (1..=8u16).enumerate() {
+            send_read(&mut stream, txn, unit);
+            let mut header = [0u8; 7];
+            let result = stream.read_exact(&mut header);
+            if hits[i] {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ),
+                    "请求 {} 应命中静默: {err:?}",
+                    i + 1
+                );
+            } else {
+                result.expect("未命中的请求应立即得到响应");
+                let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+                let mut rest = vec![0u8; length - 1];
+                stream.read_exact(&mut rest).expect("读响应体失败");
+                assert_eq!(rest[0], 0x03, "应为 FC03 正常响应");
+            }
+        }
     }
 }
