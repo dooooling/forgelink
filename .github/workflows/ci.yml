@@ -56,6 +56,7 @@ jobs:
         run: ./scripts/package.sh
 
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: forgelink-linux-x86_64
           path: dist/forgelink-*-linux-x86_64/
@@ -77,6 +78,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         if: always()
+        continue-on-error: true
         with:
           name: bench-smoke-report
           path: bench-report/
@@ -113,6 +115,7 @@ jobs:
         run: ./scripts/package.ps1
 
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: forgelink-windows-x86_64
           path: dist/forgelink-*-windows-x86_64/
