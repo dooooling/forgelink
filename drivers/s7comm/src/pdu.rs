@@ -174,15 +174,22 @@ pub fn build_setup(pdu_ref: u16, proposed_pdu: u16) -> Vec<u8> {
 /// 功能码不符或参数区截断返回 `unexpected_function_code` /
 /// `invalid_response`。
 pub fn parse_setup_ack(param: &[u8]) -> Result<u16, S7Error> {
-    // 应答参数区最小 4 字节（[F0][00][negotiated u16]）；部分固件附
-    // 加字段（如 max AMQ）使参数区更长，negotiated 位置不变。
-    if param.len() < 4 || param[0] != FUNCTION_SETUP {
-        return Err(S7Error::unexpected_function_code(
-            FUNCTION_SETUP,
-            param.first().copied().unwrap_or(0),
-        ));
+    // 真实 PLC 应答参数区布局（Wireshark packet-s7comm.c
+    // s7comm_decode_pdu_setup_communication，见 docs/s7comm-protocol-reference.md）：
+    // [F0][reserved][max-AMQ-calling u16][max-AMQ-called u16][PDU length u16]
+    // ——共 8 字节，PDU 长度位于 [6..8]。部分精简固件只回 4 字节
+    // [F0][00][PDU u16]（无 AMQ 字段），此时 PDU 位于 [2..4]。
+    // 两种布局以参数区长度区分。
+    if param.len() >= 8 && param[0] == FUNCTION_SETUP {
+        return Ok(u16::from_be_bytes([param[6], param[7]]));
     }
-    Ok(u16::from_be_bytes([param[2], param[3]]))
+    if param.len() >= 4 && param[0] == FUNCTION_SETUP {
+        return Ok(u16::from_be_bytes([param[2], param[3]]));
+    }
+    Err(S7Error::unexpected_function_code(
+        FUNCTION_SETUP,
+        param.first().copied().unwrap_or(0),
+    ))
 }
 
 /// 构造 Read Var 请求。
@@ -311,12 +318,13 @@ pub fn parse_read_response<'a>(
         let return_code = data[cursor];
         let transport_size = data[cursor + 1];
         let declared = u16::from_be_bytes([data[cursor + 2], data[cursor + 3]]);
-        // length 单位随 transport size 变化（BIT=位、BYTE=字节、
-        // WORD=字、DWORD=双字），载荷字节数按单位换算。
+        // length 单位随 transport size 变化（Wireshark packet-s7comm.c
+        // s7comm_decode_response_read_data 权威：BIT 与 WORD/INT 类按
+        // 位计（向上取整到字节），BYTE/DWORD/DINT/REAL 等按字节计）。
+        // 真机实测佐证：读 DBW 应答 ts=0x04 length=0x0010（16 位=2 字节）。
         let payload_len = match transport_size {
             TS_BIT => usize::from(declared).div_ceil(8),
-            TS_WORD => usize::from(declared) * 2,
-            TS_DWORD => usize::from(declared) * 4,
+            TS_WORD | 0x05 /* INT */ => usize::from(declared).div_ceil(8),
             _ => usize::from(declared),
         };
         cursor += 4;
@@ -345,7 +353,11 @@ pub fn parse_read_response<'a>(
 }
 
 fn check_read_header(param: &[u8], expected_items: usize) -> Result<(), S7Error> {
-    if param.len() < 4 || param[0] != FUNCTION_READ {
+    // 真实应答参数区只有 2 字节：[0x04][item count]（Wireshark
+    // packet-s7comm.c ACK_DATA 分支——item count 紧跟功能码，无
+    // reserved 字节）。原 `< 4` 条件是真机调试发现的缺陷：会把合法
+    // 2 字节参数区误判为功能码错位（报错打印的首字节恰为 0x04）。
+    if param.len() < 2 || param[0] != FUNCTION_READ {
         return Err(S7Error::unexpected_function_code(
             FUNCTION_READ,
             param.first().copied().unwrap_or(0),
@@ -457,7 +469,8 @@ mod tests {
         assert_eq!(u16::from_be_bytes([req[8], req[9]]), 0, "Setup 无数据区");
         assert_eq!(&req[10..], &[FUNCTION_SETUP, 0x00, 0x01, 0xF4, 0x01, 0xF4]);
 
-        // 应答：模拟 PLC 提供 480（应答参数区 4B：F0 00 01 E0）。
+        // 应答：真实布局 8 字节参数区（Wireshark 权威）：
+        // [F0][00][AMQ-calling][AMQ-called][PDU u16=480]。
         let ack = vec![
             PROTOCOL_ID,
             ROSCTR_ACK_DATA,
@@ -465,6 +478,33 @@ mod tests {
             0x00,
             0x00,
             0x01,
+            0x00,
+            0x08,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            FUNCTION_SETUP,
+            0x00,
+            0x00,
+            0x0A, // AMQ calling = 10
+            0x00,
+            0x05, // AMQ called = 5
+            0x01,
+            0xE0, // PDU length = 480
+        ];
+        let ack_parts = parse_ack(&ack).unwrap();
+        assert_eq!(ack_parts.pdu_ref, 1);
+        assert_eq!(parse_setup_ack(ack_parts.param).unwrap(), 480);
+
+        // 精简固件短布局：4 字节参数区 [F0][00][PDU u16]。
+        let short = vec![
+            PROTOCOL_ID,
+            ROSCTR_ACK_DATA,
+            0x00,
+            0x00,
+            0x00,
+            0x02,
             0x00,
             0x04,
             0x00,
@@ -476,17 +516,18 @@ mod tests {
             0x01,
             0xE0,
         ];
-        let ack_parts = parse_ack(&ack).unwrap();
-        assert_eq!(ack_parts.pdu_ref, 1);
-        assert_eq!(parse_setup_ack(ack_parts.param).unwrap(), 480);
+        let parts = parse_ack(&short).unwrap();
+        assert_eq!(parse_setup_ack(parts.param).unwrap(), 480);
     }
 
     #[test]
     fn read_response_parses_items_and_requires_exact_closure() {
-        // 手工构造完整 Ack_Data 帧：头 12B + 参数区 4B + 数据区。
-        let mut pdu = vec![PROTOCOL_ID, ROSCTR_ACK_DATA, 0, 0, 0, 7, 0, 4, 0, 12, 0, 0];
-        pdu.extend_from_slice(&[FUNCTION_READ, 2, 0x00, 0x00]);
-        pdu.extend_from_slice(&[RC_SUCCESS, TS_WORD, 0x00, 0x01, 0x12, 0x34]);
+        // 手工构造完整 Ack_Data 帧：头 12B + 参数区 2B（真实布局
+        // [0x04][item count]）+ 数据区。WORD 的 length 域按位计
+        // （真机实测：读 DBW 应答 ts=0x04 length=0x0010=16 位=2 字节）。
+        let mut pdu = vec![PROTOCOL_ID, ROSCTR_ACK_DATA, 0, 0, 0, 7, 0, 2, 0, 12, 0, 0];
+        pdu.extend_from_slice(&[FUNCTION_READ, 2]);
+        pdu.extend_from_slice(&[RC_SUCCESS, TS_WORD, 0x00, 0x10, 0x12, 0x34]);
         pdu.extend_from_slice(&[RC_SUCCESS, TS_BYTE, 0x00, 0x01, 0x56, 0x00]);
         let parts = parse_ack(&pdu).unwrap();
         let items = parse_read_response(parts.param, parts.data, 2).unwrap();

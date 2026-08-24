@@ -550,7 +550,16 @@ fn handle_s7(behavior: &Arc<Mutex<MockBehavior>>, pdu: &[u8]) -> Option<Vec<u8>>
                 let payload = read_image(&guard.values, &item);
                 data.push(rc);
                 data.push(item.transport_size);
-                data.extend_from_slice(&(item.length as u16).to_be_bytes());
+                // length 域单位随 transport size（Wireshark 权威语义，
+                // 真机实测佐证）：BIT 与 WORD/INT 类按位计（位数量），
+                // 其余按字节计。BIT 的位数 = 点数；WORD/INT 的位数 =
+                // 载荷字节数 × 8。
+                let declared: u32 = match item.transport_size {
+                    TS_BIT => item.length,
+                    TS_WORD | 0x05 /* INT */ => u32::from(payload.len() as u16) * 8,
+                    _ => payload.len() as u32,
+                };
+                data.extend_from_slice(&(declared as u16).to_be_bytes());
                 data.extend_from_slice(&payload);
                 if payload.len() % 2 == 1 {
                     data.push(0x00); // 偶对齐填充
@@ -986,8 +995,9 @@ mod tests {
         let data_len = u16::from_be_bytes([resp[8], resp[9]]) as usize;
         let data_start = 12 + u16::from_be_bytes([resp[6], resp[7]]) as usize;
         let data = &resp[data_start..data_start + data_len];
-        // 项 1（DBW20）：FF 04 0001 1234（头 4B + 载荷 2B，无 pad）。
-        assert_eq!(&data[0..6], &[RC_SUCCESS, TS_WORD, 0x00, 0x01, 0x12, 0x34]);
+        // 项 1（DBW20）：FF 04 0010 1234（头 4B + 载荷 2B，无 pad）。
+        // WORD 的 length 域按位计：2 字节 = 0x0010。
+        assert_eq!(&data[0..6], &[RC_SUCCESS, TS_WORD, 0x00, 0x10, 0x12, 0x34]);
         // 项 2（位）：FF 01 0001 + 载荷 01 + pad 00（奇数载荷补偶对齐）。
         assert_eq!(&data[6..10], &[RC_SUCCESS, TS_BIT, 0x00, 0x01]);
         assert_eq!(data[10], 0x01);
