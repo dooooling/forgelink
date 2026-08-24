@@ -9,6 +9,7 @@
 //! - `session` / `batch` / `encode` / `decode` 与 ABI 面：提交 3–6 交付
 
 pub mod address;
+pub mod batch;
 pub mod config;
 pub mod decode;
 pub mod encode;

@@ -26,7 +26,7 @@
 use crate::error::McError;
 
 /// 软元件种类与访问单位。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceKind {
     /// 输入继电器 X（位，只读；编号协议层按 HEX 编码——本驱动入口恒十进制）。
     X,
