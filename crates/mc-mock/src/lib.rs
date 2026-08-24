@@ -366,7 +366,10 @@ fn handle_command(behavior: &Arc<Mutex<McBehavior>>, body: &[u8]) -> Option<Vec<
 
     let mut guard = behavior.lock().expect("行为锁");
     if let Some(forced) = guard.force_end_code {
-        return Some(vec![forced.to_le_bytes()[0], forced.to_le_bytes()[1]]);
+        // 强制结束代码：应答体仅含结束代码、无读数据（长度自洽校验
+        // 按错误应答语义计算——写/错均为 2 字节）。
+        let ec = forced.to_le_bytes();
+        return Some(vec![ec[0], ec[1]]);
     }
     match command {
         CMD_READ_WORD | CMD_READ_BIT => {
@@ -457,6 +460,10 @@ fn handle_command(behavior: &Arc<Mutex<McBehavior>>, body: &[u8]) -> Option<Vec<
 }
 
 /// 组装并发送一帧 3E 应答。
+///
+/// `wrong_data_length` 注入模拟真机行为：声明数据长 +2 且实际多发送
+/// 2 字节填充（仅改声明不改实发会让客户端按声明读体时错位/阻塞，
+/// 与真实失步场景不符）。
 fn send_response(
     stream: &mut TcpStream,
     routing: &[u8; 5],
@@ -472,19 +479,21 @@ fn send_response(
         SUBHEADER_RESPONSE
     };
     let declared = reply_body.len() as u16 + if wrong_data_length { 2 } else { 0 };
-    let mut frame = Vec::with_capacity(9 + reply_body.len());
+    let mut frame = Vec::with_capacity(9 + reply_body.len() + usize::from(wrong_data_length) * 2);
     frame.extend_from_slice(&sub.to_le_bytes());
-    for (i, b) in routing.iter().enumerate() {
+    for b in routing.iter() {
         let v = if wrong_routing_echo {
             b.wrapping_add(1)
         } else {
             *b
         };
         frame.push(v);
-        let _ = i;
     }
     frame.extend_from_slice(&declared.to_le_bytes());
     frame.extend_from_slice(reply_body);
+    if wrong_data_length {
+        frame.extend_from_slice(&[0, 0]); // 填充字节与声明一致
+    }
     let _ = stream.write_all(&frame);
 }
 

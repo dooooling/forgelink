@@ -2,8 +2,9 @@
 //!
 //! # 编码规则（写入侧，权威）
 //!
-//! 与读取侧同表：expected_type（来自 Profile value_type）决定点数；
-//! Loader 通路恒发宽 Tag——按值最小无损收窄定点数：
+//! **写入没有 expected_type**（ABI `DriverWriteItem` 无此字段，Profile
+//! 的 value_type 在写路径不可达）——点数由 **ABI Tag + 值本身的最小
+//! 无损宽度**决定（镜像 modbus「宽度来自 ABI Tag」约定）：
 //!
 //! | 值 | 点数 | 规则 |
 //! |---|---|---|
@@ -13,8 +14,15 @@
 //! | F64 可无损缩窄 f32 | 2 | f32 位型 LE |
 //! | F64 其余（含 NaN/Inf） | 4 | f64 位型 LE |
 //!
-//! 位软元件仅接受 Bool → 1 字节 0/1。越界不存在（宽 Tag 值域全覆盖），
-//! 类型不兼容一律 invalid_type。全小端。
+//! 位软元件仅接受 Bool → 1 字节 0/1。
+//!
+//! # 读写点数不对称声明
+//!
+//! 读取点数由 expected_type 决定、写入点数由值决定——二者可不同
+//! （如 Profile value_type=i32 的点位写 -5 时只写 1 点）。MC 字软元件
+//! 按「点」独立编址无隐式高字，写短读长时高字保持原值——这是 MC 按
+//! 16 位字独立访问的协议语义而非缺陷；需要整 32 位原子更新的现场应
+//! 在 Profile 层拆分或保证先全量初始化。
 
 use observation_model::{DataType, RawValue};
 
@@ -31,9 +39,6 @@ pub struct EncodedWrite {
 }
 
 /// 编码一个写值。
-///
-/// `expected` 保留为 ABI 层签名一致性占位（MC 写宽度由值本身决定最小
-/// 无损点数，与读取侧 expected_type 定宽度的方向相反）。
 ///
 /// # Errors
 ///
@@ -57,24 +62,36 @@ pub fn encode_write(
         RawValue::Array(_) => "Array",
         RawValue::Struct(_) => "Struct",
     };
-    // 字软元件：以值本身决定最小无损宽度（宽 Tag 收窄）。
-    match (kind, value) {
-        (DeviceKind::D, RawValue::I64(v)) => narrow_signed_i(*v),
-        (DeviceKind::D, RawValue::U64(v)) => narrow_unsigned_u(*v),
-        (DeviceKind::D, RawValue::F64(v)) => Ok(narrow_float(*v)),
-        // W/R/ZR/SD 走同一数值编码路径。
-        (_, RawValue::I64(v)) if matches!(kind, DeviceKind::W | DeviceKind::R | DeviceKind::Zr) => {
+    // 字软元件：以值本身决定最小无损宽度（宽 Tag 收窄）；全部数值
+    // 软元件（D/W/R/ZR/SD）同一编码路径。
+    match value {
+        RawValue::I64(v)
+            if matches!(
+                kind,
+                DeviceKind::D | DeviceKind::W | DeviceKind::R | DeviceKind::Zr
+            ) =>
+        {
             narrow_signed_i(*v)
         }
-        (_, RawValue::U64(v)) if matches!(kind, DeviceKind::W | DeviceKind::R | DeviceKind::Zr) => {
+        RawValue::U64(v)
+            if matches!(
+                kind,
+                DeviceKind::D | DeviceKind::W | DeviceKind::R | DeviceKind::Zr
+            ) =>
+        {
             narrow_unsigned_u(*v)
         }
-        (_, RawValue::F64(v)) if matches!(kind, DeviceKind::W | DeviceKind::R | DeviceKind::Zr) => {
+        RawValue::F64(v)
+            if matches!(
+                kind,
+                DeviceKind::D | DeviceKind::W | DeviceKind::R | DeviceKind::Zr
+            ) =>
+        {
             Ok(narrow_float(*v))
         }
-        (_, v) => Err(McError::invalid_type(format!(
+        other => Err(McError::invalid_type(format!(
             "字软元件 {kind:?} 不接受值类型 {}（映射表见模块文档）",
-            type_name(v)
+            type_name(other)
         ))),
     }
 }
@@ -103,9 +120,8 @@ fn encode_bit(value: &RawValue) -> Result<EncodedWrite, McError> {
 }
 
 /// 有符号整数按最小无损宽度收窄。
-#[allow(clippy::cast_possible_truncation)]
 fn narrow_signed_i(v: i64) -> Result<EncodedWrite, McError> {
-    let (points, bytes): (u16, Vec<u8>) = if i32::try_from(v).is_ok() && i16::try_from(v).is_ok() {
+    let (points, bytes): (u16, Vec<u8>) = if i16::try_from(v).is_ok() {
         (1, v.to_le_bytes()[..2].to_vec())
     } else if i32::try_from(v).is_ok() {
         (2, v.to_le_bytes()[..4].to_vec())
@@ -134,7 +150,6 @@ fn narrow_unsigned_u(v: u64) -> Result<EncodedWrite, McError> {
 }
 
 /// 浮点按可否无损缩窄决定 2 点（f32）或 4 点（f64）；NaN/Inf 恒 4 点。
-#[allow(clippy::cast_possible_truncation)]
 fn narrow_float(v: f64) -> EncodedWrite {
     let narrowed = v as f32;
     if !narrowed.is_nan() && f64::from(narrowed) == v {
@@ -176,12 +191,12 @@ mod tests {
                 data: vec![0x88, 0x13]
             }
         );
-        // -2 → 1 点补码。
+        // -1234 → 1 点补码（i16 域内）。
         assert_eq!(
-            encode_write(DeviceKind::D, None, &RawValue::I64(-2)).unwrap(),
+            encode_write(DeviceKind::D, None, &RawValue::I64(-1234)).unwrap(),
             EncodedWrite {
                 points: 1,
-                data: vec![0xFE, 0xFF]
+                data: vec![0x2E, 0xFB]
             }
         );
         // 70000 超 u16 → 2 点。
@@ -202,7 +217,7 @@ mod tests {
     fn floats_narrow_losslessly_or_stay_wide() {
         // 1.5 可无损缩窄 → 2 点 f32。
         assert_eq!(
-            encode_write(DeviceKind::D, None, &RawValue::F64(1.5)).unwrap(),
+            encode_write(DeviceKind::Zr, None, &RawValue::F64(1.5)).unwrap(),
             EncodedWrite {
                 points: 2,
                 data: vec![0, 0, 0xC0, 0x3F]
@@ -210,14 +225,14 @@ mod tests {
         );
         // 0.1 不可缩窄 → 4 点 f64。
         assert_eq!(
-            encode_write(DeviceKind::D, None, &RawValue::F64(0.1))
+            encode_write(DeviceKind::Zr, None, &RawValue::F64(0.1))
                 .unwrap()
                 .points,
             4
         );
         // NaN 恒 4 点。
         assert_eq!(
-            encode_write(DeviceKind::D, None, &RawValue::F64(f64::NAN))
+            encode_write(DeviceKind::Zr, None, &RawValue::F64(f64::NAN))
                 .unwrap()
                 .points,
             4

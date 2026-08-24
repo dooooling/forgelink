@@ -125,6 +125,10 @@ impl TcpSession {
     /// 发送一帧完整请求并读取一帧完整应答（原始字节；三层自洽校验的
     /// 前两层在 mc 层、第三层长度校验在此完成）。
     ///
+    /// 第三层校验语义：成功读应答必须与推算长度**精确一致**（防错位）；
+    /// 错误应答（结束代码非 0）合法地只有 2 字节体——放行由调用方按
+    /// 结束代码处理。写请求应答恒 2 字节。
+    ///
     /// 所有错误路径先置断开态（实现纪律，见模块文档论证）。
     ///
     /// # Errors
@@ -149,7 +153,9 @@ impl TcpSession {
         let frame = self.read_frame()?;
         // 副头 + 路由区回声两层校验；第三层长度自洽在此完成。
         let (head, _body) = mc::parse_response_head(&frame, &self.routing)?;
-        if head.declared_len != expected_resp_len {
+        // 错误应答（结束代码非 0）合法短帧：仅 2 字节结束代码、无数据。
+        let is_error_reply = head.end_code != 0 && head.declared_len == 2;
+        if head.declared_len != expected_resp_len && !is_error_reply {
             self.disconnect();
             return Err(McError::invalid_response(format!(
                 "应答数据长与期望不符：声明 {}，按请求推算 {expected_resp_len}",
