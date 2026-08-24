@@ -2459,6 +2459,12 @@ driver-ether-ip       EtherNet/IP (CIP) Driver V0.3 第一交付（读+写）：
                       nonce 回显校验）+ CIP Read/Write Tag 全经 Multi-Service
                       打包；符号标签寻址（大小写敏感）；写侧懒式类型发现缓存；
                       分块受静态双上限约束；宽度由设备应答类型码承载
+driver-mitsubishi-mc  三菱 MC Driver V0.3 第二交付（读+写）：MC 3E 二进制帧 over
+                      TCP 6006（无握手步）；软元件寻址 D/M/X/Y/W/R/ZR 等
+                      （编号一律十进制解析，HEX 陷阱挡在驱动内）；同软元件
+                      跳洞合并、写侧精确相邻、单次点数上限分块；结束代码
+                      整计划粒度（协议级会话保留）；读取点数由 expected_type
+                      决定、写入按值最小无损宽度收窄
 driver-modbus         Modbus TCP/RTU Driver：读取 MVP；写功能 FC05/06/15/16（帧编解码、
                       响应回显校验、精确相邻批量合并、多寄存器字序镜像读侧）
 control-engine        Control Engine 基础（§81-§90：统一入口、幂等键去重、每设备有界队列、

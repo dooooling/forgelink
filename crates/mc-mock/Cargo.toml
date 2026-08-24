@@ -1,0 +1,13 @@
+[package]
+name = "mc-mock"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# 同步 Mock 三菱 MC PLC Server（测试共用，非生产代码）：
+# MC 3E 帧批量读/写应答、内存软元件表（未写地址读出恒 0）与行为开关
+# （延迟/断连/概率超时/结束代码注入/失步注入）及捕获统计。仅用于测试。
+
+[dependencies]
+serde_json = "1"

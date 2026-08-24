@@ -1,0 +1,66 @@
+{
+  "id": "mitsubishi-q-demo",
+  "vendor": "Mitsubishi",
+  "family": "MELSEC",
+  "models": ["Q", "iQ-R", "FX5U"],
+  "domain": "plc",
+  "driver_id": "mitsubishi-mc",
+  "properties": [
+    {
+      "path": "plc.motor.running",
+      "driver_address": "M100",
+      "raw_type": "bool",
+      "value_type": "bool",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "exact",
+      "readable": true,
+      "writable": true,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.line.count",
+      "driver_address": "D500",
+      "raw_type": "u16",
+      "value_type": "i64",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.process.value",
+      "driver_address": "ZR100",
+      "raw_type": "f32",
+      "value_type": "f64",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": true,
+      "default_interval_ms": 1000,
+      "min": null,
+      "max": null
+    }
+  ],
+  "commands": [],
+  "capabilities": {
+    "supported_properties": [
+      "plc.motor.running",
+      "plc.line.count",
+      "plc.process.value"
+    ],
+    "supported_commands": [],
+    "acquisition": {},
+    "limits": {}
+  }
+}
