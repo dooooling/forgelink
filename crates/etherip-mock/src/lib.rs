@@ -398,6 +398,10 @@ fn handle_connection(
                     state.rng = XorShift32::new(*session);
                     (0, *session)
                 };
+                // 应答体：[version=1 u16][option=0 u16][session handle u32]
+                //（与驱动 parse_register_session_reply 契约一致）。
+                let mut body = vec![0x01, 0x00, 0x00, 0x00];
+                body.extend_from_slice(&session_out.to_le_bytes());
                 send_enip(
                     &mut stream,
                     &behavior,
@@ -405,7 +409,7 @@ fn handle_connection(
                     session_out,
                     status,
                     echo_ctx(&behavior, context),
-                    &[0x01, 0x00, 0x00, 0x00],
+                    &body,
                 );
             }
             CMD_UNREGISTER_SESSION => {
@@ -765,6 +769,29 @@ fn handle_multi(behavior: &Arc<Mutex<MockBehavior>>, data: &[u8]) -> Option<Vec<
     let mut out = vec![SVC_MULTI | 0x80, 0x00, STATUS_SUCCESS, 0x00];
     out.extend_from_slice(&body);
     Some(out)
+}
+
+/// 配置 host/port 的连接 JSON（driver-ether-ip `mode=tcp`）。
+pub fn tcp_config_at(host: &str, port: u16, timeout_ms: u64) -> String {
+    serde_json::json!({
+        "mode": "tcp",
+        "host": host,
+        "port": port,
+        "timeout_ms": timeout_ms,
+        "reconnect": true,
+        "reconnect_max_attempts": 2,
+        "reconnect_delay_ms": 50,
+    })
+    .to_string()
+}
+
+/// 便捷：从运行中的服务器取地址配置连接 JSON。
+pub fn tcp_config(server: &MockServer, timeout_ms: u64) -> String {
+    tcp_config_at(
+        &server.addr.ip().to_string(),
+        server.addr.port(),
+        timeout_ms,
+    )
 }
 
 #[cfg(test)]

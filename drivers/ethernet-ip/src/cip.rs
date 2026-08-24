@@ -176,6 +176,7 @@ pub fn build_multi(sub_requests: &[Vec<u8>]) -> Vec<u8> {
     let count = sub_requests.len();
     // 数据区 = count(2) + 偏移表(count×2) + 各子请求。
     let mut data = vec![0u8; 2 + count * 2];
+    data[0..2].copy_from_slice(&(count as u16).to_le_bytes());
     let mut running = (2 + count * 2) as u16;
     for (i, sub) in sub_requests.iter().enumerate() {
         let at = 2 + i * 2;

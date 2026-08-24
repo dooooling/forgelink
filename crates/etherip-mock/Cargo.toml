@@ -9,3 +9,6 @@ license.workspace = true
 # 封装层 RegisterSession/SendRRData、CIP Message Router 的 Read/Write Tag
 # 与 Multi-Service 解包、内存标签表与行为开关（延迟/断连/概率超时/
 # 拒绝注入/失步注入）及捕获统计。仅用于测试。
+
+[dependencies]
+serde_json = "1"
