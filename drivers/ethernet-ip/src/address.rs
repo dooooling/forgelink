@@ -80,11 +80,17 @@ pub fn parse(input: &str) -> Result<TagPath, AddressError> {
     let mut index = String::new();
     let mut in_bracket = false;
     let mut indices_in_dim = 0usize;
+    // 刚闭合过下标（`a[0]` 的 `.` 不应再要求新段名非空——`a[0].b` 中
+    // `.` 分隔的是下标与下一段）。
+    let mut after_index = false;
 
     macro_rules! close_segment {
         () => {
-            finish_seg(&seg)?;
+            if !after_index {
+                finish_seg(&seg)?;
+            }
             seg.clear();
+            after_index = false;
         };
     }
 
@@ -94,6 +100,13 @@ pub fn parse(input: &str) -> Result<TagPath, AddressError> {
                 close_segment!();
             }
             '[' if !in_bracket => {
+                // 连续下标（`a[1][2]`）非法：CIP 多维下标是 `[i,j]` 单括号
+                // 形式，且刚闭合过下标再开新括号说明结构错误。
+                if after_index {
+                    return Err(AddressError::InvalidSyntax(format!(
+                        "连续数组下标非法: {raw}"
+                    )));
+                }
                 close_segment!();
                 in_bracket = true;
                 indices_in_dim = 0;
@@ -108,6 +121,7 @@ pub fn parse(input: &str) -> Result<TagPath, AddressError> {
                 parse_index(&index)?;
                 index.clear();
                 in_bracket = false;
+                after_index = true;
             }
             ',' if in_bracket => {
                 parse_index(&index)?;
@@ -124,6 +138,7 @@ pub fn parse(input: &str) -> Result<TagPath, AddressError> {
                     index.push(other);
                 } else {
                     seg.push(other);
+                    after_index = false;
                 }
             }
         }
@@ -131,8 +146,13 @@ pub fn parse(input: &str) -> Result<TagPath, AddressError> {
     if in_bracket {
         return Err(AddressError::InvalidSyntax(format!("未闭合的 '[': {raw}")));
     }
-    // 收尾段：末尾若紧跟下标已在上面的 ']' 分支闭合；裸段在此校验。
-    if !seg.is_empty() || raw.ends_with('.') {
+    // 收尾：末尾是裸段则校验；以下标结尾（seg 空、after_index）已合法。
+    if !seg.is_empty() {
+        finish_seg(&seg)?;
+    } else if raw.ends_with('.') {
+        return Err(AddressError::InvalidSyntax(format!("空段名: {raw}")));
+    } else if !after_index && seg.is_empty() && dims == 0 {
+        // 纯空串已在入口拒绝；此处防御空段结构。
         finish_seg(&seg)?;
     }
     Ok(TagPath {
@@ -224,7 +244,8 @@ mod tests {
     fn total_length_capped() {
         let long_tag = "a".repeat(241);
         assert!(parse(&long_tag).is_err());
-        let ok_tag = format!("{}[1]", "a".repeat(200));
+        // 合法长路径：多段拼接（单段 ≤40）接近总上限。
+        let ok_tag = "a".repeat(30) + "." + &"b".repeat(30) + "[1]";
         assert!(parse(&ok_tag).is_ok());
     }
 }
