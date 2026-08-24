@@ -62,6 +62,29 @@ rest:
 #       max_bytes_per_multi: 500
 #     enabled: true
 
+# ── 三菱 MC 设备示例（V0.3，替换上方 driver/devices 段使用）──
+# driver:
+#   plugin: drivers/mitsubishi-mc/driver_mitsubishi_mc.dll   # Linux: libdriver_mitsubishi_mc.so
+#   manifest:
+#     id: mitsubishi-mc
+#     name: Mitsubishi MC
+#     version: "0.1.0"
+#     abi: { major: 1, minor: 0 }
+# devices:
+#   - id: plc-mc-01
+#     driver: mitsubishi-mc
+#     profile: mitsubishi-q-demo
+#     connection:
+#       mode: tcp
+#       host: 192.168.1.20
+#       port: 6006
+#       timeout_ms: 3000
+#       network_no: 0        # 本机直连为 0；经 CC-Link/Ethernet 中转按现场调整
+#       pc_no: 0
+#       module_io: 1023      # CPU 直连典型 0x03FF；接口模块按实际 I/O 配置
+#       module_station: 0
+#     enabled: true
+
 buffer:
   db_path: ./collector-wal.db
 
