@@ -41,6 +41,27 @@ northbound:
 rest:
   listen: "127.0.0.1:18080"
 
+# ── EtherNet/IP 设备示例（V0.3，替换上方 driver/devices 段使用）──
+# driver:
+#   plugin: drivers/ethernet-ip/driver_ether_ip.dll   # Linux: libdriver_ether_ip.so
+#   manifest:
+#     id: ethernet-ip
+#     name: EtherNet/IP CIP
+#     version: "0.1.0"
+#     abi: { major: 1, minor: 0 }
+# devices:
+#   - id: plc-enip-01
+#     driver: ethernet-ip
+#     profile: ab-logix-demo
+#     connection:
+#       mode: tcp
+#       host: 192.168.1.10
+#       port: 44818
+#       timeout_ms: 3000
+#       max_services_per_multi: 20
+#       max_bytes_per_multi: 500
+#     enabled: true
+
 buffer:
   db_path: ./collector-wal.db
 
