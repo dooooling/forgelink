@@ -63,6 +63,15 @@ pub struct McConfig {
     /// 监视定时器（入帧原样携带；实际超时控制仍由 socket timeout_ms 实现）。
     #[serde(default = "default_monitoring_timer")]
     pub monitoring_timer: u16,
+    /// 单次字访问点数上限（1..=960；Q/iQ-R/FX5U 保守交集）。
+    #[serde(default = "default_max_word_points")]
+    pub max_word_points_per_access: u16,
+    /// 单次位访问点数上限（1..=720；同上保守交集）。
+    #[serde(default = "default_max_bit_points")]
+    pub max_bit_points_per_access: u16,
+    /// 读合并跳洞阈值（点）：缺口不超过该值并入同一游程。
+    #[serde(default = "default_max_merge_gap")]
+    pub max_merge_gap_points: u32,
 }
 
 fn default_mode() -> String {
@@ -97,6 +106,18 @@ fn default_monitoring_timer() -> u16 {
     2_000
 }
 
+fn default_max_word_points() -> u16 {
+    960
+}
+
+fn default_max_bit_points() -> u16 {
+    720
+}
+
+fn default_max_merge_gap() -> u32 {
+    8
+}
+
 /// 缺省重连语义镜像既有驱动。
 impl Default for McConfig {
     fn default() -> Self {
@@ -113,6 +134,9 @@ impl Default for McConfig {
             module_io: default_module_io(),
             module_station: 0,
             monitoring_timer: default_monitoring_timer(),
+            max_word_points_per_access: default_max_word_points(),
+            max_bit_points_per_access: default_max_bit_points(),
+            max_merge_gap_points: default_max_merge_gap(),
         }
     }
 }
@@ -141,6 +165,18 @@ fn validate(config: &McConfig) -> Result<(), McError> {
     }
     if config.timeout_ms == 0 {
         return Err(McError::config_error("timeout_ms 必须 > 0".to_owned()));
+    }
+    if config.max_word_points_per_access == 0 || config.max_word_points_per_access > 960 {
+        return Err(McError::config_error(format!(
+            "max_word_points_per_access {} 越界（1..=960）",
+            config.max_word_points_per_access
+        )));
+    }
+    if config.max_bit_points_per_access == 0 || config.max_bit_points_per_access > 720 {
+        return Err(McError::config_error(format!(
+            "max_bit_points_per_access {} 越界（1..=720）",
+            config.max_bit_points_per_access
+        )));
     }
     Ok(())
 }
