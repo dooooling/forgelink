@@ -2454,6 +2454,11 @@ driver-s7comm         Siemens S7comm Driver V0.2（§34.6 路线图，读+写）
                       允许跳洞合并、位项精确相邻游程；写侧精确相邻合并、
                       空洞/重叠拆分升序覆盖；分块受协商 PDU 预算与项数上限
                       约束；宽度由语法后缀承载、值解释由 expected_type 决定
+driver-ether-ip       EtherNet/IP (CIP) Driver V0.3 第一交付（读+写）：EN/IP
+                      封装层（24B 小端头 + RegisterSession + sender context
+                      nonce 回显校验）+ CIP Read/Write Tag 全经 Multi-Service
+                      打包；符号标签寻址（大小写敏感）；写侧懒式类型发现缓存；
+                      分块受静态双上限约束；宽度由设备应答类型码承载
 driver-modbus         Modbus TCP/RTU Driver：读取 MVP；写功能 FC05/06/15/16（帧编解码、
                       响应回显校验、精确相邻批量合并、多寄存器字序镜像读侧）
 control-engine        Control Engine 基础（§81-§90：统一入口、幂等键去重、每设备有界队列、

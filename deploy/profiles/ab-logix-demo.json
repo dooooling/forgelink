@@ -1,0 +1,66 @@
+{
+  "id": "ab-logix-demo",
+  "vendor": "Allen-Bradley",
+  "family": "Logix",
+  "models": ["ControlLogix", "CompactLogix"],
+  "domain": "plc",
+  "driver_id": "ethernet-ip",
+  "properties": [
+    {
+      "path": "plc.motor.running",
+      "driver_address": "Motor.Run",
+      "raw_type": "bool",
+      "value_type": "bool",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "exact",
+      "readable": true,
+      "writable": true,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.line.speed",
+      "driver_address": "Line1.Speed",
+      "raw_type": "i32",
+      "value_type": "i64",
+      "unit": null,
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 500,
+      "min": null,
+      "max": null
+    },
+    {
+      "path": "plc.temp.pv",
+      "driver_address": "Temp.PV",
+      "raw_type": "f32",
+      "value_type": "f64",
+      "unit": "°C",
+      "scale": 1.0,
+      "offset": 0.0,
+      "write_rounding": "nearest",
+      "readable": true,
+      "writable": false,
+      "default_interval_ms": 1000,
+      "min": null,
+      "max": null
+    }
+  ],
+  "commands": [],
+  "capabilities": {
+    "supported_properties": [
+      "plc.motor.running",
+      "plc.line.speed",
+      "plc.temp.pv"
+    ],
+    "supported_commands": [],
+    "acquisition": {},
+    "limits": {}
+  }
+}

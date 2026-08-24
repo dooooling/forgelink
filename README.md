@@ -16,6 +16,8 @@ ForgeLink 是面向工业设备的 Rust IoT 采集与边缘平台。
 - `drivers/modbus`：Modbus TCP/RTU、地址解析、批量读取、写功能 FC05/06/15/16（响应回显校验、精确相邻批量合并）、超时/断线重连和 Native Plugin C ABI
 - `drivers/s7comm`：Siemens S7comm Driver V0.2（§34.6 路线图，读+写）——ISO-on-TCP（TPKT/COTP）+ Read/Write Var；地址文法 `db10.dbw0` / `db1.dbx0.3` / `mw20` / `m0.1`（I 区只读）；同区跳洞合并（位项精确相邻）、写侧精确相邻不覆盖未请求地址、分块受协商 PDU 预算约束；配套 `crates/s7comm-mock`
 - `s7comm-mock`：测试共用 Mock S7 PLC server（握手/协商/读写应答与失步注入，非生产）
+- `drivers/ethernet-ip`：EtherNet/IP (CIP) Driver V0.3 第一交付（§34.6 路线图，读+写）——EN/IP 封装层（24B 小端头 + RegisterSession）+ CIP Read/Write Tag 全经 Multi-Service 打包；符号标签寻址 `Motor.Starter[2].Speed`（大小写敏感）；写侧懒式类型发现缓存（Logix 类型码精确匹配）；Multi 分块受静态双上限约束；配套 `crates/etherip-mock`
+- `etherip-mock`：测试共用 Mock EtherNet/IP PLC server（封装层/CIP 路由器/Multi 解包与失步注入，非生产）
 - `device-manager`：设备实例注册、Driver/Profile 绑定校验、读取项生成与全链路数据映射；ControlExecutor 适配层（DriverSession 共享会话读写同锁互斥、保守 Indeterminate 映射）
 - `control-engine`：Control Engine 基础（§81-§90）——统一提交/取消/查询入口、幂等键去重、每设备有界队列与优先级、超时/取消 Indeterminate 结算、审计日志与 FileJournal
 - `data-pipeline`：Telemetry Batch 组包、按设备聚合、背压/取消/有界排空

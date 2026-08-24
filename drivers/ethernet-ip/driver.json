@@ -1,0 +1,15 @@
+{
+  "id": "ethernet-ip",
+  "name": "EtherNet/IP CIP",
+  "version": "0.1.0",
+  "entry": "forgelink_driver_entry_v1",
+  "abi": {
+    "major": 1,
+    "minor": 0
+  },
+  "platforms": [
+    "windows-x86_64",
+    "linux-x86_64",
+    "linux-aarch64"
+  ]
+}
