@@ -10,5 +10,7 @@
 
 pub mod address;
 pub mod config;
+pub mod decode;
+pub mod encode;
 pub mod error;
 pub mod mc;
