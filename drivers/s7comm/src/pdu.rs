@@ -318,14 +318,25 @@ pub fn parse_read_response<'a>(
         let return_code = data[cursor];
         let transport_size = data[cursor + 1];
         let declared = u16::from_be_bytes([data[cursor + 2], data[cursor + 3]]);
-        // length 单位随 transport size 变化（Wireshark packet-s7comm.c
-        // s7comm_decode_response_read_data 权威：BIT 与 WORD/INT 类按
-        // 位计（向上取整到字节），BYTE/DWORD/DINT/REAL 等按字节计）。
-        // 真机实测佐证：读 DBW 应答 ts=0x04 length=0x0010（16 位=2 字节）。
-        let payload_len = match transport_size {
-            TS_BIT => usize::from(declared).div_ceil(8),
-            TS_WORD | 0x05 /* INT */ => usize::from(declared).div_ceil(8),
-            _ => usize::from(declared),
+        // length 域单位随 transport size 与设备实现变化（实测两语义：
+        // 真机 S7-1200 对 WORD 按位计 0x0010=2B；本地模拟器对 DWORD
+        // 报 0x0008 与实发 4B 均不符——其实现有缺陷）。解析策略：
+        // 单项时声明仅作参考、以「数据区恰好闭合」为准取剩余全长；
+        // 多项时位计优先、越界回退字节计。
+        let by_bits = usize::from(declared).div_ceil(8);
+        let by_bytes = usize::from(declared);
+        let remaining = data.len() - cursor - 4;
+        let payload_len = match (transport_size, expected_items) {
+            (TS_BIT, _) => usize::from(declared).div_ceil(8),
+            (TS_WORD | 0x05 | TS_DWORD | 0x07, 1) => remaining,
+            (TS_WORD | 0x05 | TS_DWORD | 0x07, _) => {
+                if cursor + 4 + by_bits <= data.len() {
+                    by_bits
+                } else {
+                    by_bytes
+                }
+            }
+            (_, _) => usize::from(declared),
         };
         cursor += 4;
         if cursor + payload_len > data.len() {
