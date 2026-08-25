@@ -89,8 +89,11 @@ pub struct SubmitContext {
 #[derive(Debug)]
 pub enum SubmitError {
     /// 同 key + 不同 payload（§80.1）。
+    ///
+    /// `JournalEntry` 装箱削减变体尺寸——错误类型应保持小尺寸，
+    /// 冲突详情是冷路径数据。
     Conflict {
-        existing: crate::journal::JournalEntry,
+        existing: Box<crate::journal::JournalEntry>,
     },
     /// 信封非法：`request_id` 为空或 `timeout_ms == 0`。
     InvalidRequest { code: &'static str, message: String },
@@ -600,7 +603,9 @@ impl ControlEngine {
                         .expect("active 锁被毒化")
                         .remove(&key);
                 }
-                return Err(SubmitError::Conflict { existing });
+                return Err(SubmitError::Conflict {
+                    existing: Box::new(existing),
+                });
             }
             Ok(JournalDecision::Inserted) => {
                 if !active_fresh {
@@ -1026,20 +1031,24 @@ impl ControlEngine {
             self.inner.context.policy.audit_timeout_ms,
             None,
             crate::audit::build_event(
-                &ctx.subject,
-                &ctx.source,
-                &request.namespace,
-                &request.device_id,
-                &request.request_id,
+                crate::audit::AuditEventContext {
+                    user: &ctx.subject,
+                    source: &ctx.source,
+                    namespace: &request.namespace,
+                    device_id: &request.device_id,
+                    request_id: &request.request_id,
+                },
                 audit_meta.operation,
                 &audit_meta.target,
                 &audit_meta.parameters,
                 None,
-                result.status,
-                result.error.as_ref().map(|e| e.code.clone()),
-                None,
-                0,
-                now_ns(),
+                crate::audit::AuditEventOutcome {
+                    status: result.status,
+                    error_code: result.error.as_ref().map(|e| e.code.clone()),
+                    protocol_code: None,
+                    duration_ms: 0,
+                    occurred_at_ns: now_ns(),
+                },
             ),
         )
         .await;
@@ -1113,20 +1122,24 @@ impl ControlEngine {
             self.inner.context.policy.audit_timeout_ms,
             None,
             crate::audit::build_event(
-                &ctx.subject,
-                &ctx.source,
-                &request.namespace,
-                &request.device_id,
-                &request.request_id,
+                crate::audit::AuditEventContext {
+                    user: &ctx.subject,
+                    source: &ctx.source,
+                    namespace: &request.namespace,
+                    device_id: &request.device_id,
+                    request_id: &request.request_id,
+                },
                 audit_meta.operation,
                 &audit_meta.target,
                 &audit_meta.parameters,
                 None,
-                result.status,
-                result.error.as_ref().map(|e| e.code.clone()),
-                None,
-                0,
-                now_ns(),
+                crate::audit::AuditEventOutcome {
+                    status: result.status,
+                    error_code: result.error.as_ref().map(|e| e.code.clone()),
+                    protocol_code: None,
+                    duration_ms: 0,
+                    occurred_at_ns: now_ns(),
+                },
             ),
         )
         .await;
@@ -1202,20 +1215,24 @@ impl ControlEngine {
             self.inner.context.policy.audit_timeout_ms,
             None,
             crate::audit::build_event(
-                &ctx.subject,
-                &ctx.source,
-                &request.namespace,
-                &request.device_id,
-                &request.request_id,
+                crate::audit::AuditEventContext {
+                    user: &ctx.subject,
+                    source: &ctx.source,
+                    namespace: &request.namespace,
+                    device_id: &request.device_id,
+                    request_id: &request.request_id,
+                },
                 audit_meta.operation,
                 &audit_meta.target,
                 &audit_meta.parameters,
                 None,
-                result.status,
-                result.error.as_ref().map(|e| e.code.clone()),
-                None,
-                0,
-                now_ns(),
+                crate::audit::AuditEventOutcome {
+                    status: result.status,
+                    error_code: result.error.as_ref().map(|e| e.code.clone()),
+                    protocol_code: None,
+                    duration_ms: 0,
+                    occurred_at_ns: now_ns(),
+                },
             ),
         )
         .await;

@@ -584,245 +584,6 @@ impl RestOptions {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rest_max_concurrency_upper_bound_rejected() {
-        // 评审 P2：Semaphore::new 对超限 permits 会 panic，配置必须
-        // 在启动前返回错误而非崩溃。
-        let ok = RestOptions {
-            listen: None,
-            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS,
-        };
-        assert!(ok.validate().is_ok(), "等于上限应通过");
-        let over = RestOptions {
-            listen: None,
-            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS + 1,
-        };
-        let err = over.validate().expect_err("超限必须拒绝");
-        assert!(
-            err.to_string().contains("rest.max_concurrency"),
-            "错误应指向字段: {err}"
-        );
-    }
-
-    /// 最小合法配置（§100 校验全通过；测试按需覆盖单字段）。
-    fn minimal_config() -> CollectorConfig {
-        CollectorConfig {
-            site_id: "plant-a".to_owned(),
-            session_id: None,
-            profiles_dir: PathBuf::from("profiles"),
-            driver: DriverSpec {
-                plugin: PathBuf::from("driver.dll"),
-                manifest: ManifestSpec {
-                    id: "modbus-tcp".to_owned(),
-                    ..Default::default()
-                },
-            },
-            devices: vec![DeviceSpec {
-                id: "vfd-01".to_owned(),
-                name: None,
-                domain: None,
-                driver: "modbus-tcp".to_owned(),
-                profile: "inovance-md500".to_owned(),
-                connection: serde_json::json!({ "host": "127.0.0.1", "port": 1502 }),
-                enabled: true,
-                labels: Default::default(),
-            }],
-            northbound: NorthboundConfig {
-                mqtt: MqttOptions {
-                    broker_host: "127.0.0.1".to_owned(),
-                    ..Default::default()
-                },
-            },
-            poll: Default::default(),
-            pipeline: Default::default(),
-            buffer: BufferOptions {
-                db_path: PathBuf::from("data/collector-wal.db"),
-                ..Default::default()
-            },
-            forward_poll_ms: 500,
-            rest: RestOptions {
-                listen: Some("127.0.0.1:18080".to_owned()),
-                max_concurrency: 8,
-            },
-            control: None,
-        }
-    }
-
-    /// 合法 control 段（凭据/Journal 路径仅作占位，路径存在性由运行时
-    /// 装配期校验，配置层只查非空）。
-    #[cfg(feature = "control")]
-    fn valid_control() -> ControlOptions {
-        ControlOptions {
-            namespace: "plant-a".to_owned(),
-            credentials_file: PathBuf::from("control-credentials.json"),
-            journal_path: None,
-            timeout_ms: 5_000,
-            queue_capacity: 16,
-            audit_timeout_ms: 1_000,
-            shutdown_grace_ms: 5_000,
-        }
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_build_accepts_valid_control_section() {
-        let mut config = minimal_config();
-        config.control = Some(valid_control());
-        config.validate().expect("合法 control 配置应通过");
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_build_without_section_stays_readonly() {
-        // 段是控制的启用开关（与 rest.listen 同模式）：缺省保持只读采集，
-        // 运行时启动时告警提示（不误导也不阻塞既有只读部署）。
-        let config = minimal_config();
-        config.validate().expect("缺 control 段应通过（只读运行）");
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_build_requires_rest_listen() {
-        // 控制端点经 REST v1 暴露（§31.5）：无 REST 的控制构建没有提交入口。
-        let mut config = minimal_config();
-        config.rest.listen = None;
-        config.control = Some(valid_control());
-        let err = config.validate().expect_err("未启用 REST 必须拒绝");
-        assert!(
-            err.to_string().contains("rest.listen"),
-            "错误应指向 rest.listen: {err}"
-        );
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_requires_loopback_listen_rejects_non_loopback() {
-        // §90.2：远程（非 loopback）必须 TLS，MVP 无原生 TLS——控制面仅
-        // 允许 loopback 直连（fail-fast 启动失败），远程访问须经 TLS 反向
-        // 代理转发。
-        let mut config = minimal_config();
-        config.rest.listen = Some("0.0.0.0:8080".to_owned());
-        config.control = Some(valid_control());
-        let err = config.validate().expect_err("通配地址监听必须拒绝");
-        let text = err.to_string();
-        assert!(
-            text.contains("loopback"),
-            "错误应说明仅允许 loopback: {text}"
-        );
-        assert!(
-            text.contains("TLS 反向代理"),
-            "错误应说明远程访问方案: {text}"
-        );
-
-        // 私网地址同样非 loopback，拒绝。
-        let mut config = minimal_config();
-        config.rest.listen = Some("192.168.1.10:8080".to_owned());
-        config.control = Some(valid_control());
-        assert!(config.validate().is_err(), "私网地址同样必须拒绝");
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_allows_loopback_listen_ipv4_and_ipv6() {
-        // IPv4 127.0.0.0/8 与 IPv6 ::1 均为 loopback，允许启用控制链路。
-        for listen in ["127.0.0.1:8080", "[::1]:8080", "127.9.9.9:8080"] {
-            let mut config = minimal_config();
-            config.rest.listen = Some(listen.to_owned());
-            config.control = Some(valid_control());
-            config
-                .validate()
-                .unwrap_or_else(|e| panic!("{listen} 应通过: {e}"));
-        }
-    }
-
-    #[cfg(feature = "control")]
-    #[test]
-    fn control_options_rejects_invalid_fields() {
-        let cases: Vec<(&str, ControlOptions)> = vec![
-            (
-                "control.namespace",
-                ControlOptions {
-                    namespace: String::new(),
-                    ..valid_control()
-                },
-            ),
-            (
-                "control.timeout_ms",
-                ControlOptions {
-                    timeout_ms: 0,
-                    ..valid_control()
-                },
-            ),
-            (
-                "control.queue_capacity",
-                ControlOptions {
-                    queue_capacity: 0,
-                    ..valid_control()
-                },
-            ),
-            (
-                "control.audit_timeout_ms",
-                ControlOptions {
-                    audit_timeout_ms: 0,
-                    ..valid_control()
-                },
-            ),
-            (
-                "control.shutdown_grace_ms",
-                ControlOptions {
-                    shutdown_grace_ms: 0,
-                    ..valid_control()
-                },
-            ),
-            (
-                "control.credentials_file",
-                ControlOptions {
-                    credentials_file: PathBuf::new(),
-                    ..valid_control()
-                },
-            ),
-        ];
-        for (field, options) in cases {
-            let err = options.validate().expect_err("非法字段必须拒绝");
-            assert!(err.to_string().contains(field), "错误应指向 {field}: {err}");
-        }
-    }
-
-    #[cfg(not(feature = "control"))]
-    #[test]
-    fn readonly_build_rejects_control_section() {
-        // 只读构建出现 control 段必须报错（fail-fast，防止用户误以为
-        // 控制已启用）。
-        let mut config = minimal_config();
-        config.control = Some(ControlOptions {
-            namespace: "plant-a".to_owned(),
-            credentials_file: PathBuf::from("control-credentials.json"),
-            journal_path: None,
-            timeout_ms: 5_000,
-            queue_capacity: 16,
-            audit_timeout_ms: 1_000,
-            shutdown_grace_ms: 5_000,
-        });
-        let err = config.validate().expect_err("只读构建必须拒绝 control 段");
-        assert!(
-            err.to_string().contains("只读"),
-            "错误应说明当前为只读构建: {err}"
-        );
-    }
-
-    #[cfg(not(feature = "control"))]
-    #[test]
-    fn readonly_build_ok_without_control_section() {
-        minimal_config()
-            .validate()
-            .expect("无 control 段的只读配置应通过");
-    }
-}
-
 impl CollectorConfig {
     /// 从文件加载配置（YAML 或 JSON，按扩展名/内容自动识别）。
     pub fn load_path(path: &Path) -> Result<Self, CollectorError> {
@@ -1227,5 +988,244 @@ impl BufferOptions {
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_max_concurrency_upper_bound_rejected() {
+        // 评审 P2：Semaphore::new 对超限 permits 会 panic，配置必须
+        // 在启动前返回错误而非崩溃。
+        let ok = RestOptions {
+            listen: None,
+            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS,
+        };
+        assert!(ok.validate().is_ok(), "等于上限应通过");
+        let over = RestOptions {
+            listen: None,
+            max_concurrency: tokio::sync::Semaphore::MAX_PERMITS + 1,
+        };
+        let err = over.validate().expect_err("超限必须拒绝");
+        assert!(
+            err.to_string().contains("rest.max_concurrency"),
+            "错误应指向字段: {err}"
+        );
+    }
+
+    /// 最小合法配置（§100 校验全通过；测试按需覆盖单字段）。
+    fn minimal_config() -> CollectorConfig {
+        CollectorConfig {
+            site_id: "plant-a".to_owned(),
+            session_id: None,
+            profiles_dir: PathBuf::from("profiles"),
+            driver: DriverSpec {
+                plugin: PathBuf::from("driver.dll"),
+                manifest: ManifestSpec {
+                    id: "modbus-tcp".to_owned(),
+                    ..Default::default()
+                },
+            },
+            devices: vec![DeviceSpec {
+                id: "vfd-01".to_owned(),
+                name: None,
+                domain: None,
+                driver: "modbus-tcp".to_owned(),
+                profile: "inovance-md500".to_owned(),
+                connection: serde_json::json!({ "host": "127.0.0.1", "port": 1502 }),
+                enabled: true,
+                labels: Default::default(),
+            }],
+            northbound: NorthboundConfig {
+                mqtt: MqttOptions {
+                    broker_host: "127.0.0.1".to_owned(),
+                    ..Default::default()
+                },
+            },
+            poll: Default::default(),
+            pipeline: Default::default(),
+            buffer: BufferOptions {
+                db_path: PathBuf::from("data/collector-wal.db"),
+                ..Default::default()
+            },
+            forward_poll_ms: 500,
+            rest: RestOptions {
+                listen: Some("127.0.0.1:18080".to_owned()),
+                max_concurrency: 8,
+            },
+            control: None,
+        }
+    }
+
+    /// 合法 control 段（凭据/Journal 路径仅作占位，路径存在性由运行时
+    /// 装配期校验，配置层只查非空）。
+    #[cfg(feature = "control")]
+    fn valid_control() -> ControlOptions {
+        ControlOptions {
+            namespace: "plant-a".to_owned(),
+            credentials_file: PathBuf::from("control-credentials.json"),
+            journal_path: None,
+            timeout_ms: 5_000,
+            queue_capacity: 16,
+            audit_timeout_ms: 1_000,
+            shutdown_grace_ms: 5_000,
+        }
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_accepts_valid_control_section() {
+        let mut config = minimal_config();
+        config.control = Some(valid_control());
+        config.validate().expect("合法 control 配置应通过");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_without_section_stays_readonly() {
+        // 段是控制的启用开关（与 rest.listen 同模式）：缺省保持只读采集，
+        // 运行时启动时告警提示（不误导也不阻塞既有只读部署）。
+        let config = minimal_config();
+        config.validate().expect("缺 control 段应通过（只读运行）");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_build_requires_rest_listen() {
+        // 控制端点经 REST v1 暴露（§31.5）：无 REST 的控制构建没有提交入口。
+        let mut config = minimal_config();
+        config.rest.listen = None;
+        config.control = Some(valid_control());
+        let err = config.validate().expect_err("未启用 REST 必须拒绝");
+        assert!(
+            err.to_string().contains("rest.listen"),
+            "错误应指向 rest.listen: {err}"
+        );
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_requires_loopback_listen_rejects_non_loopback() {
+        // §90.2：远程（非 loopback）必须 TLS，MVP 无原生 TLS——控制面仅
+        // 允许 loopback 直连（fail-fast 启动失败），远程访问须经 TLS 反向
+        // 代理转发。
+        let mut config = minimal_config();
+        config.rest.listen = Some("0.0.0.0:8080".to_owned());
+        config.control = Some(valid_control());
+        let err = config.validate().expect_err("通配地址监听必须拒绝");
+        let text = err.to_string();
+        assert!(
+            text.contains("loopback"),
+            "错误应说明仅允许 loopback: {text}"
+        );
+        assert!(
+            text.contains("TLS 反向代理"),
+            "错误应说明远程访问方案: {text}"
+        );
+
+        // 私网地址同样非 loopback，拒绝。
+        let mut config = minimal_config();
+        config.rest.listen = Some("192.168.1.10:8080".to_owned());
+        config.control = Some(valid_control());
+        assert!(config.validate().is_err(), "私网地址同样必须拒绝");
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_allows_loopback_listen_ipv4_and_ipv6() {
+        // IPv4 127.0.0.0/8 与 IPv6 ::1 均为 loopback，允许启用控制链路。
+        for listen in ["127.0.0.1:8080", "[::1]:8080", "127.9.9.9:8080"] {
+            let mut config = minimal_config();
+            config.rest.listen = Some(listen.to_owned());
+            config.control = Some(valid_control());
+            config
+                .validate()
+                .unwrap_or_else(|e| panic!("{listen} 应通过: {e}"));
+        }
+    }
+
+    #[cfg(feature = "control")]
+    #[test]
+    fn control_options_rejects_invalid_fields() {
+        let cases: Vec<(&str, ControlOptions)> = vec![
+            (
+                "control.namespace",
+                ControlOptions {
+                    namespace: String::new(),
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.timeout_ms",
+                ControlOptions {
+                    timeout_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.queue_capacity",
+                ControlOptions {
+                    queue_capacity: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.audit_timeout_ms",
+                ControlOptions {
+                    audit_timeout_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.shutdown_grace_ms",
+                ControlOptions {
+                    shutdown_grace_ms: 0,
+                    ..valid_control()
+                },
+            ),
+            (
+                "control.credentials_file",
+                ControlOptions {
+                    credentials_file: PathBuf::new(),
+                    ..valid_control()
+                },
+            ),
+        ];
+        for (field, options) in cases {
+            let err = options.validate().expect_err("非法字段必须拒绝");
+            assert!(err.to_string().contains(field), "错误应指向 {field}: {err}");
+        }
+    }
+
+    #[cfg(not(feature = "control"))]
+    #[test]
+    fn readonly_build_rejects_control_section() {
+        // 只读构建出现 control 段必须报错（fail-fast，防止用户误以为
+        // 控制已启用）。
+        let mut config = minimal_config();
+        config.control = Some(ControlOptions {
+            namespace: "plant-a".to_owned(),
+            credentials_file: PathBuf::from("control-credentials.json"),
+            journal_path: None,
+            timeout_ms: 5_000,
+            queue_capacity: 16,
+            audit_timeout_ms: 1_000,
+            shutdown_grace_ms: 5_000,
+        });
+        let err = config.validate().expect_err("只读构建必须拒绝 control 段");
+        assert!(
+            err.to_string().contains("只读"),
+            "错误应说明当前为只读构建: {err}"
+        );
+    }
+
+    #[cfg(not(feature = "control"))]
+    #[test]
+    fn readonly_build_ok_without_control_section() {
+        minimal_config()
+            .validate()
+            .expect("无 control 段的只读配置应通过");
     }
 }

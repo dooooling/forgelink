@@ -233,8 +233,7 @@ impl ControlJournal for FailingJournal {
         expires_at_ns: observation_model::TimestampNs,
     ) -> Result<crate::journal::JournalDecision, crate::journal::JournalError> {
         if self.fail_insert.load(Ordering::SeqCst) {
-            return Err(crate::journal::JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(crate::journal::JournalError::Io(std::io::Error::other(
                 "磁盘只读",
             )));
         }
@@ -248,8 +247,7 @@ impl ControlJournal for FailingJournal {
         result: &observation_model::ControlResult,
     ) -> Result<(), JournalError> {
         if self.fail_settle.load(Ordering::SeqCst) {
-            return Err(crate::journal::JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(crate::journal::JournalError::Io(std::io::Error::other(
                 "磁盘只读",
             )));
         }
@@ -380,16 +378,17 @@ fn authorizer(role: Role) -> Arc<MemoryAuthorizer> {
 }
 
 fn default_policy() -> Arc<ControlPolicy> {
-    let mut policy = ControlPolicy::default();
     // 测试 Profile 的命令声明了前置条件（§85）：fail-closed 语义下
     // 未配置检查器会被拒绝，故默认挂载放行检查器；前置条件专项测试
     // 自行覆盖（AlwaysFailChecker / 无检查器）。
-    policy.precondition_checker =
-        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
+    //
     // 冷却期机制由专项测试覆盖（显式策略）；机制类测试关闭以避免
     // Indeterminate 结算后的冷却拒绝干扰后续提交。
-    policy.indeterminate_cooldown_ms = 0;
-    Arc::new(policy)
+    Arc::new(ControlPolicy {
+        precondition_checker: Some(Arc::new(crate::precondition::PermissivePreconditionChecker)),
+        indeterminate_cooldown_ms: 0,
+        ..Default::default()
+    })
 }
 
 fn write_request(id: &str, path: &str, value: Value) -> ControlRequest {
@@ -647,15 +646,16 @@ async fn unauthorized_and_precondition_rejected_before_driver() {
     assert_eq!(result.error.unwrap().code, "INSUFFICIENT_ROLE");
 
     // 前置条件失败（§85）。
-    let mut policy = ControlPolicy::default();
-    policy.precondition_checker = Some(Arc::new(AlwaysFailChecker));
     let engine2 = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            precondition_checker: Some(Arc::new(AlwaysFailChecker)),
+            ..Default::default()
+        }),
     );
     let result = engine2
         .submit(command_request("u-2", true), &context())
@@ -822,15 +822,16 @@ fn in_memory_engine_with_journal(
 async fn queue_full_rejected() {
     let executor = MockExecutor::new(); // 阻塞第一个
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.queue_capacity = 1;
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            queue_capacity: 1,
+            ..Default::default()
+        }),
     );
 
     // A 占用 worker（运行中，不计入队列容量）；B 入队占满容量 1。
@@ -970,19 +971,21 @@ async fn cancel_settles_cancelled() {
 async fn priority_ordering() {
     let executor = MockExecutor::new(); // 阻塞，制造排队窗口
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.property_write_priority = Priority::Low;
-    policy.command_priority = CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]);
-    // 命令声明了前置条件（§85）：fail-closed 下需挂载放行检查器。
-    policy.precondition_checker =
-        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            property_write_priority: Priority::Low,
+            command_priority: CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]),
+            // 命令声明了前置条件（§85）：fail-closed 下需挂载放行检查器。
+            precondition_checker: Some(Arc::new(
+                crate::precondition::PermissivePreconditionChecker,
+            )),
+            ..Default::default()
+        }),
     );
 
     // 先入队一个占用 worker 的请求，再入队低/高优先级各一。
@@ -1322,15 +1325,16 @@ async fn authorization_precedes_precondition_check() {
     let executor = MockExecutor::new();
     executor.release();
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.precondition_checker = Some(Arc::new(AlwaysFailChecker));
     let engine = engine_with(
         catalog(),
         authorizer(Role::Viewer),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            precondition_checker: Some(Arc::new(AlwaysFailChecker)),
+            ..Default::default()
+        }),
     );
 
     let result = engine
@@ -1352,8 +1356,10 @@ async fn authorization_precedes_precondition_check() {
 #[test]
 #[should_panic(expected = "idempotency_retention 不得低于 24 小时")]
 fn policy_validate_rejects_short_retention() {
-    let mut policy = ControlPolicy::default();
-    policy.idempotency_retention = Duration::from_secs(3600); // 1h
+    let policy = ControlPolicy {
+        idempotency_retention: Duration::from_secs(3600), // 1h
+        ..Default::default()
+    };
     assert!(policy.validate().is_err());
     let _ = ControlEngine::new(ControlEngineConfig {
         catalog: catalog(),
@@ -1801,15 +1807,17 @@ async fn precondition_unconfigured_fails_closed() {
     let executor = MockExecutor::new();
     executor.release();
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.precondition_checker = None; // 未配置检查器
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        // 未配置检查器
+        Arc::new(ControlPolicy {
+            precondition_checker: None,
+            ..Default::default()
+        }),
     );
 
     let result = engine
@@ -1830,17 +1838,18 @@ async fn precondition_rechecked_at_execution_time() {
     let executor = MockExecutor::new();
     executor.release();
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.precondition_checker = Some(Arc::new(CountingChecker {
-        remaining: AtomicUsize::new(1), // 提交期通过，执行期复查失败
-    }));
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            precondition_checker: Some(Arc::new(CountingChecker {
+                remaining: AtomicUsize::new(1), // 提交期通过，执行期复查失败
+            })),
+            ..Default::default()
+        }),
     );
 
     let result = engine
@@ -1861,16 +1870,17 @@ async fn precondition_check_timeout_is_fail_closed() {
     let executor = MockExecutor::new();
     executor.release();
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.precondition_timeout_ms = 50;
-    policy.precondition_checker = Some(Arc::new(SlowChecker { delay_ms: 5_000 }));
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            precondition_timeout_ms: 50,
+            precondition_checker: Some(Arc::new(SlowChecker { delay_ms: 5_000 })),
+            ..Default::default()
+        }),
     );
 
     let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -2059,15 +2069,16 @@ async fn worker_panics_then_shutdown_settles_receipt() {
 async fn slow_audit_does_not_block_control() {
     let executor = MockExecutor::new();
     executor.release();
-    let mut policy = ControlPolicy::default();
-    policy.audit_timeout_ms = 20;
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         Arc::new(SlowAuditSink { delay_ms: 5_000 }),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            audit_timeout_ms: 20,
+            ..Default::default()
+        }),
     );
 
     let started = std::time::Instant::now();
@@ -2107,12 +2118,13 @@ fn audit_secret_hash_is_salted() {
 async fn priority_aging_prevents_starvation() {
     let executor = MockExecutor::new(); // 阻塞制造排队窗口
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.priority_aging_ms = 60;
-    policy.property_write_priority = Priority::Low;
-    policy.command_priority = CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]);
-    policy.precondition_checker =
-        Some(Arc::new(crate::precondition::PermissivePreconditionChecker));
+    let policy = ControlPolicy {
+        priority_aging_ms: 60,
+        property_write_priority: Priority::Low,
+        command_priority: CommandPriority::from([(CommandRiskLevel::Medium, Priority::High)]),
+        precondition_checker: Some(Arc::new(crate::precondition::PermissivePreconditionChecker)),
+        ..Default::default()
+    };
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
@@ -2256,8 +2268,7 @@ impl ControlJournal for RaceJournal {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            return Err(JournalError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(JournalError::Io(std::io::Error::other(
                 "forced insert failure",
             )));
         }
@@ -2430,15 +2441,16 @@ async fn shutdown_does_not_start_queued_actions() {
 async fn indeterminate_triggers_device_cooldown() {
     let executor = MockExecutor::new(); // 阻塞
     let audit = Arc::new(MemoryAuditSink::new());
-    let mut policy = ControlPolicy::default();
-    policy.indeterminate_cooldown_ms = 300;
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         audit.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            indeterminate_cooldown_ms: 300,
+            ..Default::default()
+        }),
     );
 
     let receipt = engine
@@ -2516,15 +2528,16 @@ async fn audit_timeout_retries_once() {
     let sink = Arc::new(SlowOnceAuditSink {
         calls: AtomicUsize::new(0),
     });
-    let mut policy = ControlPolicy::default();
-    policy.audit_timeout_ms = 50;
     let engine = engine_with(
         catalog(),
         authorizer(Role::Operator),
         Arc::new(InMemoryJournal::new()),
         executor.clone(),
         sink.clone(),
-        Arc::new(policy),
+        Arc::new(ControlPolicy {
+            audit_timeout_ms: 50,
+            ..Default::default()
+        }),
     );
 
     let started = std::time::Instant::now();
@@ -2554,16 +2567,15 @@ fn metrics_engine(
     registry: Arc<metrics::MetricsRegistry>,
     executor: Arc<MockExecutor>,
 ) -> ControlEngine {
-    let mut config = ControlEngineConfig {
+    let config = ControlEngineConfig {
         catalog: catalog(),
         authorizer: authorizer(Role::Operator),
         journal: Arc::new(InMemoryJournal::new()),
         executor,
         audit: Arc::new(MemoryAuditSink::new()),
         policy: default_policy(),
-        metrics: None,
+        metrics: Some(registry),
     };
-    config.metrics = Some(registry);
     ControlEngine::new(config)
 }
 
@@ -2645,7 +2657,7 @@ async fn metrics_queue_depth_per_device_gauges_pair_and_isolate() {
     let executor = MockExecutor::new(); // 阻塞：制造排队窗口
     executor.set_indeterminate();
     let engine = {
-        let mut config = ControlEngineConfig {
+        let config = ControlEngineConfig {
             catalog: catalog_two_devices(),
             authorizer: authorizer(Role::Operator),
             journal: Arc::new(InMemoryJournal::new()),

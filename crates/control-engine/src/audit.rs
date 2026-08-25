@@ -313,41 +313,51 @@ pub fn summarize_parameters(target: &AuditTarget<'_>) -> (String, Vec<AuditParam
     }
 }
 
+/// 审计事件主体（谁、从哪来、对哪个设备的哪个请求）。
+pub(crate) struct AuditEventContext<'a> {
+    pub user: &'a str,
+    pub source: &'a str,
+    pub namespace: &'a str,
+    pub device_id: &'a DeviceId,
+    pub request_id: &'a str,
+}
+
+/// 审计事件结算信息（结果侧字段）。
+pub(crate) struct AuditEventOutcome {
+    pub status: ControlStatus,
+    pub error_code: Option<String>,
+    pub protocol_code: Option<i64>,
+    pub duration_ms: u64,
+    pub occurred_at_ns: TimestampNs,
+}
+
 /// 供上层按请求组装完整审计事件（内部 helper）。
 ///
 /// `target_text` 与 `parameters` 由 [`summarize_parameters`] 预生成
 /// （提交时），此处只做组装。
 pub(crate) fn build_event(
-    user: &str,
-    source: &str,
-    namespace: &str,
-    device_id: &DeviceId,
-    request_id: &str,
+    ctx: AuditEventContext<'_>,
     operation: AuditOperation,
     target_text: &str,
     parameters: &[AuditParameter],
     risk_level: Option<CommandRiskLevel>,
-    status: ControlStatus,
-    error_code: Option<String>,
-    protocol_code: Option<i64>,
-    duration_ms: u64,
-    occurred_at_ns: TimestampNs,
+    outcome: AuditEventOutcome,
 ) -> AuditEvent {
     AuditEvent {
-        user: user.to_owned(),
-        source: source.to_owned(),
-        namespace: namespace.to_owned(),
-        device_id: device_id.clone(),
-        request_id: request_id.to_owned(),
+        user: ctx.user.to_owned(),
+        source: ctx.source.to_owned(),
+        namespace: ctx.namespace.to_owned(),
+        device_id: ctx.device_id.clone(),
+        request_id: ctx.request_id.to_owned(),
         operation,
         target: target_text.to_owned(),
         parameters: parameters.to_vec(),
         risk_level,
-        status,
-        error_code,
-        protocol_code,
-        duration_ms,
-        occurred_at_ns,
+        status: outcome.status,
+        error_code: outcome.error_code,
+        protocol_code: outcome.protocol_code,
+        duration_ms: outcome.duration_ms,
+        occurred_at_ns: outcome.occurred_at_ns,
     }
 }
 

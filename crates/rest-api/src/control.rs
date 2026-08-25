@@ -2090,10 +2090,12 @@ mod tests {
 
     #[tokio::test]
     async fn plain_router_keeps_control_routes_hidden_even_with_feature_enabled() {
-        // `router()`/`spawn()` 保持纯只读装配：即使 `control` feature 已启用，
-        // 未走 `spawn_with_control` 时控制路由不存在（404）。
-        let app = crate::server::router(
+        // `router_with_options(…, metrics=None)`/`spawn()` 保持纯只读装配：
+        // 即使 `control` feature 已启用，未走 `spawn_with_control` 时控制
+        // 路由不存在（404）。
+        let app = crate::server::router_with_options(
             Arc::new(EmptyState),
+            None,
             Arc::new(tokio::sync::Semaphore::new(8)),
         );
         let (status, body) =
@@ -2165,7 +2167,7 @@ mod tests {
     #[test]
     fn submit_error_conflict_and_closed_mapping() {
         let conflict = map_engine_submit_error(&Box::new(SubmitError::Conflict {
-            existing: JournalEntry {
+            existing: Box::new(JournalEntry {
                 key: IdempotencyKey {
                     namespace: NS.to_owned(),
                     device_id: DEV.to_owned(),
@@ -2176,7 +2178,7 @@ mod tests {
                 created_at_ns: 0,
                 expires_at_ns: 1,
                 result: None,
-            },
+            }),
         }));
         assert_eq!(conflict.code.status(), StatusCode::CONFLICT);
 

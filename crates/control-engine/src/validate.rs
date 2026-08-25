@@ -550,23 +550,23 @@ fn value_representable(value: &Value, data_type: &DataType) -> bool {
 /// 其余数值走 `f64`。非数值参数无范围概念（Profile 校验阶段已保证 min/max
 /// 与 `data_type` 同族，见 profile-engine validate）。
 fn param_within_range(value: &Value, min: Option<&Value>, max: Option<&Value>) -> bool {
-    if let (Some(v), Some(bound)) = (value_to_i128(value), min.and_then(value_to_i128)) {
-        if v < bound {
-            return false;
-        }
-    } else if let (Some(v), Some(bound)) = (value_to_f64(value), min.and_then(value_to_f64)) {
-        if v < bound {
-            return false;
-        }
+    if let (Some(v), Some(bound)) = (value_to_i128(value), min.and_then(value_to_i128))
+        && v < bound
+    {
+        return false;
+    } else if let (Some(v), Some(bound)) = (value_to_f64(value), min.and_then(value_to_f64))
+        && v < bound
+    {
+        return false;
     }
-    if let (Some(v), Some(bound)) = (value_to_i128(value), max.and_then(value_to_i128)) {
-        if v > bound {
-            return false;
-        }
-    } else if let (Some(v), Some(bound)) = (value_to_f64(value), max.and_then(value_to_f64)) {
-        if v > bound {
-            return false;
-        }
+    if let (Some(v), Some(bound)) = (value_to_i128(value), max.and_then(value_to_i128))
+        && v > bound
+    {
+        return false;
+    } else if let (Some(v), Some(bound)) = (value_to_f64(value), max.and_then(value_to_f64))
+        && v > bound
+    {
+        return false;
     }
     true
 }

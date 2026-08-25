@@ -557,16 +557,16 @@ impl CollectorRuntime {
         // `changed()` 永远不会触发。此处先检查当前存活状态与已置位
         // 值，任一表明服务已不可用即立即按异常退出处理，不得因错过
         // 通知而继续采集。
-        if let (Some(rest), Some(rx)) = (self.rest.as_ref(), rest_exit.as_ref()) {
-            if !rest.is_alive() || *rx.borrow() {
-                let msg = "REST 服务在监督启动前已不可用，采集停止（API 不可用）".to_owned();
-                error!(component = "collector", "{msg}");
-                self.stopping.send(true).ok();
-                return Err(match self.shutdown().await {
-                    Ok(()) => CollectorError::Task(msg),
-                    Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
-                });
-            }
+        if let (Some(rest), Some(rx)) = (self.rest.as_ref(), rest_exit.as_ref())
+            && (!rest.is_alive() || *rx.borrow())
+        {
+            let msg = "REST 服务在监督启动前已不可用，采集停止（API 不可用）".to_owned();
+            error!(component = "collector", "{msg}");
+            self.stopping.send(true).ok();
+            return Err(match self.shutdown().await {
+                Ok(()) => CollectorError::Task(msg),
+                Err(e) => CollectorError::Task(format!("{msg}；有序停机失败: {e}")),
+            });
         }
         tokio::select! {
             // 系统信号：SIGINT（Ctrl+C）直接监听；SIGTERM 由 main 挂接
