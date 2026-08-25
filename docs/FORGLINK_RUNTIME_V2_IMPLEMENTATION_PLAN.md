@@ -1,11 +1,11 @@
 # ForgeLink Runtime Architecture V2 实施方案
 
-> 状态：Draft for Implementation — Consistency Review Revision  
+> 状态：Draft for Implementation — Decision Record Revision（D1/D2 已批准）  
 > 目标版本：ForgeLink Runtime V2  
 > 适用仓库：`dooooling/forgelink`  
 > 文档目的：用于直接指导架构重构、任务拆分、PR 实施和验收  
 > 原则：**保留已稳定的数据模型与北向链路，重构 Driver Runtime / Device Session / Plugin Runtime**  
-> 决策状态：本文区分 **Normative / Target / Transitional / Proposed**；未明确标记为 `Proposed` 的目标态要求，在对应迁移 Phase 完成后生效。
+> 决策状态：本文区分 **Normative / Target / Transitional / Proposed**；未明确标记为 `Proposed` 的目标态要求，在对应迁移 Phase 完成后生效。**D1/D2 两项决策已于 2026-08-25 正式批准**（见 §1.1.1 决策记录），本文当前无未决 `Proposed` 事项。
 
 ---
 
@@ -42,10 +42,16 @@ ForgeLink 当前已经具备较完整的采集、控制、缓存、MQTT、REST�
 | `Transitional` | 仅迁移期允许；必须有明确删除点 |
 | `Proposed` | 尚需架构/路线图决策，不得在代码中默认为已批准 |
 
-当前有两个明确的 `Proposed` 决策门：
+### 1.1.1 决策记录（2026-08-25）
 
-1. **D1 — 生产环境是否强制所有 ForgeLink 自研 Rust Driver 也必须经 Driver Host。** 本文推荐“是”；无论 D1 是否批准，`BlockingUninterruptible` / 闭源 Vendor SDK 均必须进独立 Host。
-2. **D2 — Runtime V2 期间是否冻结 FINS / FOCAS / ADS 等新协议路线图。** 本文推荐冻结新增功能，只允许严重 bug、安全和协议正确性修复；最终以路线图决策为准。
+以下两项决策已于 2026-08-25 由仓库所有者正式批准，全文相应条目按此执行：
+
+| 决议 | 内容 | 生效 |
+|---|---|---|
+| **D1 — APPROVED**：生产 Driver 隔离政策 | Phase 8 后：所有生产 Driver 必须经 Driver Host；Pure Rust 默认 `per_driver`；高风险 Vendor SDK 可/应 `per_device`；in-process 仅开发测试。 | Phase 8 cutover 后强制；Host 路径实现要求自 Phase 7 起有效 |
+| **D2 — APPROVED**：协议扩展临时冻结 | 立即冻结 FINS / FOCAS / ADS / 新增 Driver / ABI v1 新能力；**Milestone B 验收通过后解除冻结**；现有协议 bug、安全、正确性修复与 Runtime V2 工作不受限制。 | 即时生效（2026-08-25 起） |
+
+原 `Proposed` 决策门描述保留于 git 历史与 §5.2 / §47 的决议记录中；本文当前无未决 `Proposed` 事项。
 
 `Edge Core` 不是新的 Runtime Role。本文中的 `Edge Core` 指 Collector / Edge 可复用的内部核心层；Runtime Role 仍沿用既有 `Collector / Edge / Manager`。Runtime V2 第一实施对象是 **Collector Role**。
 
@@ -101,7 +107,7 @@ Runtime V2 第一阶段不做以下事情：
 - 不改变 WAL 的持久化语义。
 - 不强制所有 Driver 立即迁移到 ABI v2。
 - Driver Host 的进程隔离首先解决 crash/hang 可用性故障；MVP 不把同用户权限下的 Host 宣称为“恶意插件安全沙箱”。第三方不可信 Driver 的 seccomp/AppContainer/低权限账户等属于后续安全加固。
-- `Proposed(D2)`：Runtime V2 初期暂停增加新的工业协议 Driver；在路线图决策完成前不得把该建议当作已批准的产品计划变更。
+- **已批准(D2)**：Runtime V2 期间冻结新增工业协议 Driver（FINS / FOCAS / ADS 等），自 2026-08-25 起即时生效，Milestone B 验收通过后解除；详见 §47。
 
 ---
 
@@ -249,15 +255,20 @@ driver-runtime 接管
 
 > Driver Host 的隔离粒度必须显式声明。`per_driver` 会让同一 Host 内的多个连接共享进程故障域；需要“单连接 crash/hang 不影响其他连接”的 Driver 必须使用 `per_device`，或证明故障可在 session 内完成恢复而无需 kill 整个 Host。
 
-### 5.2 Proposed D1 — 自研 Rust Driver 的生产隔离政策
+### 5.2 Decision D1 — 自研 Rust Driver 的生产隔离政策（已批准）
 
-本文推荐：Phase 8 之后，**所有生产 Driver 默认经 Driver Host**，即使协议实现是 ForgeLink 自研 Rust。这样 Core 与协议实现不共享进程故障域。
+**D1 已于 2026-08-25 批准**，政策内容：
 
-这是比原架构“只对不稳定/闭源 SDK 提供 Process Plugin”更严格的政策收紧，必须在 Phase 0 RFC 中显式批准。D1 未批准前：
+- Phase 8 cutover 之后，**所有生产 Driver 必须经 Driver Host**，即使协议实现是 ForgeLink 自研 Rust；Core 与任何协议实现不共享进程故障域。
+- Pure Rust 自研 Driver 默认 `per_driver` 隔离。
+- 高风险 Vendor SDK 可/应提升到 `per_device`（`BlockingUninterruptible` 必须 `per_device`，见 §22.3）。
+- in-process 直接加载仅限开发与测试环境。
 
-- Runtime V2 仍必须完整实现 Host 路径；
-- `BlockingUninterruptible` / Vendor SDK 仍强制进 Host；
-- 自研 `AsyncCancelable` Driver 的 in-process 生产支持不得被默认承诺，只能保留为 Transitional 能力直到决策完成。
+这是比原架构“只对不稳定/闭源 SDK 提供 Process Plugin”更严格的政策收紧。由此确定：
+
+- Runtime V2 必须完整实现 Host 路径；
+- `BlockingUninterruptible` / Vendor SDK 强制进 Host；
+- 自研 Driver 的 in-process 生产运行支持不再保留——生产配置不得绕过 Host；in-process 仅作为开发/测试便利存在，不进入生产部署形态。
 
 ## 6. 新的模块职责
 
@@ -1607,7 +1618,7 @@ shared < per_driver < per_device
 
 ### 22.2 `per_driver`
 
-适用于 `AsyncCancelable`、ForgeLink 可控且稳定的协议实现；也是本文对 D1 的推荐默认值：
+适用于 `AsyncCancelable`、ForgeLink 可控且稳定的协议实现；是 D1 决议确认的 Pure Rust Driver 默认隔离级别：
 
 ```text
 s7comm-host
@@ -2470,12 +2481,11 @@ docs/architecture/runtime-v2.md
 
 必须在该 RFC 中明确：
 
-- D1：是否批准“所有生产 Driver 默认经 Host”的政策收紧；
-- D2：是否批准 Runtime V2 期间冻结新协议路线图；
+- 记录已批准的 D1 / D2 决议内容、决议日期（2026-08-25）与生效/解除条件（见 §1.1.1 / §5.2 / §47）；
 - `Edge Core` 与 `Collector / Edge / Manager` 的术语关系；
 - 本文的 Target / Transitional 生效点。
 
-在 D2 未批准前，不得把路线图冻结写进 AGENTS.md 成为既成事实。
+D2 已批准并即时生效；AGENTS.md 路线图冻结条目的同步更新须以独立 PR 记录，与本文 RFC 分开评审。
 
 ### 37.2 Phase 1 — Contract / ABI Split + Driver Package
 
@@ -2557,7 +2567,7 @@ DriverRegistry → HostSupervisor → HostClient
 
 - 默认 production runtime-v2 feature set 的 Collector 依赖树中不存在 `libloading` / `native-driver-loader`；
 - `legacy-native-runtime` 仅作为默认关闭的 Transitional feature 保留一个兼容版本；
-- 若 D1 已批准，生产配置禁止绕过 Host。
+- D1 已批准（2026-08-25）：Phase 8 后生产配置禁止绕过 Host，in-process 仅开发测试。
 
 ### 37.10 Phase 9 — Crash / Hang Isolation
 
@@ -2602,7 +2612,7 @@ S7 的协议 Reset 已在 Phase 10 完成；Phase 12 只做 ABI/runtime 迁移�
 
 | PR | 内容 |
 |---|---|
-| PR-1 | Runtime V2 RFC / D1-D2 decisions / terminology |
+| PR-1 | Runtime V2 RFC（记录 D1-D2 已批准决议）/ terminology |
 | PR-2 | `driver-contract` + `driver-abi` split + `driver-sdk` facade |
 | PR-3 | `driver-package` + Manifest v2 schema + four manifests/package scripts migration |
 | PR-4 | Multi Driver Registry |
@@ -2771,7 +2781,7 @@ legacy-native-runtime
 
 ### 43.2 R2：进程数增加
 
-`Proposed(D1)` 推荐自研可控 Driver 使用 `per_driver` 控制进程数；`BlockingUninterruptible` 必须 `per_device`。部署若要求严格单连接进程故障隔离，可把特定 Driver 提升到 `per_device`。
+D1 已批准：自研可控 Driver 默认 `per_driver` 控制进程数；`BlockingUninterruptible` 必须 `per_device`。部署若要求严格单连接进程故障隔离，可把特定 Driver 提升到 `per_device`。
 
 ### 43.3 R3：Runtime V2 迁移过大
 
@@ -2908,33 +2918,35 @@ Driver ABI v2 migration
 
 1. **S7 Protocol Reset 在 ABI v2 之前。** 先把协议模型做对，再做 ABI 迁移，避免两个风险面混在同一 PR。
 2. **Core `dlopen` 禁令在 Phase 8 cutover 后生效。** 此前 direct ABI v1 只是 Transitional。
-3. **D1 / D2 必须在 Phase 0 形成明确记录。** 不允许实现过程中悄悄把 Proposed 变成 Normative。
+3. **D1 / D2 已于 2026-08-25 批准并记录于 §1.1.1 / §5.2 / §47。** 后续任何规范级别（Normative/Target/Transitional）变更仍须显式记录，不允许实现过程中悄悄变更。
 
-## 47. Proposed D2 — Runtime V2 开发冻结
+## 47. Decision D2 — 协议扩展临时冻结（已批准）
 
-以下是**建议的路线图调整，不是已批准 Normative 规则**。
+**D2 已于 2026-08-25 批准，自决议起即时生效。** 这是正式生效的路线图规则，不再是建议。
 
-建议 Runtime V2 核心 cutover 前暂停新增：
+冻结范围（立即冻结）：
 
 ```text
 Omron FINS
 FANUC FOCAS
 Beckhoff ADS
-更多 PLC Driver
+更多 PLC Driver / 新增 Driver
 ABI v1 新能力
 ```
 
-允许：
+不受限（继续允许）：
 
 ```text
-严重 bug fix
+现有协议 bug fix
 安全修复
 协议正确性修复
 测试基础设施
-Runtime V2
+Runtime V2 全部工作
 ```
 
-批准方式：Phase 0 RFC / 产品路线图明确记录 D2。D2 未批准前，不得自行修改 AGENTS.md 把上述协议从既有路线图中删除；可以在具体 PR 中基于风险控制暂缓扩展，但不能宣称全局冻结已经生效。
+解除条件：**Milestone B（Fault Isolation，见 §51.2）验收通过后解除冻结。** 解除时须在路线图文档中显式记录解除决议与日期；在此之前，新协议 Driver 的提案一律推迟到解冻后评审。
+
+AGENTS.md 路线图中受影响条目（如 FOCAS V0.4）的同步修改以独立 PR 记录，引用本节作为依据。
 
 ## 48. Definition of Done
 
@@ -2976,7 +2988,7 @@ Runtime V2 完成后，ForgeLink 必须满足：
 
 > **Poll / Control 不直接调用 Driver。**
 
-> **高风险 Native / Vendor Driver 不进入 Core 故障域；若 D1 批准，则所有生产 Driver 均经 Host。**
+> **高风险 Native / Vendor Driver 不进入 Core 故障域；依 D1 决议，Phase 8 后所有生产 Driver 均经 Driver Host。**
 
 > **Mock 不定义协议真相。**
 
