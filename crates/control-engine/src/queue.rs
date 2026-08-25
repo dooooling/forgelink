@@ -248,11 +248,12 @@ impl DeviceQueue {
             }
         }
         // 运行中：按幂等键匹配才取消（§87 取消不得误伤其他请求）。
-        if let Some(running) = &inner.running {
-            if running.key.namespace == key.namespace && running.key.request_id == key.request_id {
-                running.cancel.cancel();
-                return CancelOutcome::Marked;
-            }
+        if let Some(running) = &inner.running
+            && running.key.namespace == key.namespace
+            && running.key.request_id == key.request_id
+        {
+            running.cancel.cancel();
+            return CancelOutcome::Marked;
         }
         CancelOutcome::NotFound
     }
@@ -658,8 +659,10 @@ enum PickedKind {
 }
 
 /// 执行结果（引擎结算用）。
+///
+/// `Done` 装箱削减变体尺寸——结算路径只在终态读取一次，堆分配无影响。
 enum RunResult {
-    Done(ControlResult),
+    Done(Box<ControlResult>),
     Timeout,
     Cancelled,
     /// 执行器在飞行中被超时/取消/中止打断，结果未知（§80.1：不得宣称未执行）。
@@ -702,7 +705,7 @@ async fn run_entry(ctx: &Arc<EngineContext>, entry: &QueuedEntry) -> RunResult {
                 RunResult::Cancelled
             }
         }
-        outcome = &mut executor_fut => RunResult::Done(outcome),
+        outcome = &mut executor_fut => RunResult::Done(Box::new(outcome)),
     }
 }
 
@@ -906,7 +909,7 @@ async fn settle_entry(
     // 终态计数按状态归类。
     ctx.metrics.observe_settled_exit(&entry.key.device_id);
     let mut result = match run {
-        RunResult::Done(result) => result,
+        RunResult::Done(result) => *result,
         RunResult::Timeout => ControlResult {
             request_id: entry.key.request_id.clone(),
             namespace: entry.key.namespace.clone(),
@@ -1041,25 +1044,29 @@ async fn settle_entry(
             ctx.policy.audit_timeout_ms,
             deadline,
             crate::audit::build_event(
-                &entry.subject,
-                &entry.source,
-                &entry.key.namespace,
-                &entry.key.device_id,
-                &entry.key.request_id,
+                crate::audit::AuditEventContext {
+                    user: &entry.subject,
+                    source: &entry.source,
+                    namespace: &entry.key.namespace,
+                    device_id: &entry.key.device_id,
+                    request_id: &entry.key.request_id,
+                },
                 entry.audit_meta.operation,
                 &entry.audit_meta.target,
                 &entry.audit_meta.parameters,
                 entry.audit_meta.risk_level,
-                result.status,
-                result.error.as_ref().map(|e| e.code.clone()),
-                result.result.as_ref().and_then(|r| match r {
-                    observation_model::ControlPayloadResult::PropertyWrite(items) => {
-                        items.iter().find_map(|i| i.protocol_code)
-                    }
-                    observation_model::ControlPayloadResult::Command(c) => c.device_code,
-                }),
-                duration_ms,
-                completed_at_ns,
+                crate::audit::AuditEventOutcome {
+                    status: result.status,
+                    error_code: result.error.as_ref().map(|e| e.code.clone()),
+                    protocol_code: result.result.as_ref().and_then(|r| match r {
+                        observation_model::ControlPayloadResult::PropertyWrite(items) => {
+                            items.iter().find_map(|i| i.protocol_code)
+                        }
+                        observation_model::ControlPayloadResult::Command(c) => c.device_code,
+                    }),
+                    duration_ms,
+                    occurred_at_ns: completed_at_ns,
+                },
             ),
         )
         .await;

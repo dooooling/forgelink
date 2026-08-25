@@ -263,7 +263,7 @@ impl FileJournal {
                         }
                         let entry = entries.get_mut(&key).expect("已确认存在");
                         entry.status = result.status;
-                        entry.result = Some(result.clone());
+                        entry.result = Some(*result);
                     }
                 }
             }
@@ -330,7 +330,7 @@ impl FileJournal {
             if let Some(result) = &entry.result {
                 let settle = Record::Settle {
                     key: entry.key.clone(),
-                    result: result.clone(),
+                    result: Box::new(result.clone()),
                 };
                 let line = serde_json::to_string(&settle)?;
                 writeln!(out, "{line}")?;
@@ -375,14 +375,9 @@ impl From<std::io::Error> for JournalError {
 }
 
 impl From<serde_json::Error> for JournalError {
-    fn from(e: serde_json::Error) -> Self {
-        JournalError::Corrupt { line: 0 }.from_json(e)
-    }
-}
-
-impl JournalError {
-    fn from_json(self, _inner: serde_json::Error) -> Self {
-        self
+    fn from(_e: serde_json::Error) -> Self {
+        // JSON 反序列化失败一律按 Corrupt fail-closed（行号未知置 0）。
+        JournalError::Corrupt { line: 0 }
     }
 }
 
@@ -395,15 +390,15 @@ impl ControlJournal for FileJournal {
         expires_at_ns: TimestampNs,
     ) -> Result<JournalDecision, JournalError> {
         let mut inner = self.inner.lock().expect("FileJournal 锁被毒化");
-        if let Some(existing) = inner.entries.get(key) {
-            if existing.expires_at_ns >= created_at_ns {
-                if existing.payload_hash == payload_hash {
-                    return Ok(JournalDecision::Duplicate(existing.clone()));
-                }
-                return Ok(JournalDecision::Conflict {
-                    existing: existing.clone(),
-                });
+        if let Some(existing) = inner.entries.get(key)
+            && existing.expires_at_ns >= created_at_ns
+        {
+            if existing.payload_hash == payload_hash {
+                return Ok(JournalDecision::Duplicate(existing.clone()));
             }
+            return Ok(JournalDecision::Conflict {
+                existing: existing.clone(),
+            });
         }
         let entry = JournalEntry {
             key: key.clone(),
@@ -436,7 +431,7 @@ impl ControlJournal for FileJournal {
         // 的内外不一致。
         let record = Record::Settle {
             key: key.clone(),
-            result: result.clone(),
+            result: Box::new(result.clone()),
         };
         Self::write_record(&mut inner, &record)?;
         let entry = inner.entries.get_mut(key).expect("已确认存在");
@@ -536,6 +531,9 @@ pub(crate) async fn purge_and_get(
 }
 
 /// 日志记录（JSONL 行的种类）。
+///
+/// `Settle.result`（`ControlResult`）装箱削减变体尺寸——JSONL 行是
+/// 逐行解析的冷数据，堆分配无热路径影响。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Record {
     Insert {
@@ -547,7 +545,7 @@ enum Record {
     },
     Settle {
         key: IdempotencyKey,
-        result: ControlResult,
+        result: Box<ControlResult>,
     },
 }
 

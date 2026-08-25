@@ -45,6 +45,11 @@ const FIXED_OVERHEAD_PER_RECORD: usize = 512;
 /// SQLite schema 版本（§103 Embedded DB；非法版本 = 损坏，明确报错）。
 const SCHEMA_VERSION: i64 = 1;
 
+/// `open_db` 的启动状态：连接、恢复加载的内存窗口记录、
+/// （本地序号水位，磁盘容量占用，恢复水位，下一本地序号）。
+/// 元组字段语义见 [`open_db`] 文档；以类型别名收敛复杂度。
+type OpenedDb = (Connection, Vec<MemRecord>, i64, u64, i64, i64);
+
 /// 表结构：一条记录 = 一个完整 `ObservationBatch`（§31.4 WAL 持久化
 /// 单位为完整 Batch，与 MQTT 发布单位一致）。
 const CREATE_BATCHES: &str = r#"
@@ -224,9 +229,7 @@ pub(crate) fn telemetry_topic(batch: &ObservationBatch) -> Result<String, LocalB
 /// 恢复的记录统一视为补传（P2-1/P2-2，§31.4）：从未发送过的记录
 /// 也标记补传。用**会话内恢复水位**（磁盘上当前最大本地序号）实现，
 /// 不修改数据库（避免启动时全表 UPDATE 的写入放大）。
-fn open_db(
-    config: &LocalBufferConfig,
-) -> Result<(Connection, Vec<MemRecord>, i64, u64, i64, i64), LocalBufferError> {
+fn open_db(config: &LocalBufferConfig) -> Result<OpenedDb, LocalBufferError> {
     let conn = Connection::open(&config.db_path).map_err(|e| {
         // 非 SQLite 文件（SQLITE_NOTADB）与打不开（路径/权限）分开描述。
         if matches!(e, rusqlite::Error::SqliteFailure(err, _) if err.code == rusqlite::ErrorCode::NotADatabase)
@@ -638,7 +641,7 @@ fn check_pending_confirm(conn: &mut Connection, state: &mut WorkerState) -> bool
 /// 启动数据以元组传入（open_db 结果），保持参数数量在 Clippy
 /// 阈值内。
 fn worker_loop(
-    opened: (Connection, Vec<MemRecord>, i64, u64, i64, i64),
+    opened: OpenedDb,
     config: LocalBufferConfig,
     mut rx: mpsc::Receiver<Cmd>,
     closed: &AtomicBool,

@@ -316,16 +316,6 @@ impl RestApiServer {
     }
 }
 
-/// 组装只读路由（§31.5 最小资源路径 + §104 健康检查）。
-///
-/// 未匹配路径（404）与不支持的 method（405）都返回统一 §31.6 错误
-/// 载荷（含 request_id）；`/controls` 等控制路由不存在于本只读契约
-/// （启用 `control` feature 时也仅 [`Self::spawn_with_control`] 挂载，
-/// 本函数保持纯只读语义，供既有调用方与测试复用）。
-pub(crate) fn router(state: Arc<dyn ApiState>, concurrency: Arc<Semaphore>) -> Router {
-    router_with_options(state, None, concurrency)
-}
-
 /// 统一路由组装入口：只读路由 + 可选 metrics 注册表（§34.2.1）。
 ///
 /// 未匹配路径（404）与不支持的 method（405）都返回统一 §31.6 错误
@@ -726,7 +716,7 @@ mod tests {
     }
 
     fn app(state: Arc<dyn ApiState>) -> Router {
-        router(state, Arc::new(Semaphore::new(64)))
+        router_with_options(state, None, Arc::new(Semaphore::new(64)))
     }
 
     /// 带 metrics 注册表的测试装配（§34.2.1 metrics 端点）。
