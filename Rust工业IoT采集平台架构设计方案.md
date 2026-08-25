@@ -2427,11 +2427,13 @@ Linux ARM64 的峰值性能可以与 x64 不同，但功能契约必须一致。
 
 ## 34.6 MVP Driver Roadmap
 
+> **D2 冻结标注（2026-08-25）**：依据 Runtime V2 方案 §47（Decision D2 — 协议扩展临时冻结，已批准），下表中标 ❄ 的条目自 2026-08-25 起冻结，至 Milestone B（Fault Isolation，§51.2）验收通过解除；解除时须在本文显式记录。冻结期内新协议 Driver 提案一律推迟。
+
 ```text
 MVP: Modbus TCP / RTU
 V0.2: Siemens S7comm
-V0.3: EtherNet/IP + Mitsubishi MC + Omron FINS
-V0.4: FANUC FOCAS Process Plugin
+V0.3: EtherNet/IP + Mitsubishi MC + Omron FINS（❄ FINS 冻结）
+V0.4: FANUC FOCAS Process Plugin（❄ 冻结）
 ```
 
 每增加一个 Driver，都必须通过同一套 Driver Contract、Quality、Timeout、Reconnect、Batch 与 ABI/Process isolation 测试。

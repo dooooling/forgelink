@@ -21,7 +21,8 @@
 - Runtime Role（collector/edge/manager）与 domain/driver/profile 正交。Collector 通过 Cargo feature 禁用控制，并设置运行时 `read_only`；只读版本不得暴露控制入口。
 - Driver 支持 Static、Native Plugin、Process Plugin。Native Plugin 仅使用稳定 C ABI：`cdylib`、`forgelink_driver_entry_v1()`、ABI 版本校验和 `libloading`；禁止跨 FFI 暴露 Rust trait 或 `async fn`。Vendor SDK 优先使用 Process Plugin 隔离。
 - 目标平台：Windows x64、Linux x64、Linux ARM64。
-- MVP：Modbus、Poll Engine、MQTT 输出、Local Buffer、REST API 只读、REST 控制链路（Control Engine、driver-write）均已交付；S7、CIP、FOCAS 等按文档阶段推进。
+- MVP：Modbus、Poll Engine、MQTT 输出、Local Buffer、REST API 只读、REST 控制链路（Control Engine、driver-write）均已交付；S7、CIP 已交付。
+- **协议扩展冻结（D2，2026-08-25 批准）**：Omron FINS、FANUC FOCAS、Beckhoff ADS 及其他新协议 Driver 与 ABI v1 新能力一律暂停，至 Runtime V2 Milestone B（§51.2）验收通过解除；现有协议 bug fix、安全修复、协议正确性修复、测试基础设施与 Runtime V2 全部工作不受限。依据：`docs/FORGLINK_RUNTIME_V2_IMPLEMENTATION_PLAN.md` §47（路线图标注见架构设计文档 §34.6）。
 
 ## 实施约定
 
