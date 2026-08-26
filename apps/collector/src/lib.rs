@@ -17,6 +17,7 @@ pub mod config;
 mod control;
 pub mod error;
 pub mod health;
+pub mod preflight;
 pub mod rest;
 mod runtime;
 mod tasks;

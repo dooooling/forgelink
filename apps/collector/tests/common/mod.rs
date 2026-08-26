@@ -280,6 +280,47 @@ pub fn parse_batch(payload: &[u8]) -> serde_json::Value {
     serde_json::from_slice(payload).expect("Telemetry Batch 应可解析")
 }
 
+/// 构造单包 sandbox：`<dir>/<name>/{driver.json, artifact}`（sha256 缺省，
+/// 开发态 dev policy，scanner 记录实测值——发布回填由打包脚本负责）。
+#[allow(dead_code)] // multi_driver / preflight 测试使用
+pub fn write_v2_package(
+    dir: &std::path::Path,
+    name: &str,
+    id: &str,
+    artifact_src: &std::path::Path,
+) -> PathBuf {
+    let root = dir.join(name);
+    std::fs::create_dir_all(&root).expect("建包目录失败");
+    let artifact_file = artifact_src
+        .file_name()
+        .expect("产物文件名")
+        .to_str()
+        .expect("UTF-8 文件名")
+        .to_owned();
+    std::fs::copy(artifact_src, root.join(&artifact_file)).expect("复制产物失败");
+    let platform = driver_package::DriverManifestV2::current_platform();
+    let manifest = format!(
+        r#"{{
+  "schema_version": "2.0",
+  "id": "{id}",
+  "name": "{id}",
+  "version": "0.1.0",
+  "abi": {{ "major": 1, "minor": 0 }},
+  "artifacts": {{
+    "{platform}": {{ "path": "{artifact_file}" }}
+  }},
+  "runtime": {{
+    "kind": "native",
+    "execution_model": "blocking_bounded",
+    "minimum_isolation": "per_driver",
+    "default_isolation": "per_driver"
+  }}
+}}"#
+    );
+    std::fs::write(root.join("driver.json"), manifest).expect("写 manifest 失败");
+    root
+}
+
 /// 等待（默认 5s 内）条件满足。
 #[allow(dead_code)] // e2e/resilience/rest 各测试按需使用
 pub async fn wait_until<F>(cond: F)

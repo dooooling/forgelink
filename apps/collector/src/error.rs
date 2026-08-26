@@ -58,6 +58,9 @@ pub enum CollectorError {
     /// 控制链路装配/停机失败（§81/§90：凭据缺失、Journal 打开失败、
     /// 策略非法等——fail-closed，启动即失败不静默降级）。
     Control(String),
+    /// Startup Preflight 失败（Runtime V2 方案 §29：任一配置/契约预检
+    /// 不通过即 fail-fast——no partial start、no silent device disable）。
+    Preflight(crate::preflight::PreflightFailure),
     /// 运行期任务异常终止。
     Task(String),
     /// 停机超时（有限排空期限内未完成）。
@@ -113,6 +116,7 @@ impl fmt::Display for CollectorError {
             Self::Mqtt(e) => write!(f, "MQTT 客户端失败: {e}"),
             Self::Rest(e) => write!(f, "REST 接口启动失败: {e}"),
             Self::Control(e) => write!(f, "控制链路错误: {e}"),
+            Self::Preflight(pf) => write!(f, "{pf}"),
             Self::Task(e) => write!(f, "运行时任务异常: {e}"),
             Self::ShutdownTimeout { stage } => write!(f, "停机超时（{stage} 未在期限内完成）"),
             Self::Io { context, reason } => write!(f, "{context} 失败: {reason}"),

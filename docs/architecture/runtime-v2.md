@@ -101,7 +101,7 @@ Phase 2～7 仅允许 `legacy-native-runtime` 迁移路径直接加载 ABI v1；
 | PR-2 | `driver-contract` + `driver-abi` split + `driver-sdk` facade | 1 | ✅ #34 已合并（2026-08-25） |
 | PR-3 | `driver-package` + Manifest v2 + 四包迁移 | 1 | ✅ #36 已合并（2026-08-25） |
 | PR-4 | Multi Driver Registry | 2 | ✅ #38 已合并（2026-08-26） |
-| PR-5 | Startup Preflight | 3 | 🔄 下一步 |
+| PR-5 | Startup Preflight | 3 | 🔄 本 PR |
 | PR-6 | DeviceActor / SessionSupervisor + device-manager adapter | 4 | ⬜ 未开始 |
 | PR-7 | Poll → DeviceActor + Quality regression | 5 | ⬜ 未开始 |
 | PR-8 | Control → DeviceActor + Indeterminate regression | 5 | ⬜ 未开始 |

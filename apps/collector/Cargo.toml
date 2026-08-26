@@ -107,3 +107,7 @@ rest-api = { path = "../../crates/rest-api", features = ["test-utils"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "time"] }
+
+# 测试直接引用 driver-package 的平台常量（common::write_v2_package）；
+# 主依赖经 driver-read feature 引入，此处保证 tests 目标始终可用。
+driver-package = { path = "../../crates/driver-package" }
