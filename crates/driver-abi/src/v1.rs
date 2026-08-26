@@ -17,9 +17,6 @@
 //! 谁分配，谁释放：Plugin 返回的 owned buffer 必须通过 `free_buffer` 释放；
 //! 请求参数默认由 Core 持有，Plugin 只能在调用期内借用。
 
-pub mod envelope;
-pub mod tag;
-
 use std::ffi::c_void;
 
 /// ABI 主版本（§18）：`Core 1.x 可加载 Plugin 1.0 ~ 1.x，不能加载 2.x`。

@@ -354,6 +354,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-abi"
+version = "0.1.0"
+dependencies = [
+ "driver-contract",
+ "observation-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "driver-contract"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "observation-model",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "driver-ether-ip"
 version = "0.1.0"
 dependencies = [
@@ -431,6 +452,8 @@ name = "driver-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "driver-abi",
+ "driver-contract",
  "observation-model",
  "serde",
  "serde_json",
