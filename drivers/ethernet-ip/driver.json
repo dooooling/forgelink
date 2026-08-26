@@ -1,15 +1,22 @@
 {
+  "schema_version": "2.0",
   "id": "ethernet-ip",
   "name": "EtherNet/IP CIP",
-  "version": "0.1.0",
-  "entry": "forgelink_driver_entry_v1",
+  "version": "0.3.0",
   "abi": {
     "major": 1,
     "minor": 0
   },
-  "platforms": [
-    "windows-x86_64",
-    "linux-x86_64",
-    "linux-aarch64"
-  ]
+  "artifacts": {
+    "windows-x86_64": { "path": "driver_ether_ip.dll", "sha256": null },
+    "linux-x86_64": { "path": "libdriver_ether_ip.so", "sha256": null },
+    "linux-aarch64": { "path": "libdriver_ether_ip.so", "sha256": null }
+  },
+  "runtime": {
+    "kind": "native",
+    "execution_model": "blocking_bounded",
+    "minimum_isolation": "per_driver",
+    "default_isolation": "per_driver"
+  },
+  "min_core_version": "0.1.0"
 }
