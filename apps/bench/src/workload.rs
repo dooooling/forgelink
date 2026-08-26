@@ -103,7 +103,7 @@ pub fn generate(env: &GenerateEnv<'_>, plan: &WorkloadPlan) -> io::Result<Worklo
         site_id: SITE_ID.to_owned(),
         session_id: None,
         profiles_dir,
-        driver: DriverSpec {
+        driver: Some(DriverSpec {
             plugin: env.plugin_path.to_path_buf(),
             manifest: ManifestSpec {
                 id: "modbus-tcp".to_owned(),
@@ -111,7 +111,8 @@ pub fn generate(env: &GenerateEnv<'_>, plan: &WorkloadPlan) -> io::Result<Worklo
                 version: "0.1.0".to_owned(),
                 abi: AbiSpec { major: 1, minor: 0 },
             },
-        },
+        }),
+        drivers: Default::default(),
         devices,
         northbound: NorthboundConfig {
             mqtt: MqttOptions {

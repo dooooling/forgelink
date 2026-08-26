@@ -133,6 +133,13 @@ pub fn write_profiles(dir: &Path) {
     std::fs::create_dir_all(dir.join("profiles")).expect("创建 profiles 目录");
     std::fs::write(dir.join("profiles/inovance-md500.json"), profile_json())
         .expect("写入 Profile 文件");
+    // S7 Profile（multi_driver 测试引用；源文件随仓库维护）。
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    std::fs::copy(
+        repo_root.join("deploy/profiles/siemens-s7-demo.json"),
+        dir.join("profiles/siemens-s7-demo.json"),
+    )
+    .expect("复制 S7 Profile 失败");
 }
 
 /// 测试 Harness：Mock Modbus + 临时目录 + 完整 Collector 配置。
@@ -164,7 +171,7 @@ impl Harness {
             site_id: "plant-a".to_owned(),
             session_id: None,
             profiles_dir: temp.path().join("profiles"),
-            driver: DriverSpec {
+            driver: Some(DriverSpec {
                 plugin: plugin_file(),
                 manifest: ManifestSpec {
                     id: "modbus-tcp".to_owned(),
@@ -172,7 +179,8 @@ impl Harness {
                     version: "0.1.0".to_owned(),
                     abi: AbiSpec { major: 1, minor: 0 },
                 },
-            },
+            }),
+            drivers: Default::default(),
             devices: vec![DeviceSpec {
                 id: "vfd-01".to_owned(),
                 name: None,
@@ -273,6 +281,7 @@ pub fn parse_batch(payload: &[u8]) -> serde_json::Value {
 }
 
 /// 等待（默认 5s 内）条件满足。
+#[allow(dead_code)] // e2e/resilience/rest 各测试按需使用
 pub async fn wait_until<F>(cond: F)
 where
     F: FnMut() -> bool,

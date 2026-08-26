@@ -31,7 +31,6 @@ use std::time::Duration;
 
 use device_manager::{DeviceManager, NativeDriverFactory};
 use driver_loader::NativePlugin;
-use driver_sdk::DriverManifest;
 use observation_model::Device;
 use poll_engine::PollScheduler;
 use tokio::sync::{mpsc, watch};
@@ -123,32 +122,90 @@ impl CollectorRuntime {
             "Device Profile 已加载"
         );
 
-        // 2) Load Driver（§19/§20：Native Plugin + Manifest）。
-        let manifest = DriverManifest {
-            id: config.driver.manifest.id.clone(),
-            name: config.driver.manifest.name.clone(),
-            version: config.driver.manifest.version.clone(),
-            entry: driver_sdk::abi::ENTRY_SYMBOL.to_owned(),
-            abi: driver_sdk::manifest::AbiVersion {
-                major: config.driver.manifest.abi.major,
-                minor: config.driver.manifest.abi.minor,
-            },
-            platforms: vec![],
-        };
-        let plugin = Arc::new(
-            NativePlugin::load(&config.driver.plugin, manifest)
-                .map_err(|e| CollectorError::Driver(Box::new(e)))?,
-        );
-        info!(
-            component = "collector",
-            plugin = %config.driver.plugin.display(),
-            driver_id = %config.driver.manifest.id,
-            "Driver 已加载"
-        );
+        // 2) Load Driver（Runtime V2 方案 §37.3 Multi Driver Registry）。
+        //
+        // 二选一（config.validate 已保证互斥）：
+        // - `drivers.directories`：扫描 Driver Package（driver.json 唯一
+        //   事实来源，§7），同一 Collector 注册多个不同 Driver；
+        // - legacy `driver:`（Transitional §41.1）：打印
+        //   COLLECTOR_CONFIG_DRIVER_DEPRECATED 后按既有单插件路径装配。
         let mut factory = NativeDriverFactory::new();
-        factory
-            .add_plugin(plugin)
-            .map_err(|e| CollectorError::Driver(Box::new(e)))?;
+        if !config.drivers.directories.is_empty() {
+            for dir in &config.drivers.directories {
+                let packages = driver_package::scan_directories(std::slice::from_ref(dir))
+                    .map_err(|e| CollectorError::Driver(Box::new(e)))?;
+                for package in packages {
+                    // 隔离覆盖只允许相同或更严格（§7/§8）；身份元数据不可
+                    // 覆盖——此处仅校验方向，实际 Host 拓扑在 Phase 7+ 生效。
+                    if let Some(override_iso) = config.drivers.isolation_overrides.get(package.id())
+                    {
+                        let minimum = package.manifest.runtime.minimum_isolation;
+                        let chosen: driver_package::Isolation = (*override_iso).into();
+                        if chosen < minimum {
+                            return Err(CollectorError::Driver(Box::new(
+                                driver_package::ScanError::Artifact {
+                                    path: package.root.clone(),
+                                    platform: String::new(),
+                                    reason: format!(
+                                        "isolation_overrides[{id}]={chosen:?} 低于 Manifest 安全下限 {minimum:?}",
+                                        id = package.id()
+                                    ),
+                                },
+                            )));
+                        }
+                    }
+                    let plugin = Arc::new(
+                        NativePlugin::load(&package.artifact_path, synthetic_manifest(&package))
+                            .map_err(|e| CollectorError::Driver(Box::new(e)))?,
+                    );
+                    factory
+                        .add_plugin(plugin)
+                        .map_err(|e| CollectorError::Driver(Box::new(e)))?;
+                    info!(
+                        component = "collector",
+                        driver_id = %package.id(),
+                        version = %package.version(),
+                        artifact = %package.artifact_path.display(),
+                        "Driver Package 已注册"
+                    );
+                }
+            }
+            let count = config.drivers.directories.len();
+            info!(
+                component = "collector",
+                directories = %config
+                    .drivers
+                    .directories
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                %count,
+                "Driver Package 目录扫描完成"
+            );
+        } else if config.legacy_driver_provided() {
+            warn!(
+                component = "collector",
+                code = "COLLECTOR_CONFIG_DRIVER_DEPRECATED",
+                "legacy `driver:` 配置段已废弃（方案 §41.1）：请迁移到 `drivers.directories` \
+                 Package 扫描；本版本仍按单插件路径装配，下一 major 删除"
+            );
+            let spec = config.driver.as_ref().expect("legacy_driver_provided 为真");
+            let manifest = legacy_manifest(spec);
+            let plugin = Arc::new(
+                NativePlugin::load(&spec.plugin, manifest)
+                    .map_err(|e| CollectorError::Driver(Box::new(e)))?,
+            );
+            info!(
+                component = "collector",
+                plugin = %spec.plugin.display(),
+                driver_id = %spec.manifest.id,
+                "Driver 已加载（legacy 单插件路径）"
+            );
+            factory
+                .add_plugin(plugin)
+                .map_err(|e| CollectorError::Driver(Box::new(e)))?;
+        }
 
         // 3) 构造设备（domain 缺省取 Profile 决定，§100 device.yaml），
         //    随后注册绑定 Driver/Profile 并生成读取项（§37）。
@@ -790,5 +847,41 @@ impl CollectorRuntime {
             return Err(e);
         }
         Ok(())
+    }
+}
+
+/// 由 Driver Package Descriptor 构造 ABI v1 加载用 Manifest（Transitional）。
+///
+/// Package Manifest（v2）是元数据唯一事实来源（§7）；本函数只做字段搬运，
+/// 供现有 `NativePlugin::load`（ABI v1 校验路径）消费。Host 路径落地后
+/// （Phase 7+）此转换随 direct ABI v1 runtime 一并删除。
+fn synthetic_manifest(
+    package: &driver_package::DriverPackageDescriptor,
+) -> driver_sdk::DriverManifest {
+    driver_sdk::DriverManifest {
+        id: package.manifest.id.clone(),
+        name: package.manifest.name.clone(),
+        version: package.manifest.version.clone(),
+        entry: driver_sdk::abi::ENTRY_SYMBOL.to_owned(),
+        abi: driver_sdk::manifest::AbiVersion {
+            major: package.manifest.abi.major,
+            minor: package.manifest.abi.minor,
+        },
+        platforms: vec![],
+    }
+}
+
+/// legacy `driver:` 段 → 加载用 Manifest（§41.1 兼容路径，下一 major 删除）。
+fn legacy_manifest(spec: &crate::config::DriverSpec) -> driver_sdk::DriverManifest {
+    driver_sdk::DriverManifest {
+        id: spec.manifest.id.clone(),
+        name: spec.manifest.name.clone(),
+        version: spec.manifest.version.clone(),
+        entry: driver_sdk::abi::ENTRY_SYMBOL.to_owned(),
+        abi: driver_sdk::manifest::AbiVersion {
+            major: spec.manifest.abi.major,
+            minor: spec.manifest.abi.minor,
+        },
+        platforms: vec![],
     }
 }

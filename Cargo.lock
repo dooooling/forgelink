@@ -206,6 +206,7 @@ dependencies = [
  "diagnostics",
  "domain-model",
  "driver-loader",
+ "driver-package",
  "driver-sdk",
  "local-buffer",
  "metrics",

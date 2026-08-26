@@ -2,7 +2,11 @@
   "id": "siemens-s7-demo",
   "vendor": "Siemens",
   "family": "S7",
-  "models": ["S7-1200", "S7-1500", "S7-300"],
+  "models": [
+    "S7-1200",
+    "S7-1500",
+    "S7-300"
+  ],
   "domain": "plc",
   "driver_id": "s7comm",
   "properties": [
@@ -12,7 +16,7 @@
       "raw_type": "bool",
       "value_type": "bool",
       "unit": null,
-      "scale": 1.0,
+      "scale": 0.0,
       "offset": 0.0,
       "write_rounding": "exact",
       "readable": true,

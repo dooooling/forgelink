@@ -38,6 +38,7 @@ control = [
 driver-read = [
     "dep:device-manager",
     "dep:driver-loader",
+    "dep:driver-package",
     "dep:driver-sdk",
     "dep:poll-engine",
     "dep:profile-engine",
@@ -71,6 +72,7 @@ device-manager = { path = "../../crates/device-manager", optional = true }
 diagnostics = { path = "../../crates/diagnostics", optional = true }
 domain-model = { path = "../../crates/domain-model", optional = true }
 driver-loader = { path = "../../crates/driver-loader", optional = true }
+driver-package = { path = "../../crates/driver-package", optional = true }
 driver-sdk = { path = "../../crates/driver-sdk", optional = true }
 observation-model = { path = "../../crates/observation-model", optional = true }
 poll-engine = { path = "../../crates/poll-engine", optional = true }
