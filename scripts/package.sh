@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ForgeLink 发布打包（Linux x64 / ARM64）。
 #
-# 产出目录布局（§19/§20 部署形态）：
+# 产出目录布局（§19/§20 部署形态；Runtime V2 §7：driver.json 为 Package
+# 元数据唯一事实来源，发布时回填当前平台 artifact sha256）：
 #   dist/forgelink-{version}-{platform}/
 #   ├── collector
 #   ├── drivers/modbus/{libdriver_modbus.so, driver.json}
@@ -52,9 +53,30 @@ mkdir -p "$ROOT/drivers/modbus" "$ROOT/config" "$ROOT/profiles"
 
 cp "$COLLECTOR_BIN" "$ROOT/collector"
 cp "$PLUGIN_SO" "$ROOT/drivers/modbus/libdriver_modbus.so"
-cp drivers/modbus/driver.json "$ROOT/drivers/modbus/driver.json"
+
+# Manifest v2（§7.1 规则 4）：发布打包必须校验当前平台 artifact 实际存在，
+# 并计算 SHA-256 回填到 manifest 的当前平台条目（其余平台条目保持 null，
+# Runtime 只验证当前平台 artifact）。python3 仅用于 JSON 安全读写。
+MANIFEST_SRC="drivers/modbus/driver.json"
+SCHEMA=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['schema_version'])" "$MANIFEST_SRC")
+if [[ "$SCHEMA" != "2.0" ]]; then
+    echo "$MANIFEST_SRC 不是 Manifest v2（schema_version=$SCHEMA）" >&2; exit 1
+fi
+ARTIFACT_PATH=$(python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(m['artifacts']['$PLATFORM']['path'])" "$MANIFEST_SRC")
+if [[ ! -f "$ROOT/drivers/modbus/$ARTIFACT_PATH" ]]; then
+    echo "manifest 声明的 artifact 不存在：$ROOT/drivers/modbus/$ARTIFACT_PATH" >&2; exit 1
+fi
+HASH=$(sha256sum "$ROOT/drivers/modbus/$ARTIFACT_PATH" | cut -d' ' -f1)
+python3 - "$MANIFEST_SRC" "$ROOT/drivers/modbus/driver.json" "$PLATFORM" "$HASH" <<'PYEOF'
+import json, sys
+src, dst, platform, sha = sys.argv[1:5]
+m = json.load(open(src))
+m["artifacts"][platform]["sha256"] = sha
+json.dump(m, open(dst, "w"), indent=2)
+PYEOF
+
 cp deploy/collector.example.yaml "$ROOT/config/collector.example.yaml"
 cp deploy/profiles/inovance-md500.json "$ROOT/profiles/inovance-md500.json"
 cp deploy/PLATFORM-CHECKLIST.md "$ROOT/PLATFORM-CHECKLIST.md"
 
-echo "打包完成：$ROOT"
+echo "打包完成：$ROOT（modbus-tcp artifact sha256=$HASH）"

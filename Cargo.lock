@@ -433,6 +433,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-package"
+version = "0.1.0"
+dependencies = [
+ "driver-contract",
+ "observation-model",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "driver-s7comm"
 version = "0.1.0"
 dependencies = [
