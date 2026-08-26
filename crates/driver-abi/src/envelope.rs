@@ -20,12 +20,12 @@
 use observation_model::{DriverErrorInfo, RawReadResult};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::items::DriverCommand;
-use crate::results::{
+use driver_contract::items::DriverCommand;
+use driver_contract::results::{
     AddressMetadata, DriverBrowseNode, RawCommandResult, RawEvent, RawHistoryPage, RawWriteResult,
     SubscriptionRequest,
 };
-use crate::{HistoryRequest, ProtocolCapabilities};
+use driver_contract::{HistoryRequest, ProtocolCapabilities};
 
 /// 本 SDK 实现的 ABI 版本对应的 Envelope schema 版本（ABI 1.0）。
 pub const SCHEMA_VERSION: &str = "1.0";
@@ -268,7 +268,7 @@ mod tests {
     use observation_model::{RawValue, TimestampNs};
 
     use super::*;
-    use crate::results::RawEventKind;
+    use driver_contract::results::RawEventKind;
 
     #[test]
     fn read_envelope_exact_json() {

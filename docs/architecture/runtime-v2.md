@@ -97,8 +97,8 @@ Phase 2～7 仅允许 `legacy-native-runtime` 迁移路径直接加载 ABI v1；
 | PR | 内容（方案 §38） | 对应 Phase | 状态 |
 |---|---|---|---|
 | PR-0 | clippy 存量清零（§39 门禁前置条件） | — | ✅ #32 已合并（2026-08-25） |
-| PR-1 | Runtime V2 RFC / terminology（本文件） | 0 | 🔄 进行中 |
-| PR-2 | `driver-contract` + `driver-abi` split + `driver-sdk` facade | 1 | ⬜ 未开始 |
+| PR-1 | Runtime V2 RFC / terminology（本文件） | 0 | ✅ #33 已合并（2026-08-25） |
+| PR-2 | `driver-contract` + `driver-abi` split + `driver-sdk` facade | 1 | 🔄 本 PR |
 | PR-3 | `driver-package` + Manifest v2 + 四包迁移 | 1 | ⬜ 未开始 |
 | PR-4 | Multi Driver Registry | 2 | ⬜ 未开始 |
 | PR-5 | Startup Preflight | 3 | ⬜ 未开始 |

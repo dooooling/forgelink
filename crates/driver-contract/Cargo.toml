@@ -1,5 +1,5 @@
 [package]
-name = "driver-sdk"
+name = "driver-contract"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,8 +7,6 @@ license.workspace = true
 
 [dependencies]
 observation-model = { path = "../observation-model" }
-driver-contract = { path = "../driver-contract" }
-driver-abi = { path = "../driver-abi" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
