@@ -33,8 +33,23 @@ pub struct CollectorConfig {
     #[serde(default = "default_profiles_dir")]
     pub profiles_dir: PathBuf,
     /// 协议 Driver（Native Plugin，§19/§20：cdylib + Manifest）。
+    ///
+    /// **Legacy 配置（Transitional，方案 §41.1 / §37.3）**：Runtime V2 起
+    /// 使用 `drivers:` 段（[`CollectorConfig::drivers`]，Driver Package
+    /// 目录扫描）。本字段保留反序列化兼容：启动时若显式提供则打印
+    /// `COLLECTOR_CONFIG_DRIVER_DEPRECATED` 警告并转换为 synthetic
+    /// package 注册（[`CollectorConfig::legacy_driver_provided`]），下一
+    /// major 删除。内部以 `Option` 承载以区分"未提供"与"提供了空值"；
+    /// `None` 时 serde 跳过序列化，既有配置文件读写不受影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<DriverSpec>,
+    /// Driver Package 目录（Runtime V2 方案 §8/§37.3）。
+    ///
+    /// 配置后 Collector 扫描全部目录发现 Driver Package 并注册进
+    /// [`driver_package`] Registry；此时不得再出现 legacy `driver:` 段
+    /// （两者互斥，`validate` 强制）。
     #[serde(default)]
-    pub driver: DriverSpec,
+    pub drivers: DriversOptions,
     /// 采集设备清单（§100）。至少一台；domain 缺省时由 Profile 决定。
     #[serde(default)]
     pub devices: Vec<DeviceSpec>,
@@ -96,6 +111,40 @@ impl Default for DriverSpec {
         Self {
             plugin: PathBuf::new(),
             manifest: ManifestSpec::default(),
+        }
+    }
+}
+
+/// Driver Package 部署选项（Runtime V2 方案 §8）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DriversOptions {
+    /// Driver Package 目录列表；每个目录下以 `driver.json` 子目录为
+    /// 一个 package（`driver_package::scan_directories` 语义，§6.3）。
+    #[serde(default)]
+    pub directories: Vec<PathBuf>,
+    /// 部署级隔离覆盖：driver id → 隔离级别。**只允许调得更严格**
+    /// （§8/§7：不得低于 Manifest `minimum_isolation`），身份元数据
+    /// （id/version/abi/artifact）不可覆盖。
+    #[serde(default)]
+    pub isolation_overrides: BTreeMap<String, IsolationOverride>,
+}
+
+/// 部署级隔离级别（§22；serde snake_case 与 Manifest v2 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationOverride {
+    Shared,
+    PerDriver,
+    PerDevice,
+}
+
+impl From<IsolationOverride> for driver_package::Isolation {
+    fn from(v: IsolationOverride) -> Self {
+        match v {
+            IsolationOverride::Shared => Self::Shared,
+            IsolationOverride::PerDriver => Self::PerDriver,
+            IsolationOverride::PerDevice => Self::PerDevice,
         }
     }
 }
@@ -602,6 +651,13 @@ impl CollectorConfig {
         Ok(config)
     }
 
+    /// legacy `driver:` 段是否被显式提供（§41.1）。
+    ///
+    /// `Some(spec)` = 用户显式写了 legacy 段；`None` = 未提供。
+    pub fn legacy_driver_provided(&self) -> bool {
+        self.driver.is_some()
+    }
+
     /// 校验配置合法性；组件级约束与各 crate `validate` 一致，缺省
     /// 值在此补齐后统一生效（不静默取默认值）。
     pub fn validate(&self) -> Result<(), CollectorError> {
@@ -680,11 +736,61 @@ impl CollectorConfig {
                 }
             }
         }
-        if self.driver.plugin.as_os_str().is_empty() {
-            return Err(ConfigError::invalid("driver.plugin", "Driver 插件路径不能为空").into());
+        // Driver 加载来源二选一（Runtime V2 方案 §37.3）：
+        // - `drivers:`（Package 目录扫描，目标态）；`isolation_overrides`
+        //   只能配合本模式出现；
+        // - legacy `driver:`（Transitional，§41.1）：显式提供时打印
+        //   `COLLECTOR_CONFIG_DRIVER_DEPRECATED` 并由运行时转换为
+        //   synthetic package 注册；与 `drivers.directories` 互斥。
+        let legacy_driver = self.legacy_driver_provided();
+        if !self.drivers.directories.is_empty() {
+            if legacy_driver {
+                return Err(ConfigError::invalid(
+                    "driver",
+                    "legacy `driver:` 段与 `drivers:` Package 扫描互斥；请删除 legacy 段",
+                )
+                .into());
+            }
+            if self.drivers.directories.is_empty() {
+                unreachable!("外层已判非空");
+            }
+            for (idx, dir) in self.drivers.directories.iter().enumerate() {
+                if dir.as_os_str().is_empty() {
+                    return Err(ConfigError::invalid(
+                        "drivers.directories[]",
+                        format!("第 {idx} 个目录为空"),
+                    )
+                    .into());
+                }
+            }
+            for id in self.drivers.isolation_overrides.keys() {
+                if id.is_empty() {
+                    return Err(ConfigError::invalid(
+                        "drivers.isolation_overrides",
+                        "driver id 不能为空",
+                    )
+                    .into());
+                }
+            }
+        } else if !legacy_driver && !self.drivers.isolation_overrides.is_empty() {
+            return Err(ConfigError::invalid(
+                "drivers.isolation_overrides",
+                "隔离覆盖必须配合 drivers.directories 使用",
+            )
+            .into());
         }
-        if self.driver.manifest.id.is_empty() {
-            return Err(ConfigError::invalid("driver.manifest.id", "Driver 标识不能为空").into());
+        if legacy_driver {
+            let driver = self.driver.as_ref().expect("legacy_driver_provided 为真");
+            if driver.plugin.as_os_str().is_empty() {
+                return Err(
+                    ConfigError::invalid("driver.plugin", "Driver 插件路径不能为空").into(),
+                );
+            }
+            if driver.manifest.id.is_empty() {
+                return Err(
+                    ConfigError::invalid("driver.manifest.id", "Driver 标识不能为空").into(),
+                );
+            }
         }
         self.northbound.mqtt.validate()?;
         self.poll.validate()?;
@@ -1021,13 +1127,14 @@ mod tests {
             site_id: "plant-a".to_owned(),
             session_id: None,
             profiles_dir: PathBuf::from("profiles"),
-            driver: DriverSpec {
+            driver: Some(DriverSpec {
                 plugin: PathBuf::from("driver.dll"),
                 manifest: ManifestSpec {
                     id: "modbus-tcp".to_owned(),
                     ..Default::default()
                 },
-            },
+            }),
+            drivers: DriversOptions::default(),
             devices: vec![DeviceSpec {
                 id: "vfd-01".to_owned(),
                 name: None,
