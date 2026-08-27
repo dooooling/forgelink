@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use driver_loader::{LoaderError, NativeDriver};
 use driver_sdk::{
-    DriverCommand, DriverErrorInfo, DriverReadItem, DriverWriteItem, RawCommandResult,
-    RawReadResult, RawWriteResult,
+    AddressMetadata, DriverCommand, DriverErrorInfo, DriverReadItem, DriverWriteItem,
+    ProtocolCapabilities, RawCommandResult, RawReadResult, RawWriteResult,
 };
 use poll_engine::PollDriver;
 
@@ -70,6 +70,32 @@ pub trait DriverSession: Send {
         &mut self,
         command: &DriverCommand,
     ) -> Result<RawCommandResult, DriverErrorInfo>;
+
+    /// 地址校验与规范化（§15 `validate_address`；Startup Preflight 第 5 项
+    /// 使用，方案 §29）。
+    ///
+    /// 默认实现返回 `unsupported`——不支持地址预检的会话实现（测试替身等）
+    /// 由 Preflight 按"能力未声明"跳过该项而非失败。
+    fn validate_address(&mut self, _address: &str) -> Result<AddressMetadata, DriverErrorInfo> {
+        Err(DriverErrorInfo {
+            code: "unsupported".to_owned(),
+            message: "本会话实现不支持地址校验预检".to_owned(),
+            protocol_code: None,
+            retryable: false,
+        })
+    }
+
+    /// 协议层能力声明（§13.1；Startup Preflight 第 6~9 项使用，方案 §29）。
+    ///
+    /// 默认实现返回 `unsupported`——同上，由 Preflight 跳过能力比对。
+    fn protocol_capabilities(&mut self) -> Result<ProtocolCapabilities, DriverErrorInfo> {
+        Err(DriverErrorInfo {
+            code: "unsupported".to_owned(),
+            message: "本会话实现不支持能力查询预检".to_owned(),
+            protocol_code: None,
+            retryable: false,
+        })
+    }
 }
 
 /// 基于 Native Plugin（C ABI v1）的完整会话实现（§19、§20）。
@@ -108,6 +134,19 @@ impl DriverSession for NativeSessionDriver {
         command: &DriverCommand,
     ) -> Result<RawCommandResult, DriverErrorInfo> {
         self.driver.execute(command).map_err(map_loader_error)
+    }
+
+    fn validate_address(&mut self, address: &str) -> Result<AddressMetadata, DriverErrorInfo> {
+        self.driver
+            .validate_address(address)
+            .map_err(map_loader_error)
+    }
+
+    fn protocol_capabilities(&mut self) -> Result<ProtocolCapabilities, DriverErrorInfo> {
+        self.driver
+            .protocol_capabilities()
+            .copied()
+            .map_err(map_loader_error)
     }
 }
 

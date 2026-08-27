@@ -207,6 +207,11 @@ impl CollectorRuntime {
                 .map_err(|e| CollectorError::Driver(Box::new(e)))?;
         }
 
+        // 2.5) Startup Preflight（Runtime V2 方案 §29）：九项配置/契约预检,
+        //      任一失败 fail-fast——此时除 Profile/Driver 加载外无任何组件
+        //      启动，失败无需回收。
+        crate::preflight::run_preflight(&config, &registry, &factory)?;
+
         // 3) 构造设备（domain 缺省取 Profile 决定，§100 device.yaml），
         //    随后注册绑定 Driver/Profile 并生成读取项（§37）。
         let mut devices: Vec<Device> = Vec::with_capacity(config.devices.len());
